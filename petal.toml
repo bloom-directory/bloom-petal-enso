@@ -1,0 +1,38 @@
+schema = "bloom.petal.package.v1"
+name = "enso"
+
+[source]
+kind = "github"
+repository = "bloom-directory/bloom-petal-enso"
+
+[build]
+command = "scripts/build.sh"
+outputs = ["petal/enso"]
+
+[consent]
+summary = "Request Enso Shortcuts route discovery, simulate and stage EVM swap transactions through Bloom, and track settlement."
+
+[caps]
+allowed = ["bloom:http", "bloom:store", "bloom:tx.outbox", "bloom:chain", "bloom:vfs.read"]
+
+[[net.allow]]
+binding = "enso"
+host = "api.enso.finance"
+methods = ["get"]
+paths = ["/api/v1/shortcuts/route", "/api/v1/shortcuts/quote"]
+
+[[net.allow]]
+binding = "enso"
+host = "api.enso.finance"
+methods = ["post"]
+paths = ["/api/v1/shortcuts/bundle"]
+
+[[net.allow]]
+binding = "enso_quoter"
+host = "quoter.api.enso.build"
+methods = ["post"]
+paths = ["/api/v1/simulate", "/api/v1/validate"]
+
+[store]
+namespaces = ["state"]
+secret_namespaces = ["secrets"]

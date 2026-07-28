@@ -1,0 +1,1 @@
+petal::route_file!(spec: petal::static_dir_spec(), list: {let mut v=petal::files(&["intent.txt","route.json","plan.md","tx.json","simulation.json","settlement.json","status.json"]);v.extend([petal::writable("confirm")]);v});

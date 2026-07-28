@@ -1,0 +1,18 @@
+name: Release Petal
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    # Pin both the workflow and its CLI tooling to the same immutable commit.
+    uses: bloom-directory/petal/.github/workflows/release-petal.yml@ec8fe8e445073e4cbef8a62bb27ab88feca32ef6
+    with:
+      petal-name: enso
+      petal-tooling-ref: "ec8fe8e445073e4cbef8a62bb27ab88feca32ef6"
+      build-command: scripts/build.sh
+      expected-route-count: 18
