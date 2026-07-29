@@ -1,5 +1,16 @@
 use petal::sdk::{EvmTransaction, HttpRequest, HttpResponse, OutboxInspection, StagedTransaction};
 
+/// Result of a generic `eth_call`.
+///
+/// `return_data` is always `0x`-prefixed hex. When `success` is `false` the
+/// `return_data` carries the raw revert payload (e.g. an `Error(string)`
+/// encoding beginning with `0x08c379a0`).
+#[derive(Debug, Clone)]
+pub struct EthCallResult {
+    pub success: bool,
+    pub return_data: String, // 0x-prefixed hex
+}
+
 pub trait Host {
     fn now_ms(&mut self) -> u64;
     fn random(&mut self, len: usize) -> Result<Vec<u8>, String>;
@@ -27,6 +38,40 @@ pub trait Host {
         chain: &str,
         id: &str,
     ) -> Result<OutboxInspection, String>;
+
+    // --- Chain helpers -----------------------------------------------------
+
+    /// Generic `eth_call` against `to` with the given already-encoded `data`
+    /// (0x-prefixed hex). `from`/`value` are optional tx-object fields.
+    fn eth_call(
+        &mut self,
+        chain: &str,
+        to: &str,
+        data: &str,
+        from: Option<&str>,
+        value: Option<&str>,
+    ) -> Result<EthCallResult, String>;
+
+    /// `eth_chainId` for the chain, returned as the canonical numeric chain id.
+    fn chain_id(&mut self, chain: &str) -> Result<u64, String>;
+
+    /// `ERC-20 allowance(owner, spender)` as a decimal string.
+    fn erc20_allowance(
+        &mut self,
+        chain: &str,
+        token: &str,
+        owner: &str,
+        spender: &str,
+    ) -> Result<String, String>;
+
+    /// `ERC-20 balanceOf(addr)` as a decimal string.
+    fn erc20_balance(&mut self, chain: &str, token: &str, addr: &str) -> Result<String, String>;
+
+    /// `ERC-20 decimals()`.
+    fn erc20_decimals(&mut self, chain: &str, token: &str) -> Result<u8, String>;
+
+    /// `ERC-20 symbol()` decoded from the dynamic `string` ABI encoding.
+    fn erc20_symbol(&mut self, chain: &str, token: &str) -> Result<String, String>;
 }
 
 pub struct BloomHost;
@@ -109,5 +154,252 @@ impl Host for BloomHost {
         id: &str,
     ) -> Result<OutboxInspection, String> {
         petal::sdk::tx_inspect(wallet, chain, id).map_err(|error| error.message())
+    }
+
+    fn eth_call(
+        &mut self,
+        chain: &str,
+        to: &str,
+        data: &str,
+        from: Option<&str>,
+        value: Option<&str>,
+    ) -> Result<EthCallResult, String> {
+        let mut tx = serde_json::Map::new();
+        tx.insert("to".to_string(), serde_json::Value::String(to.to_string()));
+        tx.insert("data".to_string(), serde_json::Value::String(data.to_string()));
+        if let Some(f) = from {
+            tx.insert("from".to_string(), serde_json::Value::String(f.to_string()));
+        }
+        if let Some(v) = value {
+            tx.insert("value".to_string(), serde_json::Value::String(v.to_string()));
+        }
+        let params = serde_json::json!([serde_json::Value::Object(tx), "latest"]).to_string();
+        let raw = self.chain_read(chain, "eth_call", &params)?;
+        // chain_read returns the JSON-RPC `result` field verbatim; for eth_call
+        // that is a JSON string ("0x...") — unwrap one layer of JSON quoting.
+        let hex_data: String = serde_json::from_str(&raw)
+            .map_err(|e| format!("eth_call result is not a JSON string: {e}"))?;
+
+        // Error(string) selector — a revert.
+        if hex_data.starts_with("0x08c379a0") {
+            return Ok(EthCallResult {
+                success: false,
+                return_data: hex_data,
+            });
+        }
+        if hex_data.starts_with("0x") {
+            return Ok(EthCallResult {
+                success: true,
+                return_data: hex_data,
+            });
+        }
+        Err(format!("eth_call returned unexpected value: {hex_data}"))
+    }
+
+    fn chain_id(&mut self, chain: &str) -> Result<u64, String> {
+        let raw = self.chain_read(chain, "eth_chainId", "[]")?;
+        let hex_data: String = serde_json::from_str(&raw)
+            .map_err(|e| format!("eth_chainId result is not a JSON string: {e}"))?;
+        let stripped = hex_data.strip_prefix("0x").unwrap_or(&hex_data);
+        u64::from_str_radix(stripped, 16).map_err(|e| format!("chain id decode: {e}"))
+    }
+
+    fn erc20_allowance(
+        &mut self,
+        chain: &str,
+        token: &str,
+        owner: &str,
+        spender: &str,
+    ) -> Result<String, String> {
+        let owner_word = encode_address_word(owner)?;
+        let spender_word = encode_address_word(spender)?;
+        let data = format!("0xdd62ed3e{owner_word}{spender_word}");
+        let res = self.eth_call(chain, token, &data, None, None)?;
+        if !res.success {
+            return Err(format!("erc20 allowance reverted: {}", res.return_data));
+        }
+        decode_uint256(&res.return_data)
+    }
+
+    fn erc20_balance(&mut self, chain: &str, token: &str, addr: &str) -> Result<String, String> {
+        let addr_word = encode_address_word(addr)?;
+        let data = format!("0x70a08231{addr_word}");
+        let res = self.eth_call(chain, token, &data, None, None)?;
+        if !res.success {
+            return Err(format!("erc20 balance reverted: {}", res.return_data));
+        }
+        decode_uint256(&res.return_data)
+    }
+
+    fn erc20_decimals(&mut self, chain: &str, token: &str) -> Result<u8, String> {
+        let res = self.eth_call(chain, token, "0x313ce567", None, None)?;
+        if !res.success {
+            return Err(format!("erc20 decimals reverted: {}", res.return_data));
+        }
+        let hex = res.return_data.strip_prefix("0x").unwrap_or(&res.return_data);
+        if hex.len() < 64 {
+            return Err(format!("decimals return data too short: {}", res.return_data));
+        }
+        let last_two = &hex[hex.len() - 2..];
+        u8::from_str_radix(last_two, 16).map_err(|e| format!("decimals decode: {e}"))
+    }
+
+    fn erc20_symbol(&mut self, chain: &str, token: &str) -> Result<String, String> {
+        let res = self.eth_call(chain, token, "0x95d89b41", None, None)?;
+        if !res.success {
+            return Err(format!("erc20 symbol reverted: {}", res.return_data));
+        }
+        decode_abi_string(&res.return_data)
+    }
+}
+
+// --- ABI / hex helpers (no alloy, kept deliberately simple) -----------------
+
+/// Encode a 20-byte address as a left-padded 32-byte ABI word (64 lowercase
+/// hex chars, no `0x` prefix).
+fn encode_address_word(addr: &str) -> Result<String, String> {
+    let stripped = addr.strip_prefix("0x").unwrap_or(addr);
+    if stripped.len() != 40 || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("invalid address: {addr}"));
+    }
+    Ok(format!("{:0>64}", stripped.to_ascii_lowercase()))
+}
+
+/// Decode an ABI-encoded `uint256` word from 0x-prefixed hex return data into
+/// a decimal string. The value occupies the final 32 bytes (64 hex chars).
+fn decode_uint256(return_data: &str) -> Result<String, String> {
+    let hex = return_data.strip_prefix("0x").unwrap_or(return_data);
+    if hex.len() < 64 {
+        return Err(format!("uint256 return data too short: {return_data}"));
+    }
+    let word = &hex[hex.len() - 64..];
+    hex_to_decimal_str(word)
+}
+
+/// Decode an ABI-encoded dynamic `string` (e.g. `symbol()`) from 0x-prefixed hex
+/// return data into UTF-8.
+fn decode_abi_string(return_data: &str) -> Result<String, String> {
+    let hex = return_data.strip_prefix("0x").unwrap_or(return_data);
+    // Need at least: offset word (64) + length word (64).
+    if hex.len() < 128 {
+        return Err(format!("string return data too short: {return_data}"));
+    }
+    // The offset is expressed in bytes; for a single-string return it is 0x20.
+    let offset = usize::from_str_radix(&hex[..64], 16)
+        .map_err(|e| format!("string offset decode: {e}"))?;
+    let len_start = offset * 2;
+    if len_start + 64 > hex.len() {
+        return Err(format!("string length out of range: {return_data}"));
+    }
+    let byte_len = usize::from_str_radix(&hex[len_start..len_start + 64], 16)
+        .map_err(|e| format!("string length decode: {e}"))?;
+    let data_start = len_start + 64;
+    let need = byte_len * 2;
+    if data_start + need > hex.len() {
+        return Err(format!("string data truncated: {return_data}"));
+    }
+    let bytes = hex::decode(&hex[data_start..data_start + need])
+        .map_err(|e| format!("string data hex decode: {e}"))?;
+    String::from_utf8(bytes).map_err(|e| format!("string is not valid UTF-8: {e}"))
+}
+
+/// Arbitrary-precision hex (no `0x` prefix) → decimal string, so a full
+/// `uint256` can be represented without pulling in a big-int crate.
+fn hex_to_decimal_str(hex: &str) -> Result<String, String> {
+    if hex.is_empty() {
+        return Ok("0".to_string());
+    }
+    // decimal digits, least-significant first
+    let mut dec: Vec<u8> = vec![0];
+    for ch in hex.chars() {
+        let d = ch
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid hex char '{ch}'"))? as u32;
+        // dec = dec * 16
+        let mut carry = 0u32;
+        for cell in dec.iter_mut() {
+            let v = (*cell as u32) * 16 + carry;
+            *cell = (v % 10) as u8;
+            carry = v / 10;
+        }
+        while carry > 0 {
+            dec.push((carry % 10) as u8);
+            carry /= 10;
+        }
+        // dec += d
+        let mut carry = d;
+        for cell in dec.iter_mut() {
+            let v = (*cell as u32) + carry;
+            *cell = (v % 10) as u8;
+            carry = v / 10;
+            if carry == 0 {
+                break;
+            }
+        }
+        while carry > 0 {
+            dec.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    let s: String = dec.iter().rev().map(|d| (b'0' + d) as char).collect();
+    Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn address_word_left_pads_to_32_bytes() {
+        // 20-byte address left-padded to a 32-byte word (24 zero-hex prefix).
+        assert_eq!(
+            encode_address_word("0x0123456789abcdef0123456789abcdef01234567").unwrap(),
+            "0000000000000000000000000123456789abcdef0123456789abcdef01234567"
+        );
+    }
+
+    #[test]
+    fn address_word_lowercases_and_accepts_no_prefix() {
+        assert_eq!(
+            encode_address_word("ABCDEF0123456789ABCDEF0123456789ABCDEF01").unwrap(),
+            "000000000000000000000000abcdef0123456789abcdef0123456789abcdef01"
+        );
+    }
+
+    #[test]
+    fn address_word_rejects_bad_length() {
+        assert!(encode_address_word("0x1234").is_err());
+        assert!(encode_address_word("0xZZ3400000000000000000000000000000000000000").is_err());
+    }
+
+    #[test]
+    fn hex_to_decimal_handles_uint256() {
+        assert_eq!(hex_to_decimal_str("").unwrap(), "0");
+        assert_eq!(hex_to_decimal_str("a").unwrap(), "10");
+        assert_eq!(hex_to_decimal_str("ff").unwrap(), "255");
+        // max uint256
+        assert_eq!(
+            hex_to_decimal_str(&"f".repeat(64)).unwrap(),
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        );
+    }
+
+    #[test]
+    fn decode_uint256_takes_last_word() {
+        // 0x...00000000000000000000000000000000000000000000000000000000000003e8 == 1000
+        let word = format!("0x{}", "00000000000000000000000000000000000000000000000000000000000003e8");
+        assert_eq!(decode_uint256(&word).unwrap(), "1000");
+    }
+
+    #[test]
+    fn decode_abi_string_roundtrip() {
+        // symbol() == "USDC" (4 bytes): offset 0x20, length 0x04, data "USDC" padded.
+        let data = format!(
+            "0x{}{}{}",
+            "0000000000000000000000000000000000000000000000000000000000000020", // offset
+            "0000000000000000000000000000000000000000000000000000000000000004", // length
+            "5553444300000000000000000000000000000000000000000000000000000000"  // "USDC"
+        );
+        assert_eq!(decode_abi_string(&data).unwrap(), "USDC");
     }
 }

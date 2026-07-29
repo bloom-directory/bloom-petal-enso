@@ -12,8 +12,5 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
         Ok(value) => value,
         Err(error) => return petal::error(-1, error),
     };
-    match session.plan_md {
-        Some(ref plan) => petal::DispatchResponse::Read(plan.clone().into_bytes()),
-        None => petal::error(-1, "plan not available"),
-    }
+    petal::DispatchResponse::Read(session.plan_md.into_bytes())
 });

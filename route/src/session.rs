@@ -1,5 +1,4 @@
-use crate::api_types::RouteResponse;
-use crate::input::NewIntentBody;
+use crate::api_types::{RouteRequest, RouteResponse};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,53 +24,90 @@ pub fn failure_key(wallet: &str, id: &str) -> String {
     format!("intents/{wallet}/{id}/failure.json")
 }
 
-/// Durable intent session: the original intent text, the Enso route response,
-/// the prepared transaction, simulation results, and settlement observations.
+/// One EVM transaction to stage into the outbox. A session typically holds two:
+/// an `approve` intent (optional) and the `route` intent carrying the Enso
+/// calldata.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PreparedIntent {
+    /// `"approve"` or `"route"`.
+    pub label: String,
+    pub to: String,
+    pub value_wei: String,
+    pub data_hex: String,
+    pub chain: String,
+    /// Token address for `approve` intents.
+    #[serde(default)]
+    pub approve_token: Option<String>,
+    /// Spender address for `approve` intents.
+    #[serde(default)]
+    pub approve_spender: Option<String>,
+}
+
+/// Per-intent staging state, kept in lockstep with `Session::intents` by index.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IntentState {
+    pub index: usize,
+    /// `"prepared"`, `"staged"`, `"broadcast"`, `"mined"`, `"failed"`.
+    pub status: String,
+    #[serde(default)]
+    pub outbox_id: Option<String>,
+    #[serde(default)]
+    pub tx_hash: Option<String>,
+    pub updated_ms: u64,
+}
+
+/// Durable intent session: the original intent text, the resolved Enso route
+/// request/response, the prepared multi-intent plan, per-intent staging state,
+/// simulation results, and settlement observations.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub schema_version: u32,
     pub id: String,
     pub wallet: String,
     pub wallet_address: String,
-    pub created_ms: u64,
-    pub updated_ms: u64,
-    pub state: String,
-    pub intent_text: String,
     pub chain: String,
-    pub destination_chain: Option<String>,
     #[serde(default)]
-    pub request_body: NewIntentBody,
+    pub destination_chain: Option<String>,
+    pub intent_text: String,
+    /// Persisted route request so the route can be re-verified on confirm.
+    #[serde(default)]
+    pub route_request: Option<RouteRequest>,
     #[serde(default)]
     pub route: Option<RouteResponse>,
-    /// Whether the route's input token/amount was verified against the request.
+    pub plan_md: String,
+    /// Multi-intent plan (approve + route).
     #[serde(default)]
-    pub route_verified: bool,
+    pub intents: Vec<PreparedIntent>,
+    /// Per-intent staging state, indexed in parallel with `intents`.
+    #[serde(default)]
+    pub intent_states: Vec<IntentState>,
+    /// Outbox IDs of staged intents.
+    #[serde(default)]
+    pub staged_ids: Vec<String>,
+    pub created_ms: u64,
+    pub updated_ms: u64,
+    /// Top-level lifecycle state — mirrors the most advanced `intent_state`
+    /// status. Values: `"prepared"`, `"staged"`, `"confirmed"`, `"failed"`.
+    pub state: String,
+    /// Settlement baseline observed before staging.
+    #[serde(default)]
+    pub observed_before: Option<String>,
+    #[serde(default)]
+    pub min_settlement_delta: Option<String>,
+    #[serde(default)]
+    pub source_tx_hashes: Vec<String>,
+    #[serde(default)]
+    pub policy_checks: serde_json::Value,
+    #[serde(default)]
+    pub receiver_class: Option<String>,
+    // petal additions
     /// Simulation result from the Enso Quoter (if run).
     #[serde(default)]
     pub simulation: Option<serde_json::Value>,
-    /// Prepared EVM transaction for the outbox.
-    #[serde(default)]
-    pub prepared_tx: Option<PreparedTx>,
-    #[serde(default)]
-    pub outbox_id: Option<String>,
-    #[serde(default)]
-    pub outbox_state: Option<String>,
-    #[serde(default)]
-    pub tx_hash: Option<String>,
-    #[serde(default)]
-    pub plan_md: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
+    #[serde(default)]
     pub history: Vec<History>,
-}
-
-/// Prepared EVM transaction — what gets staged into the outbox on confirm.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PreparedTx {
-    pub to: String,
-    pub value_wei: String,
-    pub data_hex: String,
-    pub chain: String,
 }
 
 impl Session {

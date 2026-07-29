@@ -1,18 +1,18 @@
 //! Workflow operations for Enso intent sessions.
 //!
-//! create → route discovery → simulate → confirm → outbox staging
+//! Lifecycle: create → route discovery → (optional simulate) → confirm →
+//! outbox staging → broadcast → settlement verification.
 
 pub use crate::runtime::{BloomHost, Host};
-use crate::{
-    api,
-    api_types::*,
-    input::{self, NewIntentBody},
-    session::{self, Session},
-    settings,
-};
+use crate::api_types::{NATIVE_TOKEN, RouteRequest, RouteResponse};
+use crate::session::{self, IntentState, PreparedIntent, Session};
+use crate::{api, input, settings};
 use alloy::primitives::{Address, U256};
 use petal::sdk::EvmTransaction;
-use sha2::{Digest, Sha256};
+
+// ---------------------------------------------------------------------------
+// persistence helpers
+// ---------------------------------------------------------------------------
 
 fn json<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, String> {
     serde_json::to_vec(value).map_err(|e| e.to_string())
@@ -28,6 +28,10 @@ pub fn load<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<Session, St
         .ok_or("session not found")?;
     serde_json::from_slice(&raw).map_err(|e| format!("corrupt session: {e}"))
 }
+
+// ---------------------------------------------------------------------------
+// resolution helpers
+// ---------------------------------------------------------------------------
 
 fn resolve_api_key<H: Host>(host: &mut H) -> Result<String, String> {
     let private_store = host.get_secret(settings::API_KEY, 8192)?;
@@ -70,72 +74,292 @@ fn generate_id<H: Host>(host: &mut H) -> Result<String, String> {
     Ok(hex::encode(&bytes))
 }
 
-fn quote_hash(route: &RouteResponse) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(route.tx.to.as_slice());
-    hasher.update(route.amount_out.as_bytes());
-    hasher.update(&route.tx.data);
-    hex::encode(hasher.finalize())
+// ---------------------------------------------------------------------------
+// amount / calldata helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a human-readable amount into raw smallest-units using explicit
+/// decimals.
+fn parse_amount(amount: &str, decimals: u8) -> Result<U256, String> {
+    let trimmed = amount.trim();
+    if trimmed.is_empty() {
+        return Err("amount is empty".into());
+    }
+
+    // Raw integer without a decimal point — parse directly (no scaling).
+    if !trimmed.contains('.') {
+        return U256::from_str_radix(trimmed, 10)
+            .map_err(|_| format!("invalid amount: {trimmed}"));
+    }
+
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.len() > 2 {
+        return Err(format!("invalid amount: {trimmed}"));
+    }
+
+    let whole = parts[0];
+    let frac = if parts.len() == 2 { parts[1] } else { "" };
+
+    let whole_val = if whole.is_empty() {
+        U256::from(0u64)
+    } else {
+        U256::from_str_radix(whole, 10)
+            .map_err(|_| format!("invalid whole part: {whole}"))?
+    };
+
+    let scaled_whole = whole_val * U256::from(10u64).pow(U256::from(decimals as u64));
+
+    let frac_val = if frac.is_empty() {
+        U256::from(0u64)
+    } else {
+        if frac.len() > decimals as usize {
+            return Err(format!(
+                "too many decimal places: {} has more than {decimals} digits",
+                frac
+            ));
+        }
+        let padded = format!("{:0<width$}", frac, width = decimals as usize);
+        U256::from_str_radix(&padded, 10)
+            .map_err(|_| format!("invalid fractional part: {frac}"))?
+    };
+
+    Ok(scaled_whole + frac_val)
 }
 
-/// Create a new intent session.
-///
-/// Parses the intent body, resolves token symbols, calls the Enso route API,
-/// optionally simulates, and stores the durable session.
+/// Build ERC-20 `approve(spender, type(uint256).max)` calldata.
+fn build_approve_calldata(spender_hex: &str) -> String {
+    // Selector: approve(address,uint256) = 0x095ea7b3
+    let stripped = spender_hex.strip_prefix("0x").unwrap_or(spender_hex);
+    let padded_spender = format!("{:0>64}", stripped.to_ascii_lowercase());
+    // type(uint256).max = 0xffff…ffff (64 hex chars)
+    format!("0x095ea7b3{padded_spender}{}", "f".repeat(64))
+}
+
+fn classify_receiver(_host_wallet_addr: &str, receiver_addr: &str) -> String {
+    if receiver_addr.eq_ignore_ascii_case(_host_wallet_addr) {
+        "wallet_eoa".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// Basic policy evaluation — all local, no external proto dependency.
+fn evaluate_policy(
+    route_verified: bool,
+    needs_approve: bool,
+    cross_chain: bool,
+    receiver_class: &str,
+) -> serde_json::Value {
+    let mut checks: Vec<serde_json::Value> = Vec::new();
+
+    checks.push(serde_json::json!({
+        "rule": "route_verified",
+        "outcome": if route_verified { "pass" } else { "deny" },
+        "message": if route_verified {
+            "Enso route transaction input matches the request"
+        } else {
+            "Enso route transaction input does NOT match the request — refusing"
+        },
+    }));
+
+    if needs_approve {
+        checks.push(serde_json::json!({
+            "rule": "erc20_approval",
+            "outcome": "warn",
+            "message": "An ERC-20 approve(spender, max) transaction will be staged before the swap",
+        }));
+    }
+
+    if cross_chain {
+        checks.push(serde_json::json!({
+            "rule": "cross_chain",
+            "outcome": "warn",
+            "message": "This route crosses chains — settlement verification reads the destination chain",
+        }));
+    }
+
+    checks.push(serde_json::json!({
+        "rule": "receiver",
+        "outcome": if receiver_class == "wallet_eoa" { "pass" } else { "warn" },
+        "message": format!("Receiver classified as: {receiver_class}"),
+    }));
+
+    serde_json::Value::Array(checks)
+}
+
+/// Render a human-readable plan document for the session.
+fn render_plan_md(
+    intent_text: &str,
+    chain_name: &str,
+    destination_chain: Option<&str>,
+    req: &RouteRequest,
+    route: &RouteResponse,
+    intents: &[PreparedIntent],
+    route_verified: bool,
+    receiver_class: &str,
+    observed_before: Option<&str>,
+) -> String {
+    let dest = destination_chain.unwrap_or(chain_name);
+    let protocols = route.protocols();
+    let protocol_str = if protocols.1 {
+        "unknown protocols".to_string()
+    } else if protocols.0.is_empty() {
+        "no protocol info".to_string()
+    } else {
+        protocols.0.join(", ")
+    };
+
+    let token_in_hex = format!("0x{:x}", req.token_in);
+    let token_out_hex = format!("0x{:x}", req.token_out);
+
+    let mut out = format!(
+        "# Enso Shortcuts Swap\n\n\
+         The following is Bloom's authoritative transaction plan.\n\n\
+         - Intent: `{intent_text}`\n\
+         - Source chain: `{chain_name}` (chain ID {})\n\
+         - Destination chain: `{dest}`\n\
+         - Token in: `{token_in_hex}`\n\
+         - Token out: `{token_out_hex}`\n\
+         - Amount in: {}\n\
+         - Expected output: {}\n\
+         - Route verified: {route_verified}\n\
+         - Protocols: {protocol_str}\n\
+         - Gas estimate: {}\n\
+         - Price impact (display only): {}\n\
+         - Receiver class: {receiver_class}\n\n",
+        req.chain_id,
+        req.amount_in,
+        route.amount_out,
+        route.gas.as_deref().unwrap_or("not estimated"),
+        route
+            .price_impact
+            .map(|v| format!("{v}"))
+            .unwrap_or_else(|| "not reported".into()),
+    );
+
+    out.push_str("## Transactions to stage\n\n");
+    for (i, intent) in intents.iter().enumerate() {
+        out.push_str(&format!(
+            "**{i}. `{}`** — `{}`\n\
+             - To: `{}`\n\
+             - Value: {} wei\n\
+             - Calldata: `{}…`\n",
+            intent.label,
+            intent.chain,
+            intent.to,
+            intent.value_wei,
+            &intent.data_hex[..intent.data_hex.len().min(74)],
+        ));
+        if let Some(ref token) = intent.approve_token {
+            out.push_str(&format!("- Approve token: `{token}`\n"));
+        }
+        if let Some(ref spender) = intent.approve_spender {
+            out.push_str(&format!("- Spender: `{spender}`\n"));
+        }
+        out.push('\n');
+    }
+
+    if let Some(before) = observed_before {
+        out.push_str(&format!(
+            "## Settlement baseline\n\n\
+             Destination token balance before staging: `{before}`\n\n"
+        ));
+    }
+
+    out.push_str("Write `confirm` to stage these transactions into the wallet outbox.\n");
+    out
+}
+
+// ---------------------------------------------------------------------------
+// create — route discovery + session creation
+// ---------------------------------------------------------------------------
+
 pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String, String> {
     let now = host.now_ms();
     let parsed = input::parse_new_body(body)?;
     let address = wallet_address(host, wallet)?;
     let api_key = resolve_api_key(host)?;
 
-    // Determine chain.
+    // Determine source chain.
+    let nat_opt = input::parse_natural_intent(&parsed.intent);
+    let nat_chain = nat_opt.as_ref().and_then(|n| n.chain.clone());
     let chain_name = parsed
         .chain
         .as_deref()
-        .or_else(|| {
-            if let Some(ref nat) = input::parse_natural_intent(&parsed.intent) {
-                nat.chain.as_deref()
-            } else {
-                None
-            }
-        })
+        .or(nat_chain.as_deref())
         .unwrap_or("ethereum");
 
-    let chain_id = input::chain_to_id(chain_name)
-        .ok_or_else(|| format!("unsupported chain: {chain_name}"))?;
+    // Determine chain_id — try on-chain first, fall back to static table.
+    let chain_id = match host.chain_id(chain_name) {
+        Ok(id) => id,
+        Err(_) => input::chain_to_id(chain_name)
+            .ok_or_else(|| format!("unsupported chain: {chain_name}"))?,
+    };
 
-    // Parse the natural intent to extract tokens and amount.
-    let nat = input::parse_natural_intent(&parsed.intent)
-        .ok_or_else(|| {
-            format!(
-                "could not parse intent '{}' (expected `swap <amount> <tok> to <tok>`)",
-                parsed.intent
-            )
-        })?;
+    // Parse the natural intent.
+    let nat = nat_opt.ok_or_else(|| {
+        format!(
+            "could not parse intent '{}' (expected `swap <amount> <tok> to <tok>`)",
+            parsed.intent
+        )
+    })?;
 
-    // Resolve token addresses.
+    // Resolve token_in on source chain.
     let token_in = input::resolve_token_symbol(chain_id, &nat.token_in)
         .ok_or_else(|| format!("could not resolve token symbol: {}", nat.token_in))?;
-    let token_out = input::resolve_token_symbol(chain_id, &nat.token_out)
-        .ok_or_else(|| format!("could not resolve token symbol: {}", nat.token_out))?;
 
-    // Parse amount — accept decimal human amount and scale to token decimals.
-    // For simplicity, we treat the amount as a raw decimal string of the
-    // smallest unit. A proper implementation would resolve decimals and scale.
-    // TODO: implement proper decimal scaling (ETH has 18, USDC has 6, etc.)
-    let amount_raw = parse_amount(&nat.amount, chain_id, &nat.token_in)?;
+    // Determine destination chain.
+    let destination_chain = parsed.destination_chain.clone();
+    let dest_chain_name = destination_chain.as_deref().unwrap_or(chain_name);
+    let dest_chain_id = if let Some(ref dest) = destination_chain {
+        input::chain_to_id(dest)
+    } else {
+        Some(chain_id)
+    };
+
+    // Resolve token_out — on destination chain if cross-chain, else source.
+    let token_out = {
+        let resolve_chain_id = dest_chain_id.unwrap_or(chain_id);
+        input::resolve_token_symbol(resolve_chain_id, &nat.token_out)
+            .ok_or_else(|| format!("could not resolve token symbol: {}", nat.token_out))?
+    };
+
+    // Resolve decimals for token_in.
+    let token_in_hex = format!("0x{:x}", token_in);
+    let decimals = if token_in_hex.eq_ignore_ascii_case(NATIVE_TOKEN) {
+        18u8
+    } else if nat.token_in.starts_with("0x") || nat.token_in.starts_with("0X") {
+        // Hex address — try on-chain decimals.
+        match host.erc20_decimals(chain_name, &token_in_hex) {
+            Ok(d) => d,
+            Err(_) => 18, // safe default
+        }
+    } else {
+        input::decimals_for_symbol(chain_id, &nat.token_in)
+    };
+
+    // Parse amount with correct decimals.
+    let amount_raw = parse_amount(&nat.amount, decimals)?;
 
     let from_address: Address = address
         .parse()
         .map_err(|_| format!("invalid wallet address: {address}"))?;
 
+    // Build route request.
     let mut route_req = RouteRequest::new(from_address, chain_id, token_in, token_out, amount_raw);
     route_req.slippage_bps = parsed.slippage_bps.unwrap_or(50);
-    if let Some(ref dest) = parsed.destination_chain {
-        if let Some(dest_id) = input::chain_to_id(dest) {
+
+    let cross_chain = destination_chain.is_some() && destination_chain.as_deref() != Some(chain_name);
+    if let Some(dest_id) = dest_chain_id {
+        if dest_id != chain_id {
             route_req.destination_chain_id = Some(dest_id);
+            // For cross-chain, default receiver to the wallet address itself.
+            if parsed.receiver.is_none() {
+                route_req.receiver = Some(from_address);
+            }
         }
     }
+
     if let Some(ref recv) = parsed.receiver {
         if let Ok(addr) = recv.parse::<Address>() {
             route_req.receiver = Some(addr);
@@ -145,73 +369,141 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
     // Call Enso route API.
     let route_resp = api::route(host, &api_key, &route_req)?;
 
-    // Verify route input matches request.
+    // SECURITY: verify route input matches request — reject if not.
     let route_verified = route_resp.input_matches_request(&route_req);
+    if !route_verified {
+        return Err(
+            "Enso route transaction input does not match the requested token and amount — refusing"
+                .into(),
+        );
+    }
 
-    let id = generate_id(host)?;
+    let router_addr = format!("0x{:x}", route_resp.tx.to);
 
-    // Build plan markdown.
-    let protocols = route_resp.protocols();
-    let protocol_str = if protocols.1 {
-        "unknown protocols".to_string()
-    } else if protocols.0.is_empty() {
-        "no protocol info".to_string()
-    } else {
-        protocols.0.join(", ")
-    };
+    // Check ERC-20 allowance and build approve intent if needed.
+    let token_in_is_native = token_in_hex.eq_ignore_ascii_case(NATIVE_TOKEN);
+    let mut needs_approve = false;
+    let mut intents: Vec<PreparedIntent> = Vec::new();
 
-    let plan_md = format!(
-        "# Enso Shortcuts Swap\n\n        The following is Bloom's authoritative transaction plan.\n\n        - Wallet: `{wallet}` (`{address}`)\n        - Chain: `{chain_name}` (chain ID {chain_id})\n        - Intent: `{}`\n        - Input: {} {} → Output: {} ({})\n        - Route verified: {}\n        - Protocols: {protocol_str}\n        - Gas estimate: {}\n        - Price impact (display only): {}\n\n        Write `confirm` to stage this transaction into the wallet outbox.\n",
-        parsed.intent,
-        nat.amount,
-        nat.token_in,
-        route_resp.amount_out,
-        nat.token_out,
-        route_verified,
-        route_resp.gas.as_deref().unwrap_or("not estimated"),
-        route_resp
-            .price_impact
-            .map(|v| format!("{v}"))
-            .unwrap_or_else(|| "not reported".into()),
-    );
+    if !token_in_is_native {
+        let allowance = host
+            .erc20_allowance(chain_name, &token_in_hex, &address, &router_addr)
+            .unwrap_or_else(|_| "0".to_string());
 
-    let prepared_tx = PreparedTx {
-        to: format!("0x{:x}", route_resp.tx.to),
+        if lt_decimal(&allowance, &route_req.amount_in.to_string()) {
+            needs_approve = true;
+            let approve_data = build_approve_calldata(&router_addr);
+            intents.push(PreparedIntent {
+                label: "approve".into(),
+                to: token_in_hex.clone(),
+                value_wei: "0".into(),
+                data_hex: approve_data,
+                chain: chain_name.to_string(),
+                approve_token: Some(token_in_hex.clone()),
+                approve_spender: Some(router_addr.clone()),
+            });
+        }
+    }
+
+    // Build the route intent.
+    intents.push(PreparedIntent {
+        label: "route".into(),
+        to: router_addr.clone(),
         value_wei: route_resp.tx.value.to_string(),
         data_hex: format!("0x{}", hex::encode(&route_resp.tx.data)),
         chain: chain_name.to_string(),
+        approve_token: None,
+        approve_spender: None,
+    });
+
+    // Classify receiver.
+    let receiver_addr = route_req
+        .receiver
+        .map(|a| format!("0x{:x}", a))
+        .unwrap_or_else(|| address.clone());
+    let receiver_class = classify_receiver(&address, &receiver_addr);
+
+    // Evaluate policy checks.
+    let policy_checks = evaluate_policy(route_verified, needs_approve, cross_chain, &receiver_class);
+
+    // Observe settlement baseline.
+    let token_out_hex = format!("0x{:x}", route_req.token_out);
+    let observed_before = if !token_out_hex.eq_ignore_ascii_case(NATIVE_TOKEN) {
+        crate::settlement::observe_balance_before(
+            host,
+            dest_chain_name,
+            &token_out_hex,
+            &receiver_addr,
+        )
+    } else {
+        None
     };
+
+    // Generate session ID.
+    let id = generate_id(host)?;
+
+    // Build plan markdown.
+    let plan_md = render_plan_md(
+        &parsed.intent,
+        chain_name,
+        destination_chain.as_deref(),
+        &route_req,
+        &route_resp,
+        &intents,
+        route_verified,
+        &receiver_class,
+        observed_before.as_deref(),
+    );
+
+    // Build intent_states (one per intent, all "prepared").
+    let now_ms = now;
+    let intent_states: Vec<IntentState> = intents
+        .iter()
+        .enumerate()
+        .map(|(i, _)| IntentState {
+            index: i,
+            status: "prepared".into(),
+            outbox_id: None,
+            tx_hash: None,
+            updated_ms: now_ms,
+        })
+        .collect();
 
     let mut sess = Session {
         schema_version: 1,
         id: id.clone(),
         wallet: wallet.to_string(),
         wallet_address: address,
+        chain: chain_name.to_string(),
+        destination_chain: destination_chain.clone(),
+        intent_text: parsed.intent.clone(),
+        route_request: Some(route_req),
+        route: Some(route_resp),
+        plan_md,
+        intents,
+        intent_states,
+        staged_ids: Vec::new(),
         created_ms: now,
         updated_ms: now,
         state: "prepared".into(),
-        intent_text: parsed.intent.clone(),
-        chain: chain_name.to_string(),
-        destination_chain: parsed.destination_chain.clone(),
-        request_body: parsed,
-        route: Some(route_resp),
-        route_verified,
+        observed_before,
+        min_settlement_delta: None,
+        source_tx_hashes: Vec::new(),
+        policy_checks,
+        receiver_class: Some(receiver_class),
         simulation: None,
-        prepared_tx: Some(prepared_tx),
-        outbox_id: None,
-        outbox_state: None,
-        tx_hash: None,
-        plan_md: Some(plan_md),
         last_error: None,
-        history: vec![],
+        history: Vec::new(),
     };
-    sess.transition(now, "prepared", "route discovered");
-
+    sess.transition(now, "prepared", "route discovered and verified");
     save(host, &sess)?;
     Ok(id)
 }
 
-/// Confirm: stage the prepared transaction into the outbox.
+// ---------------------------------------------------------------------------
+// confirm — stage all prepared intents into the outbox
+// ---------------------------------------------------------------------------
+
 pub fn confirm<H: Host>(
     host: &mut H,
     wallet: &str,
@@ -221,92 +513,121 @@ pub fn confirm<H: Host>(
     let now = host.now_ms();
     let mut sess = load(host, wallet, id)?;
 
+    // SECURITY: verify wallet ownership.
+    if sess.wallet != wallet {
+        return Err("wallet mismatch: session does not belong to this wallet".into());
+    }
+
+    // Idempotent: if already staged, return.
     if sess.state == "staged" || sess.state == "confirmed" {
         return Ok(());
     }
 
-    let prepared = sess
-        .prepared_tx
+    // Re-verify route binding.
+    let req = sess
+        .route_request
         .as_ref()
-        .ok_or_else(|| "no prepared transaction to confirm".to_string())?;
+        .ok_or("session has no route request — refusing to stage")?;
+    let route = sess
+        .route
+        .as_ref()
+        .ok_or("session has no route — refusing to stage")?;
 
-    let evm_tx = EvmTransaction {
-        wallet: wallet.to_string(),
-        chain: prepared.chain.clone(),
-        to: prepared.to.clone(),
-        value_wei: prepared.value_wei.clone(),
-        data_hex: prepared.data_hex.clone(),
-        nonce: None,
-        max_fee_per_gas: None,
-        max_priority_fee_per_gas: None,
-    };
-
-    let staged = host.tx_stage(&evm_tx)?;
-    sess.outbox_id = Some(staged.outbox_id.clone());
-    sess.outbox_state = Some("staged".into());
-    if let Some(ref plan) = staged.plan_md {
-        // The outbox may provide an updated plan; prefer the outbox version.
-        sess.plan_md = Some(plan.clone());
+    // Verify addresses match.
+    let wallet_addr = &sess.wallet_address;
+    let from_hex = format!("0x{:x}", req.from_address);
+    if from_hex != *wallet_addr {
+        return Err("route request from_address does not match session wallet_address".into());
     }
-    sess.transition(now, "staged", "transaction staged into outbox");
+    let tx_from_hex = format!("0x{:x}", route.tx.from);
+    if tx_from_hex != *wallet_addr {
+        return Err("route tx from does not match session wallet_address".into());
+    }
 
+    // Re-verify route input integrity.
+    if !route.input_matches_request(req) {
+        return Err(
+            "stored Enso route transaction input does not match the stored request — refusing"
+                .into(),
+        );
+    }
+
+    // Verify chain_id.
+    match host.chain_id(&sess.chain) {
+        Ok(live_chain_id) if live_chain_id == req.chain_id => { /* ok */ }
+        Ok(live_chain_id) => {
+            return Err(format!(
+                "live chain_id ({live_chain_id}) does not match session chain_id ({}) — refusing",
+                req.chain_id
+            ));
+        }
+        Err(_) => { /* chain_read unavailable — proceed cautiously */ }
+    }
+
+    // Stage each intent sequentially.
+    let mut staged_ids: Vec<String> = Vec::new();
+    let intents = sess.intents.clone();
+
+    for (idx, intent) in intents.iter().enumerate() {
+        // Skip already-staged intents.
+        if let Some(state) = sess.intent_states.get(idx) {
+            if let Some(ref existing_id) = state.outbox_id {
+                // Check if already pending/staged in outbox.
+                if state.status == "staged" {
+                    staged_ids.push(existing_id.clone());
+                    continue;
+                }
+            }
+        }
+
+        let evm_tx = EvmTransaction {
+            wallet: wallet.to_string(),
+            chain: intent.chain.clone(),
+            to: intent.to.clone(),
+            value_wei: intent.value_wei.clone(),
+            data_hex: intent.data_hex.clone(),
+            nonce: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+        };
+
+        let staged = host.tx_stage(&evm_tx)?;
+
+        if let Some(state) = sess.intent_states.get_mut(idx) {
+            state.status = "staged".into();
+            state.outbox_id = Some(staged.outbox_id.clone());
+            state.updated_ms = now;
+        }
+
+        staged_ids.push(staged.outbox_id.clone());
+
+        // Persist after each successful stage (crash recovery).
+        sess.staged_ids = staged_ids.clone();
+        sess.updated_ms = now;
+        save(host, &sess)?;
+    }
+
+    sess.staged_ids = staged_ids;
+    sess.transition(now, "staged", "all intents staged into outbox");
     save(host, &sess)?;
     Ok(())
 }
 
-/// Parse a human-readable amount into raw wei/units.
-/// TODO: implement proper decimal scaling based on token decimals.
-/// For now, accepts decimal strings and multiplies by 10^18 for native tokens.
-fn parse_amount(amount: &str, _chain_id: u64, token_in: &str) -> Result<U256, String> {
-    let trimmed = amount.trim();
-    if trimmed.is_empty() {
-        return Err("amount is empty".into());
+// ---------------------------------------------------------------------------
+// decimal comparison helper
+// ---------------------------------------------------------------------------
+
+/// Returns true if `a` < `b` where both are decimal strings.
+fn lt_decimal(a: &str, b: &str) -> bool {
+    let a = a.trim_start_matches('0');
+    let b = b.trim_start_matches('0');
+    if a.is_empty() && b.is_empty() {
+        return false; // both zero
     }
-
-    // If it's already a raw integer, parse directly.
-    if let Ok(v) = U256::from_str_radix(trimmed, 10) {
-        // Check if it contains a decimal point — if so, scale.
-        if !trimmed.contains('.') {
-            return Ok(v);
-        }
+    if a.len() != b.len() {
+        return a.len() < b.len();
     }
-
-    // Parse decimal amount: split on '.'
-    let parts: Vec<&str> = trimmed.split('.').collect();
-    if parts.len() > 2 {
-        return Err(format!("invalid amount: {trimmed}"));
-    }
-
-    let whole = parts[0];
-    let frac = if parts.len() == 2 { parts[1] } else { "" };
-
-    // Default decimals: 18 for native ETH-like tokens, 6 for stablecoins.
-    let decimals = match token_in.to_ascii_uppercase().as_str() {
-        "USDC" | "USDT" => 6,
-        "WBTC" => 8,
-        _ => 18,
-    };
-
-    let whole_val = if whole.is_empty() {
-        U256::from(0u64)
-    } else {
-        U256::from_str_radix(whole, 10)
-            .map_err(|_| format!("invalid whole part: {whole}"))?
-    };
-
-    let scaled_whole = whole_val
-        * U256::from(10u64).pow(U256::from(decimals));
-
-    let frac_val = if frac.is_empty() {
-        U256::from(0u64)
-    } else {
-        let padded = format!("{:0<decimals$}", frac, decimals = decimals);
-        let trimmed_padded = padded[..decimals.min(padded.len())].to_string();
-        U256::from_str_radix(&trimmed_padded, 10)
-            .map_err(|_| format!("invalid fractional part: {frac}"))?
-    };
-
-    Ok(scaled_whole + frac_val)
+    a < b
 }
 
 #[cfg(test)]
@@ -314,20 +635,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_whole_amount() {
-        let v = parse_amount("100", 1, "USDC").unwrap();
+    fn parses_whole_amount_no_decimals() {
+        let v = parse_amount("100", 6).unwrap();
         assert_eq!(v, U256::from(100u64));
     }
 
     #[test]
     fn parses_decimal_eth_amount() {
-        let v = parse_amount("1.5", 1, "ETH").unwrap();
+        let v = parse_amount("1.5", 18).unwrap();
         assert_eq!(v, U256::from(1_500_000_000_000_000_000u128));
     }
 
     #[test]
     fn parses_decimal_usdc_amount() {
-        let v = parse_amount("100.5", 1, "USDC").unwrap();
+        let v = parse_amount("100.5", 6).unwrap();
         assert_eq!(v, U256::from(100_500_000u64));
+    }
+
+    #[test]
+    fn rejects_too_many_decimals() {
+        assert!(parse_amount("1.1234567", 6).is_err());
+    }
+
+    #[test]
+    fn approve_calldata_format() {
+        let data = build_approve_calldata("0x1234567890abcdef1234567890abcdef12345678");
+        assert!(data.starts_with("0x095ea7b3"));
+        // Spender should be padded to 32 bytes.
+        assert!(data.contains("0000000000000000000000001234567890abcdef1234567890abcdef12345678"));
+        // Max uint256 at the end.
+        assert!(data.ends_with(&"f".repeat(64)));
+    }
+
+    #[test]
+    fn decimal_less_than() {
+        assert!(lt_decimal("99", "100"));
+        assert!(!lt_decimal("100", "100"));
+        assert!(!lt_decimal("101", "100"));
+        assert!(lt_decimal("0", "1"));
+        assert!(!lt_decimal("0", "0"));
+        assert!(lt_decimal(
+            "999999999999999999",
+            "1000000000000000000"
+        ));
     }
 }

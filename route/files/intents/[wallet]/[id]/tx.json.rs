@@ -12,8 +12,6 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
         Ok(value) => value,
         Err(error) => return petal::error(-1, error),
     };
-    match session.prepared_tx {
-        Some(ref tx) => petal::read_json_value(&serde_json::to_value(tx).unwrap_or_default()),
-        None => petal::error(-1, "transaction not prepared"),
-    }
+    // Show all prepared intents (approve + route).
+    petal::read_json_value(&serde_json::to_value(&session.intents).unwrap_or_default())
 });

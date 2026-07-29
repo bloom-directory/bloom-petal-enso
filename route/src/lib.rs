@@ -4,7 +4,9 @@ pub mod input;
 pub mod redaction;
 pub mod runtime;
 pub mod session;
+pub mod settlement;
 pub mod settings;
+pub mod simulation;
 pub mod workflow;
 
 pub mod prelude {
