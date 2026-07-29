@@ -653,6 +653,32 @@ pub fn confirm<H: Host>(
         Err(_) => { /* chain_read unavailable — proceed cautiously */ }
     }
 
+    // POLICY RE-EVALUATION: re-evaluate from current session state (not the
+    // snapshot from create time). Refuse on any Deny outcome before staging.
+    let route_verified = route.input_matches_request(req);
+    let needs_approve = sess.intents.iter().any(|i| i.label == "approve");
+    let cross_chain = sess
+        .destination_chain
+        .as_deref()
+        .map(|d| d != sess.chain)
+        .unwrap_or(false);
+    let receiver_class = sess.receiver_class.as_deref().unwrap_or("unknown");
+    let reevaluated = evaluate_policy(route_verified, needs_approve, cross_chain, receiver_class);
+    // Update stored policy checks with fresh evaluation.
+    sess.policy_checks = reevaluated.clone();
+    save(host, &sess)?;
+    if let Some(checks) = reevaluated.as_array() {
+        for check in checks {
+            if check.get("outcome").and_then(|v| v.as_str()) == Some("deny") {
+                let rule = check.get("rule").and_then(|v| v.as_str()).unwrap_or("?");
+                let msg = check.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                return Err(format!(
+                    "policy denied [{rule}]: {msg} — deny-level policy is not bypassable"
+                ));
+            }
+        }
+    }
+
     // Stage each intent sequentially.
     let mut staged_ids: Vec<String> = Vec::new();
     let intents = sess.intents.clone();
