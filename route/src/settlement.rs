@@ -8,20 +8,9 @@ use crate::api_types::NATIVE_TOKEN;
 use crate::runtime::Host;
 use crate::session::Session;
 
-/// Compute the current settlement status for a session.
-///
-/// Returns a JSON value:
-/// ```json
-/// {
-///   "status": "not_broadcast" | "destination_pending" | "destination_received" | "unsupported_token",
-///   "observed_before": "…",
-///   "observed_after": "…",
-///   "destination_chain": "…",
-///   "receiver": "…",
-///   "token_out": "…",
-///   "delta": "…"
-/// }
-/// ```
+/// Compute the current settlement status for a session. A destination balance
+/// increase is only considered after the route outbox entry has a successful
+/// mined receipt, and only when the increase meets the quoted output floor.
 pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::Value {
     let req = match sess.route_request.as_ref() {
         Some(r) => r,
@@ -33,10 +22,7 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
         }
     };
 
-    let dest_chain = sess
-        .destination_chain
-        .as_deref()
-        .unwrap_or(&sess.chain);
+    let dest_chain = sess.destination_chain.as_deref().unwrap_or(&sess.chain);
 
     // Determine receiver.
     let receiver = req
@@ -46,42 +32,102 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
 
     let token_out_hex = format!("0x{:x}", req.token_out);
 
-    // Native token balance can't be read via erc20_balance.
-    if token_out_hex.eq_ignore_ascii_case(NATIVE_TOKEN) {
+    let route_index = sess
+        .intents
+        .iter()
+        .position(|intent| intent.label == "route");
+    let Some(route_state) = route_index.and_then(|index| sess.intent_states.get(index)) else {
         return serde_json::json!({
-            "status": "unsupported_token",
-            "note": "native token output — use eth_getBalance instead of erc20 balanceOf",
+            "status": "error",
+            "error": "session has no route intent state",
+        });
+    };
+    let Some(route_outbox_id) = route_state.outbox_id.as_deref() else {
+        return serde_json::json!({
+            "status": if sess.state == "awaiting_approval" {
+                "awaiting_approval"
+            } else {
+                "not_staged"
+            },
+            "destination_chain": dest_chain,
+            "receiver": receiver,
+            "token_out": token_out_hex,
+        });
+    };
+
+    let inspection = match host.tx_inspect(&sess.wallet, &sess.chain, route_outbox_id) {
+        Ok(value) => value,
+        Err(error) => {
+            return serde_json::json!({
+                "status": "error",
+                "error": format!("cannot inspect route outbox: {error}"),
+                "route_outbox_id": route_outbox_id,
+            });
+        }
+    };
+
+    if inspection.state != "success" {
+        let failed = matches!(
+            inspection.state.as_str(),
+            "failed" | "reverted" | "cancelled"
+        );
+        return serde_json::json!({
+            "status": if failed { "source_failed" } else { "source_pending" },
+            "source_state": inspection.state,
+            "source_tx_hash": inspection.tx_hash,
+            "route_outbox_id": route_outbox_id,
             "destination_chain": dest_chain,
             "receiver": receiver,
             "token_out": token_out_hex,
         });
     }
 
-    // Read current balance on destination chain.
-    let current = host
-        .erc20_balance(dest_chain, &token_out_hex, &receiver)
-        .unwrap_or_else(|_| "0".to_string());
-
-    let before = sess.observed_before.clone().unwrap_or_else(|| "0".to_string());
-
-    // Compute delta = current - before (as decimal string subtraction).
-    let delta = sub_decimal(&current, &before);
-    let received = delta != "0";
-
-    // Determine status.
-    let status = if sess.staged_ids.is_empty() {
-        "not_broadcast"
-    } else if received {
-        "destination_received"
-    } else {
-        "destination_pending"
+    let current = match read_balance(host, dest_chain, &token_out_hex, &receiver) {
+        Ok(value) => value,
+        Err(error) => {
+            return serde_json::json!({
+                "status": "error",
+                "error": format!("cannot read destination balance: {error}"),
+                "source_state": inspection.state,
+                "source_tx_hash": inspection.tx_hash,
+            });
+        }
     };
 
+    let Some(before) = sess.observed_before.clone() else {
+        return serde_json::json!({
+            "status": "unverified_baseline",
+            "error": "session has no trusted pre-route balance observation",
+            "source_state": inspection.state,
+            "source_tx_hash": inspection.tx_hash,
+        });
+    };
+
+    let delta = sub_decimal(&current, &before);
+    let minimum = match sess.route.as_ref().map(|route| route.amount_out.trim()) {
+        Some(value) if is_decimal(value) => value,
+        _ => {
+            return serde_json::json!({
+                "status": "error",
+                "error": "Enso route has no valid quoted output floor",
+            });
+        }
+    };
+    let received = !lt_decimal(&delta, minimum);
+
     serde_json::json!({
-        "status": status,
+        "status": if received {
+            "destination_received"
+        } else {
+            "destination_below_quote"
+        },
+        "source_state": inspection.state,
+        "source_tx_hash": inspection.tx_hash,
+        "route_outbox_id": route_outbox_id,
         "observed_before": before,
         "observed_after": current,
         "delta": delta,
+        "minimum_expected": minimum,
         "destination_chain": dest_chain,
         "receiver": receiver,
         "token_out": token_out_hex,
@@ -96,18 +142,54 @@ pub fn observe_balance_before<H: Host>(
     dest_chain: &str,
     token_out_hex: &str,
     receiver_hex: &str,
-) -> Option<String> {
-    if token_out_hex.eq_ignore_ascii_case(NATIVE_TOKEN) {
-        return None; // can't read native via erc20
+) -> Result<String, String> {
+    read_balance(host, dest_chain, token_out_hex, receiver_hex)
+}
+
+fn read_balance<H: Host>(
+    host: &mut H,
+    chain: &str,
+    token: &str,
+    receiver: &str,
+) -> Result<String, String> {
+    let value = if token.eq_ignore_ascii_case(NATIVE_TOKEN) {
+        host.eth_balance(chain, receiver)?
+    } else {
+        host.erc20_balance(chain, token, receiver)?
+    };
+    if !is_decimal(&value) {
+        return Err("balance host returned a non-decimal value".into());
     }
-    match host.erc20_balance(dest_chain, token_out_hex, receiver_hex) {
-        Ok(s) => Some(s),
-        Err(_) => None,
+    Ok(normalize_decimal(&value))
+}
+
+fn is_decimal(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn normalize_decimal(value: &str) -> String {
+    let normalized = value.trim_start_matches('0');
+    if normalized.is_empty() {
+        "0".into()
+    } else {
+        normalized.into()
     }
+}
+
+fn lt_decimal(a: &str, b: &str) -> bool {
+    let a = normalize_decimal(a);
+    let b = normalize_decimal(b);
+    if a.len() != b.len() {
+        return a.len() < b.len();
+    }
+    a < b
 }
 
 /// Subtract two non-negative decimal strings: `a - b`. Returns "0" if b > a.
 fn sub_decimal(a: &str, b: &str) -> String {
+    if !is_decimal(a) || !is_decimal(b) {
+        return "0".to_string();
+    }
     let a_digits: Vec<u8> = a
         .chars()
         .rev()
@@ -155,11 +237,7 @@ fn sub_decimal(a: &str, b: &str) -> String {
         result.pop();
     }
 
-    result
-        .iter()
-        .rev()
-        .map(|d| (b'0' + d) as char)
-        .collect()
+    result.iter().rev().map(|d| (b'0' + d) as char).collect()
 }
 
 #[cfg(test)]
@@ -177,10 +255,7 @@ mod tests {
     #[test]
     fn large_numbers() {
         assert_eq!(
-            sub_decimal(
-                "1000000000000000000000",
-                "1"
-            ),
+            sub_decimal("1000000000000000000000", "1"),
             "999999999999999999999"
         );
     }

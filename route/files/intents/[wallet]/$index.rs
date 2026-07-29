@@ -19,7 +19,7 @@ petal::route_file!(
                 ids.insert(id.to_string());
             }
         }
-        let mut children = vec![petal::writable("new")];
+        let mut children = vec![petal::writable("new"), petal::file("latest")];
         children.extend(ids.into_iter().map(petal::dir));
         Ok(children)
     }

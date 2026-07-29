@@ -6,6 +6,7 @@ petal::route_file!(
         )
     },
     write: |_ctx: &petal::Ctx, body: &[u8]| {
+        use crate::workflow::Host;
         let key = match crate::settings::parse_api_key(body) {
             Ok(value) => value,
             Err(error) => return petal::error(-3, error),

@@ -344,9 +344,8 @@ mod tests {
     #[test]
     fn ethereum_registry_is_complete() {
         let expected = [
-            "USDC", "USDT", "DAI", "WETH", "WBTC", "LINK", "UNI", "AAVE", "MKR",
-            "SNX", "CRV", "LDO", "MATIC", "SHIB", "PEPE", "ENS", "WSTETH", "RPL",
-            "GMX", "FXS",
+            "USDC", "USDT", "DAI", "WETH", "WBTC", "LINK", "UNI", "AAVE", "MKR", "SNX", "CRV",
+            "LDO", "MATIC", "SHIB", "PEPE", "ENS", "WSTETH", "RPL", "GMX", "FXS",
         ];
         for sym in expected {
             assert!(
@@ -359,8 +358,7 @@ mod tests {
     #[test]
     fn polygon_registry_is_complete() {
         let expected = [
-            "USDC", "USDT", "DAI", "WETH", "WMATIC", "WBTC", "LINK", "AAVE", "CRV",
-            "SUSHI",
+            "USDC", "USDT", "DAI", "WETH", "WMATIC", "WBTC", "LINK", "AAVE", "CRV", "SUSHI",
         ];
         for sym in expected {
             assert!(
@@ -392,7 +390,9 @@ mod tests {
 
     #[test]
     fn arbitrum_registry_is_complete() {
-        for sym in ["USDC", "USDT", "DAI", "WETH", "WBTC", "ARB", "LINK", "GMX", "LDO"] {
+        for sym in [
+            "USDC", "USDT", "DAI", "WETH", "WBTC", "ARB", "LINK", "GMX", "LDO",
+        ] {
             assert!(
                 resolve_token_symbol(42161, sym).is_some(),
                 "arbitrum token {sym} should resolve"

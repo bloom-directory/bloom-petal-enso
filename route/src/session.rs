@@ -9,17 +9,6 @@ pub struct History {
     pub reason: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FailedSession {
-    pub schema_version: u32,
-    pub id: String,
-    pub wallet: String,
-    pub created_ms: u64,
-    pub updated_ms: u64,
-    pub state: String,
-    pub last_error: String,
-}
-
 pub fn failure_key(wallet: &str, id: &str) -> String {
     format!("intents/{wallet}/{id}/failure.json")
 }
@@ -57,6 +46,11 @@ pub struct IntentState {
     /// is broadcast. Used for ERC-20 approve → route ordering.
     #[serde(default)]
     pub depends_on: Option<String>,
+    /// Ceremony approval data returned by `tx_stage` (action_id, ceremony_url,
+    /// expires_ms). Present when the staged transaction requires ceremony
+    /// approval before broadcast.
+    #[serde(default)]
+    pub approval: Option<serde_json::Value>,
     pub updated_ms: u64,
 }
 
@@ -90,16 +84,13 @@ pub struct Session {
     pub staged_ids: Vec<String>,
     pub created_ms: u64,
     pub updated_ms: u64,
-    /// Top-level lifecycle state — mirrors the most advanced `intent_state`
-    /// status. Values: `"prepared"`, `"staged"`, `"confirmed"`, `"failed"`.
+    /// Top-level lifecycle state. Approval-dependent routes pause in
+    /// `"awaiting_approval"` and are never staged until the prerequisite has
+    /// a successful receipt.
     pub state: String,
     /// Settlement baseline observed before staging.
     #[serde(default)]
     pub observed_before: Option<String>,
-    #[serde(default)]
-    pub min_settlement_delta: Option<String>,
-    #[serde(default)]
-    pub source_tx_hashes: Vec<String>,
     #[serde(default)]
     pub policy_checks: serde_json::Value,
     #[serde(default)]
@@ -125,7 +116,7 @@ impl Session {
             reason: reason.chars().take(256).collect(),
         });
         if self.history.len() > 100 {
-            self.history.remove(0);
+            self.history.drain(..1);
         }
     }
 
@@ -136,8 +127,38 @@ impl Session {
     pub fn terminal(&self) -> bool {
         matches!(
             self.state.as_str(),
-            "settled_success" | "settled_failed" | "abandoned"
+            "settled_success" | "settled_failed" | "approval_failed" | "abandoned"
         )
+    }
+
+    /// The primary outbox ID — the last staged intent (the route tx).
+    pub fn primary_outbox_id(&self) -> Option<&str> {
+        self.intent_states
+            .iter()
+            .rev()
+            .find_map(|s| s.outbox_id.as_deref())
+    }
+
+    /// The primary tx hash — the last staged intent's hash.
+    pub fn primary_tx_hash(&self) -> Option<&str> {
+        self.intent_states
+            .iter()
+            .rev()
+            .find_map(|s| s.tx_hash.as_deref())
+    }
+
+    /// Aggregate policy outcome: `"deny"` if any check denies, `"warn"` if any
+    /// warns (and none deny), `"pass"` otherwise.
+    pub fn policy_overall(&self) -> &'static str {
+        let mut overall = "pass";
+        for check in self.policy_checks.as_array().into_iter().flatten() {
+            match check.get("outcome").and_then(|v| v.as_str()) {
+                Some("deny") => return "deny",
+                Some("warn") if overall != "deny" => overall = "warn",
+                _ => {}
+            }
+        }
+        overall
     }
 }
 

@@ -9,6 +9,41 @@
 
 ---
 
+## 2026-07-29 Safety Closure Update
+
+This update supersedes the original snapshot below, which is retained as the
+migration audit trail. The current Petal has 27 route controllers and closes
+the following cutover blockers:
+
+- whole-number natural-language amounts are scaled as human token units;
+- unknown on-chain token decimals and chain identity failures now fail closed;
+- Enso source asset, amount, sender, and native value are re-verified;
+- the current wallet `[defi]` policy and MEV slippage ceiling are evaluated at
+  create and confirm;
+- passkey policies must report `signed`; unsupported future `[defi]` fields
+  fail parsing rather than being ignored;
+- route simulation must succeed before route staging, and JSON-RPC transaction
+  value is encoded as a hex quantity;
+- approvals use the exact route input amount;
+- approval-dependent sessions stage only approval first, require a successful
+  receipt plus sufficient live allowance, then re-simulate before staging the
+  route on a second confirmation;
+- settlement requires a successful source receipt, a trusted baseline, and a
+  destination balance delta at least equal to Enso's quoted output; native
+  outputs use `eth_getBalance`;
+- runtime API-key status no longer claims encrypted storage.
+
+Host validation now covers 79 tests and strict Clippy. The unresolved product
+boundary is Enso Router V2's opaque action payload: output receiver and
+minimum-output semantics are not fully decoded. With
+`require_calldata_verification = true`, the Petal refuses these routes. With
+it set to `false`, policy emits explicit warnings and the flow is suitable only
+for operator-reviewed transactions, not unattended autonomous value movement.
+
+Deferred feature-parity items below (bundle/Hyperliquid deposit, full native
+address-book classification, and a trusted USD oracle for `max_input_usd`) do
+not silently bypass policy: configured unsupported controls fail closed.
+
 ## Executive Summary
 
 The petal has **solid API-type parity** (all Enso route/quote/simulate/validate wire types are ported verbatim) and a **working create→confirm flow for simple single-token swaps**. However, it is missing **critical safety, verification, and multi-step features** from the original:

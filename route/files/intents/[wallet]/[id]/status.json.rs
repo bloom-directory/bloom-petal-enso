@@ -1,5 +1,5 @@
 petal::route_file!(
-    spec: petal::store_read_spec().caps(&["bloom:store", "bloom:chain"]),
+    spec: petal::store_read_spec().caps(&["bloom:store"]),
     read: |ctx: &petal::Ctx| {
         use crate::workflow::Host;
 

@@ -96,20 +96,6 @@ impl RouteRequest {
         }
         q
     }
-
-    /// Build the full URL with query params appended.
-    pub fn to_url(&self, base: &str, path: &str) -> Result<String, String> {
-        let mut url = format!("{base}{path}?");
-        for (i, (k, v)) in self.to_query().iter().enumerate() {
-            if i > 0 {
-                url.push('&');
-            }
-            url.push_str(k);
-            url.push('=');
-            url.push_str(&urlencoding::encode_value(v));
-        }
-        Ok(url)
-    }
 }
 
 /// The transaction Enso wants the wallet to broadcast.
@@ -213,123 +199,6 @@ impl RouteResponse {
     }
 }
 
-/// Quote response (non-committal price preview).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QuoteResponse {
-    pub amount_out: String,
-    #[serde(default)]
-    pub gas: Option<String>,
-    #[serde(default)]
-    pub price_impact: Option<f64>,
-}
-
-// --- Quoter types (simulate/validate) ---
-
-fn ser_u256_dec<S: serde::Serializer>(v: &U256, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&v.to_string())
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QuoterTx {
-    pub chain_id: u64,
-    pub from: Address,
-    pub to: Address,
-    pub data: Bytes,
-    #[serde(serialize_with = "ser_u256_dec")]
-    pub value: U256,
-}
-
-impl QuoterTx {
-    pub fn from_route_tx(chain_id: u64, tx: &RouteTx) -> Self {
-        Self {
-            chain_id,
-            from: tx.from,
-            to: tx.to,
-            data: tx.data.clone(),
-            value: tx.value,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SimulateRequest {
-    pub chain_id: u64,
-    pub transaction: QuoterTx,
-    pub token_in: Vec<Address>,
-    pub token_out: Vec<Address>,
-    pub amount_in: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub destination_chain_id: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub routing_strategy: Option<RoutingStrategy>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ValidateRequest {
-    pub simulation_id: String,
-    pub transaction: QuoterTx,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SimulateResponse {
-    pub simulation_id: String,
-    #[serde(default)]
-    pub chain_id: Option<u64>,
-    pub result: SimulateResult,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SimulateResult {
-    pub status: String,
-    #[serde(default)]
-    pub amount_out: Vec<String>,
-    #[serde(default)]
-    pub gas: Option<String>,
-    #[serde(default)]
-    pub error: Option<serde_json::Value>,
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-impl SimulateResponse {
-    pub fn status_success(&self) -> bool {
-        self.result.status.eq_ignore_ascii_case("success")
-    }
-
-    pub fn amount_out_nonempty(&self) -> bool {
-        !self.result.amount_out.is_empty()
-    }
-
-    pub fn produced_output(&self) -> bool {
-        self.status_success() && self.amount_out_nonempty()
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ValidateResponse {
-    pub valid: bool,
-    #[serde(default)]
-    pub simulation_id: Option<String>,
-    pub checks: ValidateChecks,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ValidateChecks {
-    pub chain_id: bool,
-    pub data: bool,
-    pub to: bool,
-    pub value: bool,
-    pub from: bool,
-}
-
 // --- serde helpers ---
 
 pub(crate) fn de_bytes_hex<'de, D>(d: D) -> Result<Bytes, D::Error>
@@ -373,24 +242,5 @@ where
             }
         }
         other => Err(D::Error::custom(format!("unexpected value: {other}"))),
-    }
-}
-
-/// Minimal percent-encoding for query values (only the chars Enso endpoints need).
-mod urlencoding {
-    pub fn encode_value(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        for b in s.bytes() {
-            match b {
-                b'-' | b'.' | b'_' | b'~' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' => {
-                    out.push(b as char);
-                }
-                _ => {
-                    out.push('%');
-                    out.push_str(&format!("{b:02X}"));
-                }
-            }
-        }
-        out
     }
 }

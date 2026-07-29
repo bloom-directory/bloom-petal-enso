@@ -1,10 +1,10 @@
-//! Blocking settlement poll: reads balance on destination chain every 5s
-//! for up to 300s (60 iterations), returning as soon as a positive delta
-//! is observed.
-//!
-//! The petal runtime executes route files synchronously in the WASM host,
-//! so a sleep-loop here blocks the read until settlement is confirmed or
-//! the timeout expires.
+// Blocking settlement poll: reads balance on destination chain every 5s
+// for up to 300s (60 iterations), returning as soon as a positive delta
+// is observed.
+//
+// The petal runtime executes route files synchronously in the WASM host,
+// so a sleep-loop here blocks the read until settlement is confirmed or
+// the timeout expires.
 
 petal::route_file!(
     spec: petal::store_read_spec().caps(&["bloom:store", "bloom:chain"]),

@@ -1,4 +1,4 @@
-petal::route_file!(spec: petal::store_read_spec().caps(&["bloom:store"]), read: |ctx: &petal::Ctx| {
+petal::route_file!(spec: petal::store_read_spec().caps(&["bloom:store"]), read: |_ctx: &petal::Ctx| {
     use crate::workflow::Host;
 
     let mut host = crate::workflow::BloomHost;

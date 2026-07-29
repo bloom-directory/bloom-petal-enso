@@ -31,9 +31,8 @@ Never run a live-money swap without explicit user authorization.
 ## Domain context
 
 This petal wraps the Enso Shortcuts API (`api.enso.finance`) for DeFi route
-discovery and the Enso Quoter (`quoter.api.enso.build`) for transaction
-simulation and validation. The original implementation lived in the bloom
-monorepo as `bloom-defi` (domain crate) + `bloom-vfs/src/handlers/defi.rs`
+discovery. The original implementation lived in the bloom monorepo as
+`bloom-defi` (domain crate) + `bloom-vfs/src/handlers/defi.rs`
 (VFS handler).
 
 Key differences from the monorepo:
@@ -41,5 +40,4 @@ Key differences from the monorepo:
 - Token symbol resolution uses a static table in `input.rs` instead of
   `bloom_proto::tokens`. Expand it as needed.
 - Amount decimal scaling is simplified — see `workflow::parse_amount`.
-- The Quoter simulate/validate flow is available but not yet wired into the
-  session lifecycle (see TODOs in `workflow.rs`).
+- Simulation uses `eth_call` via `chain_read`, not a separate Quoter endpoint.

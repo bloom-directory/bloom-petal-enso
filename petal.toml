@@ -19,19 +19,7 @@ allowed = ["bloom:http", "bloom:store", "bloom:tx.outbox", "bloom:chain", "bloom
 binding = "enso"
 host = "api.enso.finance"
 methods = ["get"]
-paths = ["/api/v1/shortcuts/route", "/api/v1/shortcuts/quote"]
-
-[[net.allow]]
-binding = "enso"
-host = "api.enso.finance"
-methods = ["post"]
-paths = ["/api/v1/shortcuts/bundle"]
-
-[[net.allow]]
-binding = "enso_quoter"
-host = "quoter.api.enso.build"
-methods = ["post"]
-paths = ["/api/v1/simulate", "/api/v1/validate"]
+paths = ["/api/v1/shortcuts/route"]
 
 [store]
 namespaces = ["state"]

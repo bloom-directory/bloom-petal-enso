@@ -17,22 +17,28 @@ petal::route_file!(
             Err(error) => return petal::error(-1, error),
         };
 
-        // Get balance-based settlement status.
-        let settlement = crate::settlement::settlement_status(&mut host, &session);
+        if !session.terminal() && session.state != "staged" {
+            return petal::error(-1, "receipt not available — session is not terminal or staged");
+        }
 
-        // Inspect outbox for each staged intent.
-        let mut outbox_states: Vec<serde_json::Value> = Vec::new();
+        // Gather outbox receipts for all staged intents.
+        let mut tx_receipts: Vec<serde_json::Value> = Vec::new();
         for state in &session.intent_states {
             if let Some(ref oid) = state.outbox_id {
+                let label = session
+                    .intents
+                    .get(state.index)
+                    .map(|i| i.label.as_str())
+                    .unwrap_or("?");
                 match host.tx_inspect(&session.wallet, &session.chain, oid) {
                     Ok(insp) => {
-                        outbox_states.push(serde_json::json!({
-                            "intent_index": state.index,
-                            "label": session.intents.get(state.index).map(|i| i.label.as_str()).unwrap_or("?"),
+                        tx_receipts.push(serde_json::json!({
+                            "label": label,
                             "outbox_id": oid,
                             "state": insp.state,
                             "tx_hash": insp.tx_hash,
-                            "receipt": insp.receipt_json.as_deref().and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok()),
+                            "receipt": insp.receipt_json.as_deref()
+                                .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok()),
                         }));
                     }
                     Err(_) => {}
@@ -40,14 +46,22 @@ petal::route_file!(
             }
         }
 
+        // Settlement status.
+        let settlement = crate::settlement::settlement_status(&mut host, &session);
+
         petal::read_json_value(&serde_json::json!({
             "session": session.id,
             "wallet": session.wallet,
             "chain": session.chain,
+            "destination_chain": session.destination_chain,
             "state": session.state,
+            "intent_text": session.intent_text,
+            "primary_tx_hash": session.primary_tx_hash(),
+            "primary_outbox_id": session.primary_outbox_id(),
+            "transactions": tx_receipts,
             "settlement": settlement,
-            "outbox": outbox_states,
-            "staged_ids": session.staged_ids,
+            "history": session.history,
+            "last_error": session.last_error,
         }))
     }
 );

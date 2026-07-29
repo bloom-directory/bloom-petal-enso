@@ -89,20 +89,22 @@ pub fn resolve_api_key(
     Err("Enso API key is not configured".into())
 }
 
-pub fn configured_status(
-    private_store: Option<&[u8]>,
-    setting: Option<&str>,
-) -> CredentialStatus {
+pub fn configured_status(private_store: Option<&[u8]>, setting: Option<&str>) -> CredentialStatus {
     let resolved = resolve_api_key(private_store, setting);
     let source = match resolved {
         Ok(r) => r.source,
         Err(_) => CredentialSource::Unconfigured,
     };
+    let (storage, encrypted_at_rest) = match source {
+        CredentialSource::PrivateStore => ("petal secret store", true),
+        CredentialSource::RuntimeSetting => ("Bloom runtime configuration", false),
+        CredentialSource::Unconfigured => ("none", false),
+    };
     CredentialStatus {
         configured: !matches!(source, CredentialSource::Unconfigured),
         source,
-        storage: "secrets/enso-api-key",
-        encrypted_at_rest: true,
+        storage,
+        encrypted_at_rest,
     }
 }
 
@@ -126,5 +128,13 @@ mod tests {
     fn rejects_empty() {
         assert!(parse_api_key(b"").is_err());
         assert!(parse_api_key(b"   ").is_err());
+    }
+
+    #[test]
+    fn runtime_setting_is_not_claimed_as_encrypted() {
+        let status = configured_status(None, Some("enso_abc"));
+        assert_eq!(status.source, CredentialSource::RuntimeSetting);
+        assert!(!status.encrypted_at_rest);
+        assert_eq!(status.storage, "Bloom runtime configuration");
     }
 }

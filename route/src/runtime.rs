@@ -1,3 +1,4 @@
+use alloy::primitives::U256;
 use petal::sdk::{EvmTransaction, HttpRequest, HttpResponse, OutboxInspection, StagedTransaction};
 
 /// Result of a generic `eth_call`.
@@ -67,11 +68,11 @@ pub trait Host {
     /// `ERC-20 balanceOf(addr)` as a decimal string.
     fn erc20_balance(&mut self, chain: &str, token: &str, addr: &str) -> Result<String, String>;
 
+    /// Native balance from `eth_getBalance`, as a decimal string.
+    fn eth_balance(&mut self, chain: &str, addr: &str) -> Result<String, String>;
+
     /// `ERC-20 decimals()`.
     fn erc20_decimals(&mut self, chain: &str, token: &str) -> Result<u8, String>;
-
-    /// `ERC-20 symbol()` decoded from the dynamic `string` ABI encoding.
-    fn erc20_symbol(&mut self, chain: &str, token: &str) -> Result<String, String>;
 }
 
 pub struct BloomHost;
@@ -166,12 +167,16 @@ impl Host for BloomHost {
     ) -> Result<EthCallResult, String> {
         let mut tx = serde_json::Map::new();
         tx.insert("to".to_string(), serde_json::Value::String(to.to_string()));
-        tx.insert("data".to_string(), serde_json::Value::String(data.to_string()));
+        tx.insert(
+            "data".to_string(),
+            serde_json::Value::String(data.to_string()),
+        );
         if let Some(f) = from {
             tx.insert("from".to_string(), serde_json::Value::String(f.to_string()));
         }
         if let Some(v) = value {
-            tx.insert("value".to_string(), serde_json::Value::String(v.to_string()));
+            let quantity = rpc_quantity(v)?;
+            tx.insert("value".to_string(), serde_json::Value::String(quantity));
         }
         let params = serde_json::json!([serde_json::Value::Object(tx), "latest"]).to_string();
         let raw = self.chain_read(chain, "eth_call", &params)?;
@@ -231,29 +236,50 @@ impl Host for BloomHost {
         decode_uint256(&res.return_data)
     }
 
+    fn eth_balance(&mut self, chain: &str, addr: &str) -> Result<String, String> {
+        let params = serde_json::json!([addr, "latest"]).to_string();
+        let raw = self.chain_read(chain, "eth_getBalance", &params)?;
+        let quantity: String = serde_json::from_str(&raw)
+            .map_err(|e| format!("eth_getBalance result is not a JSON string: {e}"))?;
+        let hex = quantity.strip_prefix("0x").unwrap_or(&quantity);
+        U256::from_str_radix(if hex.is_empty() { "0" } else { hex }, 16)
+            .map(|value| value.to_string())
+            .map_err(|e| format!("native balance decode: {e}"))
+    }
+
     fn erc20_decimals(&mut self, chain: &str, token: &str) -> Result<u8, String> {
         let res = self.eth_call(chain, token, "0x313ce567", None, None)?;
         if !res.success {
             return Err(format!("erc20 decimals reverted: {}", res.return_data));
         }
-        let hex = res.return_data.strip_prefix("0x").unwrap_or(&res.return_data);
+        let hex = res
+            .return_data
+            .strip_prefix("0x")
+            .unwrap_or(&res.return_data);
         if hex.len() < 64 {
-            return Err(format!("decimals return data too short: {}", res.return_data));
+            return Err(format!(
+                "decimals return data too short: {}",
+                res.return_data
+            ));
         }
         let last_two = &hex[hex.len() - 2..];
         u8::from_str_radix(last_two, 16).map_err(|e| format!("decimals decode: {e}"))
     }
-
-    fn erc20_symbol(&mut self, chain: &str, token: &str) -> Result<String, String> {
-        let res = self.eth_call(chain, token, "0x95d89b41", None, None)?;
-        if !res.success {
-            return Err(format!("erc20 symbol reverted: {}", res.return_data));
-        }
-        decode_abi_string(&res.return_data)
-    }
 }
 
 // --- ABI / hex helpers (no alloy, kept deliberately simple) -----------------
+
+fn rpc_quantity(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x") {
+        let parsed = U256::from_str_radix(if hex.is_empty() { "0" } else { hex }, 16)
+            .map_err(|e| format!("invalid hexadecimal RPC quantity: {e}"))?;
+        return Ok(format!("0x{parsed:x}"));
+    }
+    let parsed = U256::from_str_radix(trimmed, 10)
+        .map_err(|e| format!("invalid decimal RPC quantity: {e}"))?;
+    Ok(format!("0x{parsed:x}"))
+}
 
 /// Encode a 20-byte address as a left-padded 32-byte ABI word (64 lowercase
 /// hex chars, no `0x` prefix).
@@ -276,33 +302,6 @@ fn decode_uint256(return_data: &str) -> Result<String, String> {
     hex_to_decimal_str(word)
 }
 
-/// Decode an ABI-encoded dynamic `string` (e.g. `symbol()`) from 0x-prefixed hex
-/// return data into UTF-8.
-fn decode_abi_string(return_data: &str) -> Result<String, String> {
-    let hex = return_data.strip_prefix("0x").unwrap_or(return_data);
-    // Need at least: offset word (64) + length word (64).
-    if hex.len() < 128 {
-        return Err(format!("string return data too short: {return_data}"));
-    }
-    // The offset is expressed in bytes; for a single-string return it is 0x20.
-    let offset = usize::from_str_radix(&hex[..64], 16)
-        .map_err(|e| format!("string offset decode: {e}"))?;
-    let len_start = offset * 2;
-    if len_start + 64 > hex.len() {
-        return Err(format!("string length out of range: {return_data}"));
-    }
-    let byte_len = usize::from_str_radix(&hex[len_start..len_start + 64], 16)
-        .map_err(|e| format!("string length decode: {e}"))?;
-    let data_start = len_start + 64;
-    let need = byte_len * 2;
-    if data_start + need > hex.len() {
-        return Err(format!("string data truncated: {return_data}"));
-    }
-    let bytes = hex::decode(&hex[data_start..data_start + need])
-        .map_err(|e| format!("string data hex decode: {e}"))?;
-    String::from_utf8(bytes).map_err(|e| format!("string is not valid UTF-8: {e}"))
-}
-
 /// Arbitrary-precision hex (no `0x` prefix) → decimal string, so a full
 /// `uint256` can be represented without pulling in a big-int crate.
 fn hex_to_decimal_str(hex: &str) -> Result<String, String> {
@@ -314,7 +313,7 @@ fn hex_to_decimal_str(hex: &str) -> Result<String, String> {
     for ch in hex.chars() {
         let d = ch
             .to_digit(16)
-            .ok_or_else(|| format!("invalid hex char '{ch}'"))? as u32;
+            .ok_or_else(|| format!("invalid hex char '{ch}'"))?;
         // dec = dec * 16
         let mut carry = 0u32;
         for cell in dec.iter_mut() {
@@ -387,19 +386,10 @@ mod tests {
     #[test]
     fn decode_uint256_takes_last_word() {
         // 0x...00000000000000000000000000000000000000000000000000000000000003e8 == 1000
-        let word = format!("0x{}", "00000000000000000000000000000000000000000000000000000000000003e8");
-        assert_eq!(decode_uint256(&word).unwrap(), "1000");
-    }
-
-    #[test]
-    fn decode_abi_string_roundtrip() {
-        // symbol() == "USDC" (4 bytes): offset 0x20, length 0x04, data "USDC" padded.
-        let data = format!(
-            "0x{}{}{}",
-            "0000000000000000000000000000000000000000000000000000000000000020", // offset
-            "0000000000000000000000000000000000000000000000000000000000000004", // length
-            "5553444300000000000000000000000000000000000000000000000000000000"  // "USDC"
+        let word = format!(
+            "0x{}",
+            "00000000000000000000000000000000000000000000000000000000000003e8"
         );
-        assert_eq!(decode_abi_string(&data).unwrap(), "USDC");
+        assert_eq!(decode_uint256(&word).unwrap(), "1000");
     }
 }

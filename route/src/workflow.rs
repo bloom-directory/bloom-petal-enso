@@ -3,8 +3,8 @@
 //! Lifecycle: create → route discovery → (optional simulate) → confirm →
 //! outbox staging → broadcast → settlement verification.
 
-pub use crate::runtime::{BloomHost, Host};
 use crate::api_types::{NATIVE_TOKEN, RouteRequest, RouteResponse};
+pub use crate::runtime::{BloomHost, Host};
 use crate::session::{self, IntentState, PreparedIntent, Session};
 use crate::{api, input, settings};
 use alloy::primitives::{Address, U256};
@@ -86,12 +86,6 @@ fn parse_amount(amount: &str, decimals: u8) -> Result<U256, String> {
         return Err("amount is empty".into());
     }
 
-    // Raw integer without a decimal point — parse directly (no scaling).
-    if !trimmed.contains('.') {
-        return U256::from_str_radix(trimmed, 10)
-            .map_err(|_| format!("invalid amount: {trimmed}"));
-    }
-
     let parts: Vec<&str> = trimmed.split('.').collect();
     if parts.len() > 2 {
         return Err(format!("invalid amount: {trimmed}"));
@@ -103,8 +97,7 @@ fn parse_amount(amount: &str, decimals: u8) -> Result<U256, String> {
     let whole_val = if whole.is_empty() {
         U256::from(0u64)
     } else {
-        U256::from_str_radix(whole, 10)
-            .map_err(|_| format!("invalid whole part: {whole}"))?
+        U256::from_str_radix(whole, 10).map_err(|_| format!("invalid whole part: {whole}"))?
     };
 
     let scaled_whole = whole_val * U256::from(10u64).pow(U256::from(decimals as u64));
@@ -119,88 +112,57 @@ fn parse_amount(amount: &str, decimals: u8) -> Result<U256, String> {
             ));
         }
         let padded = format!("{:0<width$}", frac, width = decimals as usize);
-        U256::from_str_radix(&padded, 10)
-            .map_err(|_| format!("invalid fractional part: {frac}"))?
+        U256::from_str_radix(&padded, 10).map_err(|_| format!("invalid fractional part: {frac}"))?
     };
 
     Ok(scaled_whole + frac_val)
 }
 
-/// Build ERC-20 `approve(spender, type(uint256).max)` calldata.
-fn build_approve_calldata(spender_hex: &str) -> String {
+/// Build ERC-20 `approve(spender, amount)` calldata.
+fn build_approve_calldata(spender_hex: &str, amount: U256) -> String {
     // Selector: approve(address,uint256) = 0x095ea7b3
     let stripped = spender_hex.strip_prefix("0x").unwrap_or(spender_hex);
     let padded_spender = format!("{:0>64}", stripped.to_ascii_lowercase());
-    // type(uint256).max = 0xffff…ffff (64 hex chars)
-    format!("0x095ea7b3{padded_spender}{}", "f".repeat(64))
+    format!("0x095ea7b3{padded_spender}{amount:064x}")
 }
 
-fn classify_receiver(_host_wallet_addr: &str, receiver_addr: &str) -> String {
-    if receiver_addr.eq_ignore_ascii_case(_host_wallet_addr) {
+fn classify_receiver(wallet_addr: &str, receiver_addr: &str) -> String {
+    if receiver_addr.eq_ignore_ascii_case(wallet_addr) {
         "wallet_eoa".to_string()
     } else {
         "unknown".to_string()
     }
 }
 
-/// Basic policy evaluation — all local, no external proto dependency.
-fn evaluate_policy(
+/// Render a human-readable plan document for the session.
+struct PlanView<'a> {
+    intent_text: &'a str,
+    chain_name: &'a str,
+    destination_chain: Option<&'a str>,
+    req: &'a RouteRequest,
+    route: &'a RouteResponse,
+    intents: &'a [PreparedIntent],
     route_verified: bool,
-    needs_approve: bool,
-    cross_chain: bool,
-    receiver_class: &str,
-) -> serde_json::Value {
-    let mut checks: Vec<serde_json::Value> = Vec::new();
-
-    checks.push(serde_json::json!({
-        "rule": "route_verified",
-        "outcome": if route_verified { "pass" } else { "deny" },
-        "message": if route_verified {
-            "Enso route transaction input matches the request"
-        } else {
-            "Enso route transaction input does NOT match the request — refusing"
-        },
-    }));
-
-    if needs_approve {
-        checks.push(serde_json::json!({
-            "rule": "erc20_approval",
-            "outcome": "warn",
-            "message": "An ERC-20 approve(spender, max) transaction will be staged before the swap",
-        }));
-    }
-
-    if cross_chain {
-        checks.push(serde_json::json!({
-            "rule": "cross_chain",
-            "outcome": "warn",
-            "message": "This route crosses chains — settlement verification reads the destination chain",
-        }));
-    }
-
-    checks.push(serde_json::json!({
-        "rule": "receiver",
-        "outcome": if receiver_class == "wallet_eoa" { "pass" } else { "warn" },
-        "message": format!("Receiver classified as: {receiver_class}"),
-    }));
-
-    serde_json::Value::Array(checks)
+    receiver_class: &'a str,
+    observed_before: Option<&'a str>,
+    policy_checks: &'a serde_json::Value,
+    simulation: Option<&'a serde_json::Value>,
 }
 
-/// Render a human-readable plan document for the session.
-fn render_plan_md(
-    intent_text: &str,
-    chain_name: &str,
-    destination_chain: Option<&str>,
-    req: &RouteRequest,
-    route: &RouteResponse,
-    intents: &[PreparedIntent],
-    route_verified: bool,
-    receiver_class: &str,
-    observed_before: Option<&str>,
-    policy_checks: &serde_json::Value,
-    simulation: Option<&serde_json::Value>,
-) -> String {
+fn render_plan_md(view: PlanView<'_>) -> String {
+    let PlanView {
+        intent_text,
+        chain_name,
+        destination_chain,
+        req,
+        route,
+        intents,
+        route_verified,
+        receiver_class,
+        observed_before,
+        policy_checks,
+        simulation,
+    } = view;
     let dest = destination_chain.unwrap_or(chain_name);
     let protocols = route.protocols();
     let protocol_str = if protocols.1 {
@@ -251,8 +213,17 @@ fn render_plan_md(
 
     // Simulation summary.
     if let Some(sim) = simulation {
-        let sim_ok = sim.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-        if sim_ok {
+        let blocked_by_approval = sim
+            .get("blocked_by_approval")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let sim_ok = sim
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if blocked_by_approval {
+            out.push_str("- Simulation: **deferred until approval succeeds** ⏳\n\n");
+        } else if sim_ok {
             out.push_str("- Simulation: **passed** ✅\n\n");
         } else {
             let msg = sim
@@ -266,23 +237,23 @@ fn render_plan_md(
     }
 
     // Policy checks section.
-    if let Some(checks) = policy_checks.as_array() {
-        if !checks.is_empty() {
-            out.push_str("## Policy checks\n\n");
-            for check in checks {
-                let rule = check.get("rule").and_then(|v| v.as_str()).unwrap_or("?");
-                let outcome = check.get("outcome").and_then(|v| v.as_str()).unwrap_or("?");
-                let message = check.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                let icon = match outcome {
-                    "pass" => "✅",
-                    "warn" => "⚠️",
-                    "deny" => "❌",
-                    _ => "❓",
-                };
-                out.push_str(&format!("- {icon} **{rule}** ({outcome}): {message}\n"));
-            }
-            out.push('\n');
+    if let Some(checks) = policy_checks.as_array()
+        && !checks.is_empty()
+    {
+        out.push_str("## Policy checks\n\n");
+        for check in checks {
+            let rule = check.get("rule").and_then(|v| v.as_str()).unwrap_or("?");
+            let outcome = check.get("outcome").and_then(|v| v.as_str()).unwrap_or("?");
+            let message = check.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let icon = match outcome {
+                "pass" => "✅",
+                "warn" => "⚠️",
+                "deny" => "❌",
+                _ => "❓",
+            };
+            out.push_str(&format!("- {icon} **{rule}** ({outcome}): {message}\n"));
         }
+        out.push('\n');
     }
 
     out.push_str("## Transactions to stage\n\n");
@@ -321,7 +292,9 @@ fn render_plan_md(
     }
 
     out.push_str(&format!(
-        "Write `confirm` to stage {} transaction(s) into the wallet outbox.\n",
+        "Write exactly `confirm` to stage the next safe transaction. \
+         This plan contains {} transaction(s); an approval, when present, \
+         must succeed before a second confirmation can stage the route.\n",
         intents.len()
     ));
     out
@@ -344,14 +317,13 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
         .chain
         .as_deref()
         .or(nat_chain.as_deref())
-        .unwrap_or("ethereum");
+        .unwrap_or("ethereum")
+        .to_ascii_lowercase();
 
-    // Determine chain_id — try on-chain first, fall back to static table.
-    let chain_id = match host.chain_id(chain_name) {
-        Ok(id) => id,
-        Err(_) => input::chain_to_id(chain_name)
-            .ok_or_else(|| format!("unsupported chain: {chain_name}"))?,
-    };
+    // Resolve the configured RPC and prove that it is the requested chain.
+    let chain_id = host
+        .chain_id(&chain_name)
+        .map_err(|e| format!("cannot verify source chain {chain_name}: {e}"))?;
 
     // Parse the natural intent.
     let nat = nat_opt.ok_or_else(|| {
@@ -366,10 +338,16 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
         .ok_or_else(|| format!("could not resolve token symbol: {}", nat.token_in))?;
 
     // Determine destination chain.
-    let destination_chain = parsed.destination_chain.clone();
-    let dest_chain_name = destination_chain.as_deref().unwrap_or(chain_name);
+    let destination_chain = parsed
+        .destination_chain
+        .as_ref()
+        .map(|chain| chain.to_ascii_lowercase());
+    let dest_chain_name = destination_chain.as_deref().unwrap_or(&chain_name);
     let dest_chain_id = if let Some(ref dest) = destination_chain {
-        input::chain_to_id(dest)
+        Some(
+            host.chain_id(dest)
+                .map_err(|e| format!("cannot verify destination chain {dest}: {e}"))?,
+        )
     } else {
         Some(chain_id)
     };
@@ -386,11 +364,8 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
     let decimals = if token_in_hex.eq_ignore_ascii_case(NATIVE_TOKEN) {
         18u8
     } else if nat.token_in.starts_with("0x") || nat.token_in.starts_with("0X") {
-        // Hex address — try on-chain decimals.
-        match host.erc20_decimals(chain_name, &token_in_hex) {
-            Ok(d) => d,
-            Err(_) => 18, // safe default
-        }
+        host.erc20_decimals(&chain_name, &token_in_hex)
+            .map_err(|e| format!("cannot read token decimals: {e}"))?
     } else {
         input::decimals_for_symbol(chain_id, &nat.token_in)
     };
@@ -406,21 +381,26 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
     let mut route_req = RouteRequest::new(from_address, chain_id, token_in, token_out, amount_raw);
     route_req.slippage_bps = parsed.slippage_bps.unwrap_or(50);
 
-    let cross_chain = destination_chain.is_some() && destination_chain.as_deref() != Some(chain_name);
-    if let Some(dest_id) = dest_chain_id {
-        if dest_id != chain_id {
-            route_req.destination_chain_id = Some(dest_id);
-            // For cross-chain, default receiver to the wallet address itself.
-            if parsed.receiver.is_none() {
-                route_req.receiver = Some(from_address);
-            }
+    let cross_chain = destination_chain.is_some()
+        && !destination_chain
+            .as_deref()
+            .map(|d| d.eq_ignore_ascii_case(&chain_name))
+            .unwrap_or(false);
+    if let Some(dest_id) = dest_chain_id
+        && dest_id != chain_id
+    {
+        route_req.destination_chain_id = Some(dest_id);
+        // For cross-chain, default receiver to the wallet address itself.
+        if parsed.receiver.is_none() {
+            route_req.receiver = Some(from_address);
         }
     }
 
     if let Some(ref recv) = parsed.receiver {
-        if let Ok(addr) = recv.parse::<Address>() {
-            route_req.receiver = Some(addr);
-        }
+        let addr = recv
+            .parse::<Address>()
+            .map_err(|_| format!("invalid receiver address: {recv}"))?;
+        route_req.receiver = Some(addr);
     }
 
     // Call Enso route API.
@@ -437,35 +417,6 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
 
     let router_addr = format!("0x{:x}", route_resp.tx.to);
 
-    // SIMULATION: run eth_call against the route tx to catch reverts early.
-    let simulation = {
-        let sim_to = router_addr.clone();
-        let sim_data = format!("0x{}", hex::encode(&route_resp.tx.data));
-        let sim_from = format!("0x{:x}", route_resp.tx.from);
-        let sim_value = route_resp.tx.value.to_string();
-        match host.eth_call(chain_name, &sim_to, &sim_data, Some(&sim_from), Some(&sim_value)) {
-            Ok(res) if res.success => serde_json::json!({
-                "success": true,
-                "return_data": res.return_data,
-                "gas": route_resp.gas,
-            }),
-            Ok(res) => {
-                let message = crate::simulation::decode_error_string_pub(&res.return_data)
-                    .unwrap_or_else(|| res.return_data.clone());
-                serde_json::json!({
-                    "success": false,
-                    "decoded_error": { "message": message },
-                    "gas": route_resp.gas,
-                })
-            }
-            Err(e) => serde_json::json!({
-                "success": false,
-                "error": e,
-                "gas": route_resp.gas,
-            }),
-        }
-    };
-
     // Check ERC-20 allowance and build approve intent if needed.
     let token_in_is_native = token_in_hex.eq_ignore_ascii_case(NATIVE_TOKEN);
     let mut needs_approve = false;
@@ -473,18 +424,18 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
 
     if !token_in_is_native {
         let allowance = host
-            .erc20_allowance(chain_name, &token_in_hex, &address, &router_addr)
-            .unwrap_or_else(|_| "0".to_string());
+            .erc20_allowance(&chain_name, &token_in_hex, &address, &router_addr)
+            .map_err(|e| format!("cannot verify ERC-20 allowance: {e}"))?;
 
         if lt_decimal(&allowance, &route_req.amount_in.to_string()) {
             needs_approve = true;
-            let approve_data = build_approve_calldata(&router_addr);
+            let approve_data = build_approve_calldata(&router_addr, route_req.amount_in);
             intents.push(PreparedIntent {
                 label: "approve".into(),
                 to: token_in_hex.clone(),
                 value_wei: "0".into(),
                 data_hex: approve_data,
-                chain: chain_name.to_string(),
+                chain: chain_name.clone(),
                 approve_token: Some(token_in_hex.clone()),
                 approve_spender: Some(router_addr.clone()),
             });
@@ -497,7 +448,7 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
         to: router_addr.clone(),
         value_wei: route_resp.tx.value.to_string(),
         data_hex: format!("0x{}", hex::encode(&route_resp.tx.data)),
-        chain: chain_name.to_string(),
+        chain: chain_name.clone(),
         approve_token: None,
         approve_spender: None,
     });
@@ -508,40 +459,84 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
         .map(|a| format!("0x{:x}", a))
         .unwrap_or_else(|| address.clone());
     let receiver_class = classify_receiver(&address, &receiver_addr);
+    let token_out_hex = format!("0x{:x}", route_req.token_out);
 
-    // Evaluate policy checks.
-    let policy_checks = evaluate_policy(route_verified, needs_approve, cross_chain, &receiver_class);
+    // Load and enforce the wallet's current signed route policy.
+    let protocols = route_resp.protocols();
+    let verified_policy = crate::policy::load_verified_policy(host, wallet)?;
+    let policy_checks = crate::policy::evaluate(
+        &verified_policy,
+        &crate::policy::RoutePolicyContext {
+            source_chain: &chain_name,
+            destination_chain: dest_chain_name,
+            cross_chain,
+            receiver: &receiver_addr,
+            token_out: &token_out_hex,
+            receiver_class: &receiver_class,
+            router: &router_addr,
+            protocols: &protocols.0,
+            protocols_unknown: protocols.1,
+            native_value_wei: route_resp.tx.value,
+            slippage_bps: route_req.slippage_bps,
+            route_verified,
+            // Enso Router V2's opaque action bytes are not decoded here.
+            receiver_verified: false,
+            min_out_enforced: false,
+            needs_approve,
+        },
+    );
+    if let Some(reason) = crate::policy::deny_reason(&policy_checks) {
+        return Err(reason);
+    }
+
+    // A route that already has allowance must simulate successfully. When an
+    // approval is needed, simulation is deferred until that approval succeeds.
+    let simulation = if needs_approve {
+        serde_json::json!({
+            "success": false,
+            "blocked_by_approval": true,
+            "message": "route simulation deferred until the exact-amount approval succeeds",
+        })
+    } else {
+        let result = crate::simulation::simulate_route_response(host, &chain_name, &route_resp);
+        if !result
+            .get("success")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "route simulation failed: {}",
+                crate::simulation::failure_message(&result)
+            ));
+        }
+        result
+    };
 
     // Observe settlement baseline.
-    let token_out_hex = format!("0x{:x}", route_req.token_out);
-    let observed_before = if !token_out_hex.eq_ignore_ascii_case(NATIVE_TOKEN) {
-        crate::settlement::observe_balance_before(
-            host,
-            dest_chain_name,
-            &token_out_hex,
-            &receiver_addr,
-        )
-    } else {
-        None
-    };
+    let observed_before = Some(crate::settlement::observe_balance_before(
+        host,
+        dest_chain_name,
+        &token_out_hex,
+        &receiver_addr,
+    )?);
 
     // Generate session ID.
     let id = generate_id(host)?;
 
     // Build plan markdown.
-    let plan_md = render_plan_md(
-        &parsed.intent,
-        chain_name,
-        destination_chain.as_deref(),
-        &route_req,
-        &route_resp,
-        &intents,
+    let plan_md = render_plan_md(PlanView {
+        intent_text: &parsed.intent,
+        chain_name: &chain_name,
+        destination_chain: destination_chain.as_deref(),
+        req: &route_req,
+        route: &route_resp,
+        intents: &intents,
         route_verified,
-        &receiver_class,
-        observed_before.as_deref(),
-        &policy_checks,
-        Some(&simulation),
-    );
+        receiver_class: &receiver_class,
+        observed_before: observed_before.as_deref(),
+        policy_checks: &policy_checks,
+        simulation: Some(&simulation),
+    });
 
     // Build intent_states (one per intent, all "prepared").
     let now_ms = now;
@@ -554,6 +549,7 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
             outbox_id: None,
             tx_hash: None,
             depends_on: None,
+            approval: None,
             updated_ms: now_ms,
         })
         .collect();
@@ -563,7 +559,7 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
         id: id.clone(),
         wallet: wallet.to_string(),
         wallet_address: address,
-        chain: chain_name.to_string(),
+        chain: chain_name,
         destination_chain: destination_chain.clone(),
         intent_text: parsed.intent.clone(),
         route_request: Some(route_req),
@@ -576,8 +572,6 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
         updated_ms: now,
         state: "prepared".into(),
         observed_before,
-        min_settlement_delta: None,
-        source_tx_hashes: Vec::new(),
         policy_checks,
         receiver_class: Some(receiver_class),
         simulation: Some(simulation),
@@ -586,6 +580,10 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
     };
     sess.transition(now, "prepared", "route discovered and verified");
     save(host, &sess)?;
+
+    // Store latest pointer for convenience lookups.
+    let _ = host.put(&format!("intents/{wallet}/latest"), id.as_bytes(), false);
+
     Ok(id)
 }
 
@@ -593,12 +591,14 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
 // confirm — stage all prepared intents into the outbox
 // ---------------------------------------------------------------------------
 
-pub fn confirm<H: Host>(
-    host: &mut H,
-    wallet: &str,
-    id: &str,
-    _body: &[u8],
-) -> Result<(), String> {
+pub fn confirm<H: Host>(host: &mut H, wallet: &str, id: &str, body: &[u8]) -> Result<(), String> {
+    let confirmation = std::str::from_utf8(body)
+        .map_err(|_| "confirmation body must be UTF-8")?
+        .trim();
+    if confirmation != "confirm" {
+        return Err("write exactly `confirm` to authorize outbox staging".into());
+    }
+
     let now = host.now_ms();
     let mut sess = load(host, wallet, id)?;
 
@@ -612,29 +612,37 @@ pub fn confirm<H: Host>(
         return Ok(());
     }
 
+    // Refuse to confirm a session that has been abandoned or is otherwise terminal.
+    if sess.terminal() {
+        return Err(format!(
+            "cannot confirm a session in terminal state: {}",
+            sess.state
+        ));
+    }
+
     // Re-verify route binding.
     let req = sess
         .route_request
-        .as_ref()
+        .clone()
         .ok_or("session has no route request — refusing to stage")?;
     let route = sess
         .route
-        .as_ref()
+        .clone()
         .ok_or("session has no route — refusing to stage")?;
 
-    // Verify addresses match.
-    let wallet_addr = &sess.wallet_address;
+    // Verify addresses match (case-insensitive — checksum vs lowercase).
+    let wallet_addr = sess.wallet_address.clone();
     let from_hex = format!("0x{:x}", req.from_address);
-    if from_hex != *wallet_addr {
+    if !from_hex.eq_ignore_ascii_case(&wallet_addr) {
         return Err("route request from_address does not match session wallet_address".into());
     }
     let tx_from_hex = format!("0x{:x}", route.tx.from);
-    if tx_from_hex != *wallet_addr {
+    if !tx_from_hex.eq_ignore_ascii_case(&wallet_addr) {
         return Err("route tx from does not match session wallet_address".into());
     }
 
     // Re-verify route input integrity.
-    if !route.input_matches_request(req) {
+    if !route.input_matches_request(&req) {
         return Err(
             "stored Enso route transaction input does not match the stored request — refusing"
                 .into(),
@@ -642,59 +650,186 @@ pub fn confirm<H: Host>(
     }
 
     // Verify chain_id.
-    match host.chain_id(&sess.chain) {
-        Ok(live_chain_id) if live_chain_id == req.chain_id => { /* ok */ }
-        Ok(live_chain_id) => {
-            return Err(format!(
-                "live chain_id ({live_chain_id}) does not match session chain_id ({}) — refusing",
-                req.chain_id
-            ));
-        }
-        Err(_) => { /* chain_read unavailable — proceed cautiously */ }
+    let live_chain_id = host
+        .chain_id(&sess.chain)
+        .map_err(|e| format!("cannot verify source chain at confirm time: {e}"))?;
+    if live_chain_id != req.chain_id {
+        return Err(format!(
+            "live chain_id ({live_chain_id}) does not match session chain_id ({}) — refusing",
+            req.chain_id
+        ));
     }
 
-    // POLICY RE-EVALUATION: re-evaluate from current session state (not the
-    // snapshot from create time). Refuse on any Deny outcome before staging.
-    let route_verified = route.input_matches_request(req);
+    // Re-read and enforce the current signed policy at the last possible
+    // moment. The outbox host verifies the passkey policy signature again.
     let needs_approve = sess.intents.iter().any(|i| i.label == "approve");
     let cross_chain = sess
         .destination_chain
         .as_deref()
-        .map(|d| d != sess.chain)
+        .map(|d| !d.eq_ignore_ascii_case(&sess.chain))
         .unwrap_or(false);
+    let destination_chain = sess.destination_chain.as_deref().unwrap_or(&sess.chain);
     let receiver_class = sess.receiver_class.as_deref().unwrap_or("unknown");
-    let reevaluated = evaluate_policy(route_verified, needs_approve, cross_chain, receiver_class);
-    // Update stored policy checks with fresh evaluation.
-    sess.policy_checks = reevaluated.clone();
-    save(host, &sess)?;
-    if let Some(checks) = reevaluated.as_array() {
-        for check in checks {
-            if check.get("outcome").and_then(|v| v.as_str()) == Some("deny") {
-                let rule = check.get("rule").and_then(|v| v.as_str()).unwrap_or("?");
-                let msg = check.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                return Err(format!(
-                    "policy denied [{rule}]: {msg} — deny-level policy is not bypassable"
-                ));
-            }
-        }
+    let receiver = req
+        .receiver
+        .map(|address| format!("0x{address:x}"))
+        .unwrap_or_else(|| sess.wallet_address.clone());
+    let token_out = format!("0x{:x}", req.token_out);
+    let router = format!("0x{:x}", route.tx.to);
+    let protocols = route.protocols();
+    let verified_policy = crate::policy::load_verified_policy(host, wallet)?;
+    sess.policy_checks = crate::policy::evaluate(
+        &verified_policy,
+        &crate::policy::RoutePolicyContext {
+            source_chain: &sess.chain,
+            destination_chain,
+            cross_chain,
+            receiver: &receiver,
+            token_out: &token_out,
+            receiver_class,
+            router: &router,
+            protocols: &protocols.0,
+            protocols_unknown: protocols.1,
+            native_value_wei: route.tx.value,
+            slippage_bps: req.slippage_bps,
+            route_verified: true,
+            receiver_verified: false,
+            min_out_enforced: false,
+            needs_approve,
+        },
+    );
+    if let Some(reason) = crate::policy::deny_reason(&sess.policy_checks) {
+        sess.last_error = Some(reason.clone());
+        save(host, &sess)?;
+        return Err(reason);
     }
 
-    // Stage each intent sequentially.
-    let mut staged_ids: Vec<String> = Vec::new();
     let intents = sess.intents.clone();
+    if intents.is_empty()
+        || intents.last().map(|intent| intent.label.as_str()) != Some("route")
+        || intents
+            .iter()
+            .any(|intent| !matches!(intent.label.as_str(), "approve" | "route"))
+    {
+        return Err("session intent sequence is invalid — refusing to stage".into());
+    }
 
-    for (idx, intent) in intents.iter().enumerate() {
-        // Skip already-staged intents.
-        if let Some(state) = sess.intent_states.get(idx) {
-            if let Some(ref existing_id) = state.outbox_id {
-                // Check if already pending/staged in outbox.
-                if state.status == "staged" {
-                    staged_ids.push(existing_id.clone());
-                    continue;
-                }
+    // ERC-20 approval is deliberately a separate confirmation phase because
+    // the Petal WIT does not expose Bloom's outbox dependency API.
+    if needs_approve {
+        let approve = intents
+            .first()
+            .filter(|intent| intent.label == "approve")
+            .ok_or("approval intent is missing or out of order")?;
+        let approve_state = sess
+            .intent_states
+            .first()
+            .ok_or("approval intent state is missing")?;
+
+        if approve_state.outbox_id.is_none() {
+            let evm_tx = EvmTransaction {
+                wallet: wallet.to_string(),
+                chain: approve.chain.clone(),
+                to: approve.to.clone(),
+                value_wei: approve.value_wei.clone(),
+                data_hex: approve.data_hex.clone(),
+                nonce: None,
+                max_fee_per_gas: None,
+                max_priority_fee_per_gas: None,
+            };
+            let staged = host.tx_stage(&evm_tx)?;
+            if let Some(state) = sess.intent_states.first_mut() {
+                state.status = "staged".into();
+                state.outbox_id = Some(staged.outbox_id.clone());
+                state.approval = staged.approval.as_ref().map(|approval| {
+                    serde_json::json!({
+                        "action_id": approval.action_id,
+                        "ceremony_url": approval.ceremony_url,
+                        "expires_ms": approval.expires_ms,
+                    })
+                });
+                state.updated_ms = now;
             }
+            if let Some(route_state) = sess.intent_states.get_mut(1) {
+                route_state.depends_on = Some(staged.outbox_id.clone());
+                route_state.updated_ms = now;
+            }
+            sess.staged_ids = vec![staged.outbox_id];
+            sess.transition(
+                now,
+                "awaiting_approval",
+                "exact-amount approval staged; route remains unstaged",
+            );
+            save(host, &sess)?;
+            return Ok(());
         }
 
+        let approval_id = approve_state.outbox_id.clone().unwrap();
+        let inspection = host.tx_inspect(wallet, &approve.chain, &approval_id)?;
+        if inspection.state != "success" {
+            if matches!(
+                inspection.state.as_str(),
+                "failed" | "reverted" | "cancelled"
+            ) {
+                sess.last_error = Some(format!(
+                    "approval outbox transaction ended as {}",
+                    inspection.state
+                ));
+                sess.transition(
+                    now,
+                    "approval_failed",
+                    "approval transaction did not succeed",
+                );
+                save(host, &sess)?;
+            }
+            return Err(format!(
+                "approval {approval_id} is {}; broadcast it and wait for a successful receipt before confirming again",
+                inspection.state
+            ));
+        }
+        if let Some(state) = sess.intent_states.first_mut() {
+            state.status = "confirmed".into();
+            state.tx_hash = inspection.tx_hash;
+            state.updated_ms = now;
+        }
+
+        let allowance = host
+            .erc20_allowance(&sess.chain, &approve.to, &wallet_addr, &router)
+            .map_err(|e| format!("cannot re-verify ERC-20 allowance: {e}"))?;
+        if lt_decimal(&allowance, &req.amount_in.to_string()) {
+            return Err("approval receipt succeeded but allowance is still insufficient".into());
+        }
+        sess.updated_ms = now;
+        save(host, &sess)?;
+    }
+
+    // Re-simulate with current chain state immediately before staging the
+    // executable route.
+    let simulation = crate::simulation::simulate_route_response(host, &sess.chain, &route);
+    if !simulation
+        .get("success")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        let reason = format!(
+            "route simulation failed at confirm time: {}",
+            crate::simulation::failure_message(&simulation)
+        );
+        sess.simulation = Some(simulation);
+        sess.last_error = Some(reason.clone());
+        save(host, &sess)?;
+        return Err(reason);
+    }
+    sess.simulation = Some(simulation);
+
+    let route_index = intents.len() - 1;
+    if sess
+        .intent_states
+        .get(route_index)
+        .and_then(|state| state.outbox_id.as_ref())
+        .is_none()
+    {
+        let intent = &intents[route_index];
         let evm_tx = EvmTransaction {
             wallet: wallet.to_string(),
             chain: intent.chain.clone(),
@@ -708,32 +843,49 @@ pub fn confirm<H: Host>(
 
         let staged = host.tx_stage(&evm_tx)?;
 
-        if let Some(state) = sess.intent_states.get_mut(idx) {
+        if let Some(state) = sess.intent_states.get_mut(route_index) {
             state.status = "staged".into();
             state.outbox_id = Some(staged.outbox_id.clone());
+            state.approval = staged.approval.as_ref().map(|approval| {
+                serde_json::json!({
+                    "action_id": approval.action_id,
+                    "ceremony_url": approval.ceremony_url,
+                    "expires_ms": approval.expires_ms,
+                })
+            });
             state.updated_ms = now;
         }
-
-        // If this is an approve intent, mark the next intent as depending on it.
-        if intent.label == "approve" && idx + 1 < intents.len() {
-            if let Some(next) = sess.intent_states.get_mut(idx + 1) {
-                next.depends_on = Some(staged.outbox_id.clone());
-                next.updated_ms = now;
-            }
-        }
-
-        staged_ids.push(staged.outbox_id.clone());
-
-        // Persist after each successful stage (crash recovery).
-        sess.staged_ids = staged_ids.clone();
-        sess.updated_ms = now;
-        save(host, &sess)?;
+        sess.staged_ids.push(staged.outbox_id);
     }
 
-    sess.staged_ids = staged_ids;
-    sess.transition(now, "staged", "all intents staged into outbox");
+    sess.transition(now, "staged", "route staged into outbox");
     save(host, &sess)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// abandon — cancel a session before any outbox transaction exists
+// ---------------------------------------------------------------------------
+
+pub fn abandon<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<(), String> {
+    let now = host.now_ms();
+    let mut sess = load(host, wallet, id)?;
+
+    if sess.wallet != wallet {
+        return Err("wallet mismatch: session does not belong to this wallet".into());
+    }
+
+    // Refuse if any intent has been staged to the outbox.
+    if sess.intent_states.iter().any(|s| s.outbox_id.is_some()) {
+        return Err("cannot abandon after an outbox transaction exists".into());
+    }
+
+    if sess.terminal() {
+        return Err("session is already terminal".into());
+    }
+
+    sess.transition(now, "abandoned", "user abandoned before staging");
+    save(host, &sess)
 }
 
 // ---------------------------------------------------------------------------
@@ -760,7 +912,7 @@ mod tests {
     #[test]
     fn parses_whole_amount_no_decimals() {
         let v = parse_amount("100", 6).unwrap();
-        assert_eq!(v, U256::from(100u64));
+        assert_eq!(v, U256::from(100_000_000u64));
     }
 
     #[test]
@@ -782,12 +934,15 @@ mod tests {
 
     #[test]
     fn approve_calldata_format() {
-        let data = build_approve_calldata("0x1234567890abcdef1234567890abcdef12345678");
+        let data = build_approve_calldata(
+            "0x1234567890abcdef1234567890abcdef12345678",
+            U256::from(123u64),
+        );
         assert!(data.starts_with("0x095ea7b3"));
         // Spender should be padded to 32 bytes.
         assert!(data.contains("0000000000000000000000001234567890abcdef1234567890abcdef12345678"));
-        // Max uint256 at the end.
-        assert!(data.ends_with(&"f".repeat(64)));
+        // Exact amount at the end.
+        assert!(data.ends_with(&format!("{:064x}", U256::from(123u64))));
     }
 
     #[test]
@@ -797,9 +952,6 @@ mod tests {
         assert!(!lt_decimal("101", "100"));
         assert!(lt_decimal("0", "1"));
         assert!(!lt_decimal("0", "0"));
-        assert!(lt_decimal(
-            "999999999999999999",
-            "1000000000000000000"
-        ));
+        assert!(lt_decimal("999999999999999999", "1000000000000000000"));
     }
 }

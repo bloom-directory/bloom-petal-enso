@@ -8,7 +8,7 @@ simulation, and swap execution through the Bloom transaction pipeline.
 ### 1. Create an intent
 
 ```
-write: /intents/<wallet>/new
+write: /petals/enso/intents/<wallet>/new
 body:  {"intent":"swap 100 usdc to eth","chain":"ethereum"}
   or:  swap 100 usdc to eth
 ```
@@ -16,36 +16,58 @@ body:  {"intent":"swap 100 usdc to eth","chain":"ethereum"}
 ### 2. Inspect the plan
 
 ```
-read: /intents/<wallet>/<session>/plan.md
-read: /intents/<wallet>/<session>/route.json
-read: /intents/<wallet>/<session>/tx.json
-read: /intents/<wallet>/<session>/simulation.json
+read: /petals/enso/intents/<wallet>/<session>/plan.md
+read: /petals/enso/intents/<wallet>/<session>/route.json
+read: /petals/enso/intents/<wallet>/<session>/tx.json
+read: /petals/enso/intents/<wallet>/<session>/simulation.json
 ```
 
 ### 3. Confirm
 
 ```
-write: /intents/<wallet>/<session>/confirm    # Stage into outbox
+write: /petals/enso/intents/<wallet>/<session>/confirm
+body:  confirm
 write: /wallets/<wallet>/chains/<chain>/outbox/pending/<id>/confirm  # Broadcast
 ```
+
+For an ERC-20 route that needs approval, the first Petal confirmation stages
+only an exact-amount approval. Broadcast it and wait for a successful receipt,
+then write `confirm` to the Petal again. Only then is the swap simulated and
+staged. The route transaction is never placed in the outbox alongside a
+pending approval.
 
 ## Configuration
 
 Set the Enso API key:
 
 ```
-write: /settings/api-key
+write: /petals/enso/settings/api-key
 body:  your-enso-api-key-here
 ```
 
-Or configure via runtime setting `enso-api-key`.
+The Petal secret store is preferred. The runtime setting `enso-api-key` is a
+compatibility fallback and `settings/status.json` reports it as unencrypted
+runtime configuration.
 
 ## Safety Model
 
 - Route discovery uses the Enso Shortcuts API (requires an API key)
-- Route input is verified against the Enso Router V2 calldata envelope
+- Whole-number natural-language amounts are token units (`100 USDC` means
+  `100000000` base units)
+- Route source asset, amount, sender, and native value are verified against
+  the Enso Router V2 calldata envelope
+- The wallet's current signed `[defi]` policy is evaluated at create and
+  confirm; a stale or unsigned passkey policy fails closed
+- Simulation must pass before the route transaction is staged
+- ERC-20 approval is exact-amount and must have a successful receipt first
 - Broadcast requires the standard outbox confirm (owner gate)
-- Settlement verification for cross-chain routes: read settlement.json
+- Settlement requires a successful source receipt and a destination balance
+  increase at least as large as Enso's quoted output
+
+Enso's opaque Router V2 action bytes are not fully decoded by this version.
+If `require_calldata_verification = false`, the plan reports explicit
+receiver/min-output warnings. That mode is suitable only for operator-reviewed
+transactions, not unattended autonomous value movement.
 
 ## Route Surface
 

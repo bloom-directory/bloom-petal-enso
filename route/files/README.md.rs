@@ -1,41 +1,42 @@
-petal::route_file!(spec: petal::static_spec(), read: |_ctx: &petal::Ctx| {
+petal::route_file!(spec: petal::static_read_spec(), read: |_ctx: &petal::Ctx| {
     petal::DispatchResponse::Read(br#"# DeFi Intents (Enso Shortcuts)
 
 ## Quick Start for Agents
 
 ### 1. Create an intent
 ```json
- write: /defi/intents/<wallet>/new
+ write: /petals/enso/intents/<wallet>/new
  example: {"intent":"swap 100 usdc to eth","chain":"ethereum"}
  or just NL text: swap 100 usdc to eth
 ```
 
 ### 2. Inspect the plan
 ```json
- read: /defi/intents/<wallet>/<session>/plan.md
- read: /defi/intents/<wallet>/<session>/route.json
- read: /defi/intents/<wallet>/<session>/tx.json
- read: /defi/intents/<wallet>/<session>/simulation.json
- read: /defi/intents/<wallet>/<session>/policy_check.json
+ read: /petals/enso/intents/<wallet>/<session>/plan.md
+ read: /petals/enso/intents/<wallet>/<session>/route.json
+ read: /petals/enso/intents/<wallet>/<session>/tx.json
+ read: /petals/enso/intents/<wallet>/<session>/simulation.json
+ read: /petals/enso/intents/<wallet>/<session>/policy_check.json
 ```
 
 ### 3. Confirm
 ```json
- write: /defi/intents/<wallet>/<session>/confirm    # Stage into outbox
+ write: /petals/enso/intents/<wallet>/<session>/confirm
+ body: confirm
 ```
 
 ### 4. Verify settlement
 ```json
- read: /defi/intents/<wallet>/<session>/settlement.json
- read: /defi/intents/<wallet>/<session>/wait_settlement.json
+ read: /petals/enso/intents/<wallet>/<session>/settlement.json
+ read: /petals/enso/intents/<wallet>/<session>/wait_settlement.json
 ```
 
 ## Safety Model
 
-- Route discovery uses the Enso Shortcuts API (requires BLOOM_ENSO_KEY)
-- Simulation runs during create and on each read; reverts are decoded
-- Policy checks re-evaluate at confirm time; deny outcomes block staging
-- Auto-approve handles ERC-20 allowances when needed
-- Settlement verification for cross-chain routes
+- Route discovery uses the Enso Shortcuts API and Petal secret storage
+- The signed wallet DeFi policy is enforced at create and confirm
+- Simulation must pass before the route transaction is staged
+- ERC-20 approval is exact-amount and must succeed before a second confirm
+- Settlement requires a successful source receipt and the quoted output delta
 "#.to_vec())
 });

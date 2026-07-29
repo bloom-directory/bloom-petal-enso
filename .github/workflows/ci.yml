@@ -3,31 +3,58 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [master]
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - name: Install Rust WASM targets
+        run: |
+          rustup show
+          rustup target add wasm32-wasip2 wasm32-unknown-unknown
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: route
+      - name: Format route crate
+        run: cargo fmt --manifest-path route/Cargo.toml --all -- --check
       - name: Test route crate
-        run: |
-          scripts/check-route-architecture.sh
-          cargo fmt --manifest-path route/Cargo.toml -- --check
-          cargo test --manifest-path route/Cargo.toml --locked
-          cargo clippy --manifest-path route/Cargo.toml --locked --all-targets -- -D warnings
-      - name: Install component tools
-        run: cargo install wasm-tools --version 1.249.0 --locked
+        run: cargo test --manifest-path route/Cargo.toml --locked
+      - name: Clippy route crate
+        run: cargo clippy --manifest-path route/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Check route architecture
+        run: scripts/check-route-architecture.sh
+      - name: Install wasm-tools
+        run: cargo install wasm-tools --version 1.254.0 --locked
       - name: Install canonical Petal toolchain
         run: cargo install --git https://github.com/bloom-directory/petal --rev 4f6fb57063a70f95cba288f68bdc139e3ecac7a5 --locked bloom-petal-cli
-      - name: Build and inspect all routes
+      - name: Build and validate route components
         run: |
           scripts/build.sh
           petal check --root .
-          test "$(find petal/enso -name '*.wasm' | wc -l | tr -d ' ')" = 18
+      - name: Checkout Bloom CLI
+        uses: actions/checkout@v6
+        with:
+          repository: bloom-directory/bloom
+          ref: master
+          path: bloom
+          persist-credentials: false
+      - name: Build Bloom CLI
+        run: cargo build --release --manifest-path bloom/Cargo.toml -p bloom --bin bloom
+      - name: Validate package and static dispatch
+        shell: bash
+        run: |
+          set -euo pipefail
+          bloom_bin="$GITHUB_WORKSPACE/bloom/target/release/bloom"
+          "$bloom_bin" petals build .
+          home="$(mktemp -d)"
+          "$bloom_bin" --home "$home" petal install .
+          "$bloom_bin" --home "$home" vfs cat /petals/enso/meta/route-contract.json | grep -Fq '"name": "enso"'
+          "$bloom_bin" --home "$home" vfs cat /petals/enso/README.md | grep -Fq '/petals/enso/intents/'
