@@ -61,6 +61,10 @@ pub fn simulate_route<H: Host>(host: &mut H, sess: &Session) -> serde_json::Valu
 ///   32-byte offset (always 0x20 for a single string)
 ///   32-byte length
 ///   `length` bytes of UTF-8 data, padded to a 32-byte boundary.
+pub fn decode_error_string_pub(hex_data: &str) -> Option<String> {
+    decode_error_string(hex_data)
+}
+
 fn decode_error_string(hex_data: &str) -> Option<String> {
     let hex = hex_data.strip_prefix("0x").or_else(|| hex_data.strip_prefix("0X"))?;
     if !hex_data.starts_with("0x08c379a0") && !hex_data.starts_with("0X08c379a0") {

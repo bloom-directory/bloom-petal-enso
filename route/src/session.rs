@@ -53,6 +53,10 @@ pub struct IntentState {
     pub outbox_id: Option<String>,
     #[serde(default)]
     pub tx_hash: Option<String>,
+    /// Outbox ID of a prerequisite intent that must be mined before this one
+    /// is broadcast. Used for ERC-20 approve → route ordering.
+    #[serde(default)]
+    pub depends_on: Option<String>,
     pub updated_ms: u64,
 }
 

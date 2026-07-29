@@ -198,6 +198,8 @@ fn render_plan_md(
     route_verified: bool,
     receiver_class: &str,
     observed_before: Option<&str>,
+    policy_checks: &serde_json::Value,
+    simulation: Option<&serde_json::Value>,
 ) -> String {
     let dest = destination_chain.unwrap_or(chain_name);
     let protocols = route.protocols();
@@ -212,6 +214,12 @@ fn render_plan_md(
     let token_in_hex = format!("0x{:x}", req.token_in);
     let token_out_hex = format!("0x{:x}", req.token_out);
 
+    // Receiver address (checksummed via alloy).
+    let receiver_addr = req
+        .receiver
+        .map(|a| format!("0x{:x}", a))
+        .unwrap_or_else(|| format!("0x{:x}", req.from_address));
+
     let mut out = format!(
         "# Enso Shortcuts Swap\n\n\
          The following is Bloom's authoritative transaction plan.\n\n\
@@ -222,6 +230,8 @@ fn render_plan_md(
          - Token out: `{token_out_hex}`\n\
          - Amount in: {}\n\
          - Expected output: {}\n\
+         - Slippage tolerance: {} bps (0.{}%)\n\
+         - Receiver: `{receiver_addr}`\n\
          - Route verified: {route_verified}\n\
          - Protocols: {protocol_str}\n\
          - Gas estimate: {}\n\
@@ -230,6 +240,8 @@ fn render_plan_md(
         req.chain_id,
         req.amount_in,
         route.amount_out,
+        req.slippage_bps,
+        req.slippage_bps,
         route.gas.as_deref().unwrap_or("not estimated"),
         route
             .price_impact
@@ -237,18 +249,60 @@ fn render_plan_md(
             .unwrap_or_else(|| "not reported".into()),
     );
 
+    // Simulation summary.
+    if let Some(sim) = simulation {
+        let sim_ok = sim.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+        if sim_ok {
+            out.push_str("- Simulation: **passed** ✅\n\n");
+        } else {
+            let msg = sim
+                .get("decoded_error")
+                .and_then(|v| v.get("message"))
+                .and_then(|v| v.as_str())
+                .or_else(|| sim.get("error").and_then(|v| v.as_str()))
+                .unwrap_or("simulation failed");
+            out.push_str(&format!("- Simulation: **failed** ❌ — {msg}\n\n"));
+        }
+    }
+
+    // Policy checks section.
+    if let Some(checks) = policy_checks.as_array() {
+        if !checks.is_empty() {
+            out.push_str("## Policy checks\n\n");
+            for check in checks {
+                let rule = check.get("rule").and_then(|v| v.as_str()).unwrap_or("?");
+                let outcome = check.get("outcome").and_then(|v| v.as_str()).unwrap_or("?");
+                let message = check.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                let icon = match outcome {
+                    "pass" => "✅",
+                    "warn" => "⚠️",
+                    "deny" => "❌",
+                    _ => "❓",
+                };
+                out.push_str(&format!("- {icon} **{rule}** ({outcome}): {message}\n"));
+            }
+            out.push('\n');
+        }
+    }
+
     out.push_str("## Transactions to stage\n\n");
     for (i, intent) in intents.iter().enumerate() {
+        let data_len = if intent.data_hex.starts_with("0x") {
+            (intent.data_hex.len() - 2) / 2
+        } else {
+            intent.data_hex.len() / 2
+        };
         out.push_str(&format!(
             "**{i}. `{}`** — `{}`\n\
              - To: `{}`\n\
              - Value: {} wei\n\
-             - Calldata: `{}…`\n",
+             - Calldata: `{}…` ({} bytes)\n",
             intent.label,
             intent.chain,
             intent.to,
             intent.value_wei,
             &intent.data_hex[..intent.data_hex.len().min(74)],
+            data_len,
         ));
         if let Some(ref token) = intent.approve_token {
             out.push_str(&format!("- Approve token: `{token}`\n"));
@@ -266,7 +320,10 @@ fn render_plan_md(
         ));
     }
 
-    out.push_str("Write `confirm` to stage these transactions into the wallet outbox.\n");
+    out.push_str(&format!(
+        "Write `confirm` to stage {} transaction(s) into the wallet outbox.\n",
+        intents.len()
+    ));
     out
 }
 
@@ -380,6 +437,35 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
 
     let router_addr = format!("0x{:x}", route_resp.tx.to);
 
+    // SIMULATION: run eth_call against the route tx to catch reverts early.
+    let simulation = {
+        let sim_to = router_addr.clone();
+        let sim_data = format!("0x{}", hex::encode(&route_resp.tx.data));
+        let sim_from = format!("0x{:x}", route_resp.tx.from);
+        let sim_value = route_resp.tx.value.to_string();
+        match host.eth_call(chain_name, &sim_to, &sim_data, Some(&sim_from), Some(&sim_value)) {
+            Ok(res) if res.success => serde_json::json!({
+                "success": true,
+                "return_data": res.return_data,
+                "gas": route_resp.gas,
+            }),
+            Ok(res) => {
+                let message = crate::simulation::decode_error_string_pub(&res.return_data)
+                    .unwrap_or_else(|| res.return_data.clone());
+                serde_json::json!({
+                    "success": false,
+                    "decoded_error": { "message": message },
+                    "gas": route_resp.gas,
+                })
+            }
+            Err(e) => serde_json::json!({
+                "success": false,
+                "error": e,
+                "gas": route_resp.gas,
+            }),
+        }
+    };
+
     // Check ERC-20 allowance and build approve intent if needed.
     let token_in_is_native = token_in_hex.eq_ignore_ascii_case(NATIVE_TOKEN);
     let mut needs_approve = false;
@@ -453,6 +539,8 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
         route_verified,
         &receiver_class,
         observed_before.as_deref(),
+        &policy_checks,
+        Some(&simulation),
     );
 
     // Build intent_states (one per intent, all "prepared").
@@ -465,6 +553,7 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
             status: "prepared".into(),
             outbox_id: None,
             tx_hash: None,
+            depends_on: None,
             updated_ms: now_ms,
         })
         .collect();
@@ -491,7 +580,7 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
         source_tx_hashes: Vec::new(),
         policy_checks,
         receiver_class: Some(receiver_class),
-        simulation: None,
+        simulation: Some(simulation),
         last_error: None,
         history: Vec::new(),
     };
@@ -597,6 +686,14 @@ pub fn confirm<H: Host>(
             state.status = "staged".into();
             state.outbox_id = Some(staged.outbox_id.clone());
             state.updated_ms = now;
+        }
+
+        // If this is an approve intent, mark the next intent as depending on it.
+        if intent.label == "approve" && idx + 1 < intents.len() {
+            if let Some(next) = sess.intent_states.get_mut(idx + 1) {
+                next.depends_on = Some(staged.outbox_id.clone());
+                next.updated_ms = now;
+            }
         }
 
         staged_ids.push(staged.outbox_id.clone());
