@@ -123,7 +123,7 @@ pub struct RouteResponse {
     #[serde(default)]
     pub price_impact: Option<f64>,
     /// Destination chain id extracted from the first bridging hop.
-    #[serde(skip)]
+    #[serde(default)]
     pub destination_chain_id: Option<u64>,
 }
 
@@ -166,6 +166,17 @@ impl RouteResponse {
                     && self.tx.value == U256::ZERO
             }
             _ => false,
+        }
+    }
+
+    /// Verify that a response's bridge metadata agrees with the requested
+    /// destination. Same-chain responses may omit destination metadata.
+    pub fn destination_matches_request(&self, req: &RouteRequest) -> bool {
+        match req.destination_chain_id {
+            Some(expected) => self.destination_chain_id == Some(expected),
+            None => self
+                .destination_chain_id
+                .is_none_or(|actual| actual == req.chain_id),
         }
     }
 

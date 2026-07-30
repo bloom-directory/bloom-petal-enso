@@ -130,6 +130,41 @@ require_calldata_verification = false
             },
         );
     }
+
+    fn mark_outbox_success_with_transfer(
+        &mut self,
+        id: &str,
+        token: &str,
+        receiver: &str,
+        amount: u128,
+    ) {
+        let receiver_topic = format!(
+            "0x{}{}",
+            "00".repeat(12),
+            receiver.trim_start_matches("0x").to_ascii_lowercase()
+        );
+        let receipt = serde_json::json!({
+            "outcome": "success",
+            "logs": [{
+                "address": token,
+                "topics": [
+                    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+                    format!("0x{}", "00".repeat(32)),
+                    receiver_topic,
+                ],
+                "data": format!("0x{amount:064x}"),
+            }]
+        });
+        self.inspections.insert(
+            id.to_string(),
+            OutboxInspection {
+                outbox_id: id.to_string(),
+                state: "success".into(),
+                tx_hash: Some(format!("0x{}", "ab".repeat(32))),
+                receipt_json: Some(receipt.to_string()),
+            },
+        );
+    }
 }
 
 impl Host for MockHost {
@@ -862,7 +897,7 @@ fn erc20_zero_allowance_adds_approve_intent() {
 fn load_nonexistent_session_errors() {
     let mut host = MockHost::new();
 
-    let result = crate::workflow::load(&mut host, "test-wallet", "nonexistent-id");
+    let result = crate::workflow::load(&mut host, "test-wallet", "0000000000000000");
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("not found"));
 }
@@ -1172,7 +1207,12 @@ fn settlement_received_after_balance_increase() {
 
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     let route_id = sess.intent_states[0].outbox_id.clone().unwrap();
-    host.mark_outbox_success(&route_id);
+    host.mark_outbox_success_with_transfer(
+        &route_id,
+        "0x6b175474e89094c44da98b954eedeac495271d0f",
+        "0x742d35cc6634c0532925a3b844bc9e7595f0beb1",
+        50_000_000_000_000_000,
+    );
 
     // Now simulate balance increase on destination chain
     host.balance_override = Some("2000000000000000000".to_string());
@@ -1363,6 +1403,114 @@ fn invalid_wallet_name_rejected() {
     // Wallet name with space
     let result = crate::workflow::create(&mut host, "test wallet", br#"swap 100.0 usdc to eth"#);
     assert!(result.is_err());
+}
+
+#[test]
+fn oversized_intent_body_is_rejected_before_external_work() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let body = vec![b'a'; crate::input::MAX_NEW_BODY_BYTES + 1];
+    let error = crate::workflow::create(&mut host, "test-wallet", &body).unwrap_err();
+    assert!(error.contains("intent body"), "{error}");
+    assert_eq!(host.stage_count, 0);
+}
+
+#[test]
+fn abandon_requires_exact_command() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 100.0 usdc to eth").unwrap();
+    let error =
+        crate::workflow::abandon_with_body(&mut host, "test-wallet", &id, b"yes").unwrap_err();
+    assert!(error.contains("exactly `abandon`"), "{error}");
+    assert_eq!(
+        crate::workflow::load(&mut host, "test-wallet", &id)
+            .unwrap()
+            .state,
+        "prepared"
+    );
+}
+
+#[test]
+fn active_confirmation_lock_prevents_duplicate_staging() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 100.0 usdc to eth").unwrap();
+    let lock_key = format!("intents/test-wallet/{id}/confirm.lock");
+    let lock = serde_json::to_vec(&serde_json::json!({
+        "created_ms": host.now,
+        "nonce": "held",
+    }))
+    .unwrap();
+    host.put_new(&lock_key, &lock, false).unwrap();
+
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    assert!(error.contains("already in progress"), "{error}");
+    assert_eq!(host.stage_count, 0);
+}
+
+#[test]
+fn stale_confirmation_lock_is_recovered() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 100.0 usdc to eth").unwrap();
+    let lock_key = format!("intents/test-wallet/{id}/confirm.lock");
+    let stale = serde_json::to_vec(&serde_json::json!({
+        "created_ms": 1,
+        "nonce": "stale",
+    }))
+    .unwrap();
+    host.put_new(&lock_key, &stale, false).unwrap();
+
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    assert_eq!(host.stage_count, 1);
+    assert!(!host.store.contains_key(&lock_key));
+}
+
+#[test]
+fn confirm_rejects_tampered_prepared_transaction() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 100.0 usdc to eth").unwrap();
+    let mut session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    session.intents.last_mut().unwrap().to = "0x000000000000000000000000000000000000dead".into();
+    host.put(
+        &session.key(),
+        &serde_json::to_vec(&session).unwrap(),
+        false,
+    )
+    .unwrap();
+
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    assert!(error.contains("does not match"), "{error}");
+    assert_eq!(host.stage_count, 0);
+}
+
+#[test]
+fn create_rejects_mismatched_destination_metadata() {
+    let mut response: serde_json::Value =
+        serde_json::from_slice(&build_enso_response_erc20()).unwrap();
+    response["route"][0]["destinationChainId"] = serde_json::json!(137);
+    let mut host = MockHost::new().with_enso_response(serde_json::to_vec(&response).unwrap());
+    let body = br#"{
+        "intent":"swap 100.0 usdc to eth",
+        "chain":"ethereum",
+        "destination_chain":"base"
+    }"#;
+    let error = crate::workflow::create(&mut host, "test-wallet", body).unwrap_err();
+    assert!(error.contains("destination chain"), "{error}");
+}
+
+#[test]
+fn unrelated_balance_increase_is_not_claimed_as_settlement() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 100.0 usdc to dai").unwrap();
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    let session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    let route_id = session.intent_states[0].outbox_id.clone().unwrap();
+    host.mark_outbox_success(&route_id);
+    host.balance_override = Some("2000000000000000000".into());
+
+    let status = crate::settlement::settlement_status(&mut host, &session);
+    assert_eq!(
+        status.get("status").and_then(|value| value.as_str()),
+        Some("destination_observed_unattributed")
+    );
 }
 
 // ===========================================================================

@@ -4,15 +4,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PETAL_REV="4f6fb57063a70f95cba288f68bdc139e3ecac7a5"
 
-if [[ "${PETAL_COMPILE_TIME_SECRET+x}" == "x" ]]; then
-  if [[ -z "$PETAL_COMPILE_TIME_SECRET" ]]; then
-    echo "PETAL_COMPILE_TIME_SECRET is not configured" >&2
-    exit 1
-  fi
-  export ENSO_API_KEY="$PETAL_COMPILE_TIME_SECRET"
-  unset PETAL_COMPILE_TIME_SECRET
-fi
-
 # Bloom materializes composed route artifacts here after package validation.
 # They are derived from the route sources and must not survive a source
 # rebuild, or the next `bloom petals build/install` rejects the stale bytes

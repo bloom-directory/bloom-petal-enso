@@ -23,6 +23,8 @@ fn save<H: Host>(host: &mut H, s: &Session) -> Result<(), String> {
 }
 
 pub fn load<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<Session, String> {
+    validate_wallet_name(wallet)?;
+    validate_session_id(id)?;
     let raw = host
         .get(&session::key(wallet, id), 2 * 1024 * 1024)?
         .ok_or("session not found")?;
@@ -65,6 +67,13 @@ fn validate_wallet_name(wallet: &str) -> Result<(), String> {
 fn validate_address(addr: &str) -> Result<(), String> {
     if !addr.starts_with("0x") || addr.len() != 42 {
         return Err("wallet address must be a 0x-prefixed 20-byte hex string".into());
+    }
+    Ok(())
+}
+
+fn validate_session_id(id: &str) -> Result<(), String> {
+    if id.len() != 16 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("session ID is invalid".into());
     }
     Ok(())
 }
@@ -132,6 +141,80 @@ fn classify_receiver(wallet_addr: &str, receiver_addr: &str) -> String {
     } else {
         "unknown".to_string()
     }
+}
+
+fn valid_positive_decimal(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.bytes().any(|byte| byte != b'0')
+}
+
+fn verify_prepared_intents(
+    sess: &Session,
+    req: &RouteRequest,
+    route: &RouteResponse,
+) -> Result<(), String> {
+    if sess.intents.len() != sess.intent_states.len()
+        || sess
+            .intent_states
+            .iter()
+            .enumerate()
+            .any(|(index, state)| state.index != index)
+    {
+        return Err("session intent state layout is invalid — refusing to stage".into());
+    }
+
+    let router = format!("0x{:x}", route.tx.to);
+    let route_data = format!("0x{}", hex::encode(&route.tx.data));
+    let route_intent = sess
+        .intents
+        .last()
+        .filter(|intent| intent.label == "route")
+        .ok_or("session route intent is missing or out of order")?;
+    if !route_intent.to.eq_ignore_ascii_case(&router)
+        || route_intent.value_wei != route.tx.value.to_string()
+        || !route_intent.data_hex.eq_ignore_ascii_case(&route_data)
+        || !route_intent.chain.eq_ignore_ascii_case(&sess.chain)
+        || route_intent.approve_token.is_some()
+        || route_intent.approve_spender.is_some()
+    {
+        return Err("prepared route transaction does not match the verified Enso route".into());
+    }
+
+    let approval_count = sess
+        .intents
+        .iter()
+        .filter(|intent| intent.label == "approve")
+        .count();
+    if approval_count == 0 {
+        if sess.intents.len() != 1 {
+            return Err("session contains an unexpected prepared transaction".into());
+        }
+        return Ok(());
+    }
+    if approval_count != 1 || sess.intents.len() != 2 {
+        return Err("session approval sequence is invalid — refusing to stage".into());
+    }
+
+    let approval = &sess.intents[0];
+    let token = format!("0x{:x}", req.token_in);
+    let expected_data = build_approve_calldata(&router, req.amount_in);
+    if !approval.to.eq_ignore_ascii_case(&token)
+        || approval.value_wei != "0"
+        || !approval.data_hex.eq_ignore_ascii_case(&expected_data)
+        || !approval.chain.eq_ignore_ascii_case(&sess.chain)
+        || !approval
+            .approve_token
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(&token))
+        || !approval
+            .approve_spender
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(&router))
+    {
+        return Err("prepared approval does not match the exact route allowance".into());
+    }
+    Ok(())
 }
 
 /// Render a human-readable plan document for the session.
@@ -414,6 +497,15 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
                 .into(),
         );
     }
+    if !route_resp.destination_matches_request(&route_req) {
+        return Err(
+            "Enso route destination chain does not match the requested destination — refusing"
+                .into(),
+        );
+    }
+    if !valid_positive_decimal(route_resp.amount_out.trim()) {
+        return Err("Enso route returned an invalid quoted output amount — refusing".into());
+    }
 
     let router_addr = format!("0x{:x}", route_resp.tx.to);
 
@@ -591,7 +683,67 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
 // confirm — stage all prepared intents into the outbox
 // ---------------------------------------------------------------------------
 
+const CONFIRM_LOCK_TTL_MS: u64 = 10 * 60 * 1000;
+
+fn confirm_lock_key(wallet: &str, id: &str) -> String {
+    format!("intents/{wallet}/{id}/confirm.lock")
+}
+
+fn acquire_confirm_lock<H: Host>(
+    host: &mut H,
+    wallet: &str,
+    id: &str,
+) -> Result<(String, Vec<u8>), String> {
+    validate_wallet_name(wallet)?;
+    validate_session_id(id)?;
+    let key = confirm_lock_key(wallet, id);
+    let now = host.now_ms();
+    let nonce = hex::encode(host.random(16)?);
+    let value = serde_json::to_vec(&serde_json::json!({
+        "created_ms": now,
+        "nonce": nonce,
+    }))
+    .map_err(|error| format!("cannot encode confirmation lock: {error}"))?;
+
+    if host.put_new(&key, &value, false).is_ok() {
+        return Ok((key, value));
+    }
+
+    let existing = host
+        .get(&key, 1024)?
+        .ok_or("confirmation is already in progress")?;
+    let created_ms = serde_json::from_slice::<serde_json::Value>(&existing)
+        .ok()
+        .and_then(|lock| lock.get("created_ms").and_then(|value| value.as_u64()));
+    if created_ms.is_none_or(|created| now.saturating_sub(created) <= CONFIRM_LOCK_TTL_MS) {
+        return Err("confirmation is already in progress".into());
+    }
+
+    host.delete_if(&key, &existing)?;
+    host.put_new(&key, &value, false)
+        .map_err(|_| "confirmation is already in progress".to_string())?;
+    Ok((key, value))
+}
+
 pub fn confirm<H: Host>(host: &mut H, wallet: &str, id: &str, body: &[u8]) -> Result<(), String> {
+    let (lock_key, lock_value) = acquire_confirm_lock(host, wallet, id)?;
+    let result = confirm_locked(host, wallet, id, body);
+    let unlock = host.delete_if(&lock_key, &lock_value);
+    match (result, unlock) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(format!(
+            "transaction was staged but confirmation lock cleanup failed: {error}"
+        )),
+    }
+}
+
+fn confirm_locked<H: Host>(
+    host: &mut H,
+    wallet: &str,
+    id: &str,
+    body: &[u8],
+) -> Result<(), String> {
     let confirmation = std::str::from_utf8(body)
         .map_err(|_| "confirmation body must be UTF-8")?
         .trim();
@@ -648,6 +800,13 @@ pub fn confirm<H: Host>(host: &mut H, wallet: &str, id: &str, body: &[u8]) -> Re
                 .into(),
         );
     }
+    if !route.destination_matches_request(&req) {
+        return Err("stored route destination does not match the stored request — refusing".into());
+    }
+    if !valid_positive_decimal(route.amount_out.trim()) {
+        return Err("stored route has an invalid quoted output amount — refusing".into());
+    }
+    verify_prepared_intents(&sess, &req, &route)?;
 
     // Verify chain_id.
     let live_chain_id = host
@@ -868,6 +1027,21 @@ pub fn confirm<H: Host>(host: &mut H, wallet: &str, id: &str, body: &[u8]) -> Re
 // ---------------------------------------------------------------------------
 
 pub fn abandon<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<(), String> {
+    abandon_with_body(host, wallet, id, b"abandon")
+}
+
+pub fn abandon_with_body<H: Host>(
+    host: &mut H,
+    wallet: &str,
+    id: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let command = std::str::from_utf8(body)
+        .map_err(|_| "abandon body must be UTF-8")?
+        .trim();
+    if command != "abandon" {
+        return Err("write exactly `abandon` to cancel this session".into());
+    }
     let now = host.now_ms();
     let mut sess = load(host, wallet, id)?;
 

@@ -38,7 +38,10 @@ petal::route_file!(
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        if status == "destination_received" || status == "unsupported_token" {
+        if matches!(
+            status,
+            "destination_received" | "destination_observed_unattributed" | "unsupported_token"
+        ) {
             return petal::read_json_value(&result);
         }
 
