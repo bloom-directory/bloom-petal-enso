@@ -45,10 +45,10 @@ write: /petals/enso/settings/api-key
 body:  your-enso-api-key-here
 ```
 
-The key is stored only in Bloom's Petal secret namespace. Release artifacts
-never contain it. The runtime setting `enso-api-key` remains a compatibility
-fallback, and `settings/status.json` reports the selected source without
-exposing the key.
+Release builds can embed the repository secret `ENSO_API_KEY`. A key written to
+`settings/api-key` takes precedence over that embedded release credential. The
+runtime setting `enso-api-key` remains a compatibility fallback, and
+`settings/status.json` reports the selected source without exposing the key.
 
 ## Safety Model
 
