@@ -176,8 +176,7 @@ pub fn resolve_token_symbol(chain_id: u64, sym: &str) -> Option<Address> {
         // ── Base (chain 8453) ─────────────────────────────────────────────
         (8453, "USDC") => "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".parse().ok(),
         (8453, "WETH") => "0x4200000000000000000000000000000000000006".parse().ok(),
-        // Bridged mainnet DAI; Base has no canonical native DAI deployment.
-        (8453, "DAI") => "0x6b175474e89094c44da98b954eedeac495271d0f".parse().ok(),
+        (8453, "DAI") => "0x50c5725949a6f0c72e6c4a641f24049a917db0cb".parse().ok(),
         (8453, "CBETH") => "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22".parse().ok(),
         (8453, "DEGEN") => "0x4ed4e862860bed51a9570b96d89af5e1b0efefed".parse().ok(),
 
@@ -376,6 +375,16 @@ mod tests {
                 "base token {sym} should resolve"
             );
         }
+    }
+
+    #[test]
+    fn base_dai_uses_the_base_deployment() {
+        assert_eq!(
+            resolve_token_symbol(8453, "DAI").unwrap(),
+            "0x50c5725949a6f0c72e6c4a641f24049a917db0cb"
+                .parse::<Address>()
+                .unwrap()
+        );
     }
 
     #[test]

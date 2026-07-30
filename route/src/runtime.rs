@@ -131,7 +131,15 @@ impl Host for BloomHost {
     }
 
     fn chain_read(&mut self, chain: &str, method: &str, params: &str) -> Result<String, String> {
-        petal::sdk::chain_read(chain, method, params).map_err(|error| error.message())
+        petal::sdk::chain_read(chain, method, params).map_err(|error| match error {
+            petal::SdkError::Message(message) => message,
+            // The SDK classifies host errors by substring and can collapse a
+            // descriptive invalid-parameter error to `Host(Invalid)`.
+            other => format!(
+                "{other:?} (chain={chain}, method={method}, params_len={})",
+                params.len()
+            ),
+        })
     }
 
     fn tx_stage(&mut self, tx: &EvmTransaction) -> Result<StagedTransaction, String> {
@@ -271,6 +279,9 @@ impl Host for BloomHost {
 
 fn rpc_quantity(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("RPC quantity is empty".into());
+    }
     if let Some(hex) = trimmed.strip_prefix("0x") {
         let parsed = U256::from_str_radix(if hex.is_empty() { "0" } else { hex }, 16)
             .map_err(|e| format!("invalid hexadecimal RPC quantity: {e}"))?;
@@ -391,5 +402,19 @@ mod tests {
             "00000000000000000000000000000000000000000000000000000000000003e8"
         );
         assert_eq!(decode_uint256(&word).unwrap(), "1000");
+    }
+
+    #[test]
+    fn rpc_quantity_canonicalizes_decimal_and_hex_values() {
+        assert_eq!(rpc_quantity("0").unwrap(), "0x0");
+        assert_eq!(rpc_quantity("100000").unwrap(), "0x186a0");
+        assert_eq!(rpc_quantity("0x000f").unwrap(), "0xf");
+    }
+
+    #[test]
+    fn rpc_quantity_rejects_invalid_values() {
+        assert!(rpc_quantity("").is_err());
+        assert!(rpc_quantity("not-a-number").is_err());
+        assert!(rpc_quantity("0xzz").is_err());
     }
 }

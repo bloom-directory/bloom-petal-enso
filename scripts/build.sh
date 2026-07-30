@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PETAL_REV="4f6fb57063a70f95cba288f68bdc139e3ecac7a5"
 
+# Bloom materializes composed route artifacts here after package validation.
+# They are derived from the route sources and must not survive a source
+# rebuild, or the next `bloom petals build/install` rejects the stale bytes
+# before it gets a chance to regenerate them.
+rm -rf -- "$ROOT/artifacts"
+
 if [[ -n "${PETAL_BIN:-}" ]]; then
   "$PETAL_BIN" build --root "$ROOT"
 elif command -v petal >/dev/null 2>&1; then
