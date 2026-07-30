@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::api_types::NATIVE_TOKEN;
 
+pub const MAX_NEW_BODY_BYTES: usize = 16 * 1024;
+
 /// Body of `new` writes — accepts either a JSON object or plain NL text.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewIntentBody {
@@ -31,6 +33,11 @@ pub struct NewIntentBody {
 /// Parse the write body for `intents/<wallet>/new`.
 /// Accepts JSON `{intent, chain, ...}` or bare NL text.
 pub fn parse_new_body(body: &[u8]) -> Result<NewIntentBody, String> {
+    if body.is_empty() || body.len() > MAX_NEW_BODY_BYTES {
+        return Err(format!(
+            "intent body must be 1..={MAX_NEW_BODY_BYTES} bytes"
+        ));
+    }
     let text = std::str::from_utf8(body)
         .map_err(|_| "intent body must be UTF-8")?
         .trim();

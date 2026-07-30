@@ -37,6 +37,7 @@ petal::route_file!(spec: petal::static_read_spec(), read: |_ctx: &petal::Ctx| {
 - The signed wallet DeFi policy is enforced at create and confirm
 - Simulation must pass before the route transaction is staged
 - ERC-20 approval is exact-amount and must succeed before a second confirm
-- Settlement requires a successful source receipt and the quoted output delta
+- Same-chain ERC-20 settlement requires an attributable receipt Transfer
+- Native and cross-chain balance changes are reported as unattributed
 "#.to_vec())
 });

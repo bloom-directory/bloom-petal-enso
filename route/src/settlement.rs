@@ -7,10 +7,13 @@
 use crate::api_types::NATIVE_TOKEN;
 use crate::runtime::Host;
 use crate::session::Session;
+use alloy::primitives::U256;
 
-/// Compute the current settlement status for a session. A destination balance
-/// increase is only considered after the route outbox entry has a successful
-/// mined receipt, and only when the increase meets the quoted output floor.
+const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+/// Compute the current settlement status for a session. Same-chain ERC-20
+/// completion requires an attributable receipt log; balance-only observations
+/// are reported without claiming that the route caused them.
 pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::Value {
     let req = match sess.route_request.as_ref() {
         Some(r) => r,
@@ -113,25 +116,90 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
             });
         }
     };
-    let received = !lt_decimal(&delta, minimum);
+    let balance_reached_quote = !lt_decimal(&delta, minimum);
+    let same_chain = dest_chain.eq_ignore_ascii_case(&sess.chain);
+    let receipt_transfer = if same_chain && !token_out_hex.eq_ignore_ascii_case(NATIVE_TOKEN) {
+        inspection
+            .receipt_json
+            .as_deref()
+            .and_then(|receipt| transfer_amount_to_receiver(receipt, &token_out_hex, &receiver))
+    } else {
+        None
+    };
+    let receipt_reached_quote = receipt_transfer
+        .as_deref()
+        .is_some_and(|amount| !lt_decimal(amount, minimum));
+    let status = if receipt_reached_quote {
+        "destination_received"
+    } else if balance_reached_quote {
+        "destination_observed_unattributed"
+    } else {
+        "destination_below_quote"
+    };
 
     serde_json::json!({
-        "status": if received {
-            "destination_received"
-        } else {
-            "destination_below_quote"
-        },
+        "status": status,
         "source_state": inspection.state,
         "source_tx_hash": inspection.tx_hash,
         "route_outbox_id": route_outbox_id,
         "observed_before": before,
         "observed_after": current,
         "delta": delta,
+        "receipt_transfer_amount": receipt_transfer,
         "minimum_expected": minimum,
         "destination_chain": dest_chain,
         "receiver": receiver,
         "token_out": token_out_hex,
     })
+}
+
+fn transfer_amount_to_receiver(receipt: &str, token: &str, receiver: &str) -> Option<String> {
+    let receipt: serde_json::Value = serde_json::from_str(receipt).ok()?;
+    let logs = receipt.get("logs")?.as_array()?;
+    let receiver = receiver
+        .strip_prefix("0x")
+        .unwrap_or(receiver)
+        .to_ascii_lowercase();
+    let mut total = U256::ZERO;
+    let mut matched = false;
+    for log in logs {
+        let Some(address) = log.get("address").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !address.eq_ignore_ascii_case(token) {
+            continue;
+        }
+        let Some(topics) = log.get("topics").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        if topics.len() < 3 {
+            continue;
+        }
+        let (Some(event_topic), Some(recipient_topic)) = (topics[0].as_str(), topics[2].as_str())
+        else {
+            continue;
+        };
+        let recipient_topic = recipient_topic.trim_start_matches("0x");
+        if !event_topic.eq_ignore_ascii_case(TRANSFER_TOPIC)
+            || recipient_topic.len() != 64
+            || !recipient_topic[24..].eq_ignore_ascii_case(&receiver)
+        {
+            continue;
+        }
+        let Some(data) = log.get("data").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let data = data.trim_start_matches("0x");
+        if data.len() != 64 {
+            continue;
+        }
+        let Ok(amount) = U256::from_str_radix(data, 16) else {
+            continue;
+        };
+        total = total.checked_add(amount)?;
+        matched = true;
+    }
+    matched.then(|| total.to_string())
 }
 
 /// Observe the pre-stage balance of the output token for the receiver.
@@ -263,5 +331,51 @@ mod tests {
     #[test]
     fn strip_leading_zeros() {
         assert_eq!(sub_decimal("1000", "999"), "1");
+    }
+
+    #[test]
+    fn attributes_erc20_transfer_log_to_receiver() {
+        let token = "0x6b175474e89094c44da98b954eedeac495271d0f";
+        let receiver = "0x742d35cc6634c0532925a3b844bc9e7595f0beb1";
+        let receipt = serde_json::json!({
+            "logs": [{
+                "address": token,
+                "topics": [
+                    TRANSFER_TOPIC,
+                    format!("0x{}", "00".repeat(32)),
+                    format!("0x{}{}", "00".repeat(12), receiver.trim_start_matches("0x")),
+                ],
+                "data": format!("0x{:064x}", U256::from(123_u64)),
+            }]
+        });
+        assert_eq!(
+            transfer_amount_to_receiver(&receipt.to_string(), token, receiver).as_deref(),
+            Some("123")
+        );
+    }
+
+    #[test]
+    fn skips_malformed_logs_before_attributable_transfer() {
+        let token = "0x6b175474e89094c44da98b954eedeac495271d0f";
+        let receiver = "0x742d35cc6634c0532925a3b844bc9e7595f0beb1";
+        let receipt = serde_json::json!({
+            "logs": [
+                {"topics": "not-an-array"},
+                {"address": token, "topics": [TRANSFER_TOPIC, null, null], "data": "0x00"},
+                {
+                    "address": token,
+                    "topics": [
+                        TRANSFER_TOPIC,
+                        format!("0x{}", "00".repeat(32)),
+                        format!("0x{}{}", "00".repeat(12), receiver.trim_start_matches("0x")),
+                    ],
+                    "data": format!("0x{:064x}", U256::from(123_u64)),
+                }
+            ]
+        });
+        assert_eq!(
+            transfer_amount_to_receiver(&receipt.to_string(), token, receiver).as_deref(),
+            Some("123")
+        );
     }
 }

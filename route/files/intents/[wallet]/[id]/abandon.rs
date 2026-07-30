@@ -6,7 +6,7 @@ petal::route_file!(
                 .to_vec(),
         )
     },
-    write: |ctx: &petal::Ctx, _body: &[u8]| {
+    write: |ctx: &petal::Ctx, body: &[u8]| {
         let wallet = match petal::param(ctx, "wallet") {
             Ok(value) => value,
             Err(response) => return response,
@@ -16,7 +16,7 @@ petal::route_file!(
             Err(response) => return response,
         };
         let mut host = crate::workflow::BloomHost;
-        match crate::workflow::abandon(&mut host, wallet, id) {
+        match crate::workflow::abandon_with_body(&mut host, wallet, id, body) {
             Ok(()) => petal::DispatchResponse::Write,
             Err(error) => petal::error(-4, crate::redaction::sanitize_message(&error)),
         }

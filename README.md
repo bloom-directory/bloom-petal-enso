@@ -62,8 +62,10 @@ runtime setting `enso-api-key` remains a compatibility fallback, and
 - Simulation must pass before the route transaction is staged
 - ERC-20 approval is exact-amount and must have a successful receipt first
 - Broadcast requires the standard outbox confirm (owner gate)
-- Settlement requires a successful source receipt and a destination balance
-  increase at least as large as Enso's quoted output
+- Same-chain ERC-20 settlement requires a successful source receipt containing
+  an attributable `Transfer` to the receiver for at least Enso's quoted output
+- Cross-chain and native-output balance increases are reported as observed but
+  unattributed; they are never presented as confirmed settlement
 
 Enso's opaque Router V2 action bytes are not fully decoded by this version.
 If `require_calldata_verification = false`, the plan reports explicit

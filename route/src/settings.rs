@@ -42,6 +42,9 @@ pub struct CredentialStatus {
 }
 
 pub fn parse_api_key(body: &[u8]) -> Result<ApiKey, String> {
+    if body.is_empty() || body.len() > 8192 {
+        return Err("API key must be 1..=8192 bytes".into());
+    }
     let text = std::str::from_utf8(body)
         .map_err(|_| "API key must be UTF-8")?
         .trim();
