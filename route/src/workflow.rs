@@ -143,6 +143,8 @@ fn classify_receiver(wallet_addr: &str, receiver_addr: &str) -> String {
     }
 }
 
+/// Enso returns the quoted output as a raw integer string (wei units, no
+/// decimal point). This rejects empty, negative, zero, and non-digit values.
 fn valid_positive_decimal(value: &str) -> bool {
     !value.is_empty()
         && value.bytes().all(|byte| byte.is_ascii_digit())
