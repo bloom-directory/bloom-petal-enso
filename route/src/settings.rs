@@ -1,6 +1,7 @@
 use serde::Serialize;
 
 pub const API_KEY: &str = "credentials/enso-api-key";
+const EMBEDDED_ENSO_API_KEY: Option<&str> = option_env!("ENSO_API_KEY");
 
 #[derive(Clone)]
 pub struct ApiKey(String);
@@ -20,6 +21,7 @@ impl ApiKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialSource {
+    EmbeddedRelease,
     PrivateStore,
     RuntimeSetting,
     Unconfigured,
@@ -65,12 +67,19 @@ pub fn parse_api_key(body: &[u8]) -> Result<ApiKey, String> {
     Ok(ApiKey(token.into()))
 }
 
-/// Resolve the API key from the private store first, then the runtime setting
-/// `enso-api-key`.
+/// Resolve the API key from the embedded release credential first, then the
+/// private store and legacy runtime setting `enso-api-key`.
 pub fn resolve_api_key(
+    embedded: Option<&str>,
     private_store: Option<&[u8]>,
     setting: Option<&str>,
 ) -> Result<ResolvedApiKey, String> {
+    if let Some(raw) = embedded {
+        return Ok(ResolvedApiKey {
+            key: parse_api_key(raw.as_bytes())?,
+            source: CredentialSource::EmbeddedRelease,
+        });
+    }
     if let Some(raw) = private_store {
         return Ok(ResolvedApiKey {
             key: parse_api_key(raw)?,
@@ -89,28 +98,58 @@ pub fn resolve_api_key(
     Err("Enso API key is not configured".into())
 }
 
-pub fn configured_status(private_store: Option<&[u8]>, setting: Option<&str>) -> CredentialStatus {
-    let resolved = resolve_api_key(private_store, setting);
-    let source = match resolved {
-        Ok(r) => r.source,
-        Err(_) => CredentialSource::Unconfigured,
-    };
-    let (storage, encrypted_at_rest) = match source {
-        CredentialSource::PrivateStore => ("petal secret store", true),
-        CredentialSource::RuntimeSetting => ("Bloom runtime configuration", false),
-        CredentialSource::Unconfigured => ("none", false),
+pub fn configured_api_key(
+    private_store: Option<&[u8]>,
+    setting: Option<&str>,
+) -> Result<ResolvedApiKey, String> {
+    resolve_api_key(EMBEDDED_ENSO_API_KEY, private_store, setting)
+}
+
+pub fn status(
+    embedded: Option<&str>,
+    private_store: Option<&[u8]>,
+    setting: Option<&str>,
+) -> CredentialStatus {
+    let (configured, source, storage, encrypted_at_rest) = if let Some(raw) = embedded {
+        (
+            parse_api_key(raw.as_bytes()).is_ok(),
+            CredentialSource::EmbeddedRelease,
+            "release artifact",
+            false,
+        )
+    } else if let Some(raw) = private_store {
+        (
+            parse_api_key(raw).is_ok(),
+            CredentialSource::PrivateStore,
+            "petal secret store",
+            true,
+        )
+    } else if let Some(raw) = setting.filter(|raw| !raw.trim().is_empty()) {
+        (
+            parse_api_key(raw.trim().as_bytes()).is_ok(),
+            CredentialSource::RuntimeSetting,
+            "Bloom runtime configuration",
+            false,
+        )
+    } else {
+        (false, CredentialSource::Unconfigured, "none", false)
     };
     CredentialStatus {
-        configured: !matches!(source, CredentialSource::Unconfigured),
+        configured,
         source,
         storage,
         encrypted_at_rest,
     }
 }
 
+pub fn configured_status(private_store: Option<&[u8]>, setting: Option<&str>) -> CredentialStatus {
+    status(EMBEDDED_ENSO_API_KEY, private_store, setting)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    const TEST_KEY: &str = "enso_test_must_never_appear";
 
     #[test]
     fn parses_plain_key() {
@@ -132,9 +171,60 @@ mod tests {
 
     #[test]
     fn runtime_setting_is_not_claimed_as_encrypted() {
-        let status = configured_status(None, Some("enso_abc"));
+        let status = status(None, None, Some("enso_abc"));
         assert_eq!(status.source, CredentialSource::RuntimeSetting);
         assert!(!status.encrypted_at_rest);
         assert_eq!(status.storage, "Bloom runtime configuration");
+    }
+
+    #[test]
+    fn embedded_release_key_overrides_private_and_runtime_values() {
+        let resolved =
+            resolve_api_key(Some(TEST_KEY), Some(b"enso_private"), Some("enso_runtime")).unwrap();
+        assert_eq!(resolved.source, CredentialSource::EmbeddedRelease);
+        assert_eq!(resolved.key.expose(), TEST_KEY);
+
+        let status = status(Some(TEST_KEY), Some(b"enso_private"), Some("enso_runtime"));
+        assert!(status.configured);
+        assert_eq!(status.source, CredentialSource::EmbeddedRelease);
+        assert_eq!(status.storage, "release artifact");
+        assert!(!status.encrypted_at_rest);
+    }
+
+    #[test]
+    fn private_store_and_runtime_setting_remain_fallbacks() {
+        let private = resolve_api_key(None, Some(b"enso_private"), Some("enso_runtime")).unwrap();
+        assert_eq!(private.source, CredentialSource::PrivateStore);
+        assert_eq!(private.key.expose(), "enso_private");
+
+        let runtime = resolve_api_key(None, None, Some("enso_runtime")).unwrap();
+        assert_eq!(runtime.source, CredentialSource::RuntimeSetting);
+        assert_eq!(runtime.key.expose(), "enso_runtime");
+    }
+
+    #[test]
+    fn malformed_embedded_key_fails_closed_without_leaking() {
+        let malformed = "enso_test_must_never_appear malformed";
+        let error = resolve_api_key(Some(malformed), Some(b"enso_private"), Some("enso_runtime"))
+            .unwrap_err();
+        let status = status(Some(malformed), Some(b"enso_private"), Some("enso_runtime"));
+
+        assert!(!error.contains(malformed));
+        assert!(!status.configured);
+        assert_eq!(status.source, CredentialSource::EmbeddedRelease);
+        assert!(!format!("{status:?}").contains(malformed));
+    }
+
+    #[test]
+    fn debug_and_serialized_status_do_not_reveal_embedded_key() {
+        let resolved = resolve_api_key(Some(TEST_KEY), None, None).unwrap();
+        let status = status(Some(TEST_KEY), None, None);
+        let output = format!(
+            "{resolved:?}\n{status:?}\n{}",
+            serde_json::to_string(&status).unwrap()
+        );
+
+        assert!(!output.contains(TEST_KEY));
+        assert!(output.contains("embedded_release"));
     }
 }

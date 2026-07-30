@@ -45,9 +45,11 @@ write: /petals/enso/settings/api-key
 body:  your-enso-api-key-here
 ```
 
-The Petal secret store is preferred. The runtime setting `enso-api-key` is a
-compatibility fallback and `settings/status.json` reports it as unencrypted
-runtime configuration.
+Release builds can embed the repository secret `ENSO_API_KEY`. When present,
+that release credential takes precedence over `settings/api-key`. Without an
+embedded credential, the Petal secret store is preferred; the runtime setting
+`enso-api-key` remains a compatibility fallback and `settings/status.json`
+reports the selected source without exposing the key.
 
 ## Safety Model
 
