@@ -1497,6 +1497,31 @@ fn create_rejects_mismatched_destination_metadata() {
 }
 
 #[test]
+fn confirm_accepts_legacy_cross_chain_destination_metadata() {
+    let mut response: serde_json::Value =
+        serde_json::from_slice(&build_enso_response_erc20()).unwrap();
+    response["route"][0]["destinationChainId"] = serde_json::json!(8453);
+    let mut host = MockHost::new().with_enso_response(serde_json::to_vec(&response).unwrap());
+    let body = br#"{
+        "intent":"swap 100.0 usdc to eth",
+        "chain":"ethereum",
+        "destination_chain":"base"
+    }"#;
+    let id = crate::workflow::create(&mut host, "test-wallet", body).unwrap();
+    let mut session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    session.route.as_mut().unwrap().destination_chain_id = None;
+    host.put(
+        &session.key(),
+        &serde_json::to_vec(&session).unwrap(),
+        false,
+    )
+    .unwrap();
+
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    assert_eq!(host.stage_count, 1);
+}
+
+#[test]
 fn unrelated_balance_increase_is_not_claimed_as_settlement() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
     let id = crate::workflow::create(&mut host, "test-wallet", b"swap 100.0 usdc to dai").unwrap();

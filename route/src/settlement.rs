@@ -163,26 +163,39 @@ fn transfer_amount_to_receiver(receipt: &str, token: &str, receiver: &str) -> Op
     let mut total = U256::ZERO;
     let mut matched = false;
     for log in logs {
-        let address = log.get("address")?.as_str()?;
+        let Some(address) = log.get("address").and_then(|value| value.as_str()) else {
+            continue;
+        };
         if !address.eq_ignore_ascii_case(token) {
             continue;
         }
-        let topics = log.get("topics")?.as_array()?;
+        let Some(topics) = log.get("topics").and_then(|value| value.as_array()) else {
+            continue;
+        };
         if topics.len() < 3 {
             continue;
         }
-        let recipient_topic = topics[2].as_str()?.trim_start_matches("0x");
-        if !topics[0].as_str()?.eq_ignore_ascii_case(TRANSFER_TOPIC)
+        let (Some(event_topic), Some(recipient_topic)) = (topics[0].as_str(), topics[2].as_str())
+        else {
+            continue;
+        };
+        let recipient_topic = recipient_topic.trim_start_matches("0x");
+        if !event_topic.eq_ignore_ascii_case(TRANSFER_TOPIC)
             || recipient_topic.len() != 64
             || !recipient_topic[24..].eq_ignore_ascii_case(&receiver)
         {
             continue;
         }
-        let data = log.get("data")?.as_str()?.trim_start_matches("0x");
+        let Some(data) = log.get("data").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let data = data.trim_start_matches("0x");
         if data.len() != 64 {
             continue;
         }
-        let amount = U256::from_str_radix(if data.is_empty() { "0" } else { data }, 16).ok()?;
+        let Ok(amount) = U256::from_str_radix(data, 16) else {
+            continue;
+        };
         total = total.checked_add(amount)?;
         matched = true;
     }
@@ -334,6 +347,31 @@ mod tests {
                 ],
                 "data": format!("0x{:064x}", U256::from(123_u64)),
             }]
+        });
+        assert_eq!(
+            transfer_amount_to_receiver(&receipt.to_string(), token, receiver).as_deref(),
+            Some("123")
+        );
+    }
+
+    #[test]
+    fn skips_malformed_logs_before_attributable_transfer() {
+        let token = "0x6b175474e89094c44da98b954eedeac495271d0f";
+        let receiver = "0x742d35cc6634c0532925a3b844bc9e7595f0beb1";
+        let receipt = serde_json::json!({
+            "logs": [
+                {"topics": "not-an-array"},
+                {"address": token, "topics": [TRANSFER_TOPIC, null, null], "data": "0x00"},
+                {
+                    "address": token,
+                    "topics": [
+                        TRANSFER_TOPIC,
+                        format!("0x{}", "00".repeat(32)),
+                        format!("0x{}{}", "00".repeat(12), receiver.trim_start_matches("0x")),
+                    ],
+                    "data": format!("0x{:064x}", U256::from(123_u64)),
+                }
+            ]
         });
         assert_eq!(
             transfer_amount_to_receiver(&receipt.to_string(), token, receiver).as_deref(),

@@ -172,11 +172,15 @@ impl RouteResponse {
     /// Verify that a response's bridge metadata agrees with the requested
     /// destination. Same-chain responses may omit destination metadata.
     pub fn destination_matches_request(&self, req: &RouteRequest) -> bool {
+        let destination_chain_id = self.destination_chain_id.or_else(|| {
+            self.route
+                .as_array()?
+                .iter()
+                .find_map(|hop| hop.get("destinationChainId")?.as_u64())
+        });
         match req.destination_chain_id {
-            Some(expected) => self.destination_chain_id == Some(expected),
-            None => self
-                .destination_chain_id
-                .is_none_or(|actual| actual == req.chain_id),
+            Some(expected) => destination_chain_id == Some(expected),
+            None => destination_chain_id.is_none_or(|actual| actual == req.chain_id),
         }
     }
 
