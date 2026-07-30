@@ -36,7 +36,7 @@ pub fn load<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<Session, St
 fn resolve_api_key<H: Host>(host: &mut H) -> Result<String, String> {
     let private_store = host.get_secret(settings::API_KEY, 8192)?;
     let runtime = host.setting("enso-api-key")?;
-    let resolved = settings::resolve_api_key(private_store.as_deref(), runtime.as_deref())?;
+    let resolved = settings::configured_api_key(private_store.as_deref(), runtime.as_deref())?;
     Ok(resolved.key.expose().to_string())
 }
 
