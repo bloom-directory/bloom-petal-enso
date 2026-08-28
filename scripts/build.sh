@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PETAL_REV="4f6fb57063a70f95cba288f68bdc139e3ecac7a5"
+PETAL_REV="864a80b407387871bae06aabe77b91865e55f7bc"
 
 if [[ "${PETAL_COMPILE_TIME_SECRET+x}" == "x" ]]; then
   if [[ -z "$PETAL_COMPILE_TIME_SECRET" ]]; then
