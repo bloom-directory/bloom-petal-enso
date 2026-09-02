@@ -53,8 +53,17 @@ jobs:
         run: |
           set -euo pipefail
           bloom_bin="$GITHUB_WORKSPACE/bloom/target/release/bloom"
-          "$bloom_bin" petals build .
           home="$(mktemp -d)"
+          "$bloom_bin" --home "$home" serve >"$RUNNER_TEMP/bloom.log" 2>&1 &
+          bloom_pid=$!
+          trap 'kill "$bloom_pid" 2>/dev/null || true; wait "$bloom_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 300); do
+            "$bloom_bin" --home "$home" vfs ls / >/dev/null 2>&1 && break
+            kill -0 "$bloom_pid" 2>/dev/null || { cat "$RUNNER_TEMP/bloom.log"; exit 1; }
+            sleep 0.1
+          done
+          "$bloom_bin" --home "$home" vfs ls / >/dev/null
+          "$bloom_bin" --home "$home" petals build .
           "$bloom_bin" --home "$home" petal install .
           "$bloom_bin" --home "$home" vfs cat /petals/enso/meta/route-contract.json | grep -Fq '"name": "enso"'
           "$bloom_bin" --home "$home" vfs cat /petals/enso/README.md | grep -Fq '/petals/enso/intents/'
