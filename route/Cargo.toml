@@ -11,7 +11,7 @@ crate-type = ["rlib"]
 [dependencies]
 alloy = { version = "2", default-features = false, features = ["dyn-abi", "sol-types", "std"] }
 hex = "0.4"
-petal = { package = "bloom-petal-sdk", git = "https://github.com/bloom-directory/petal", rev = "864a80b407387871bae06aabe77b91865e55f7bc" }
+petal = { package = "bloom-petal-sdk", git = "https://github.com/bloom-directory/petal", rev = "1b6ede4b8d8e88026c019651018deb7c1973ecfe" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
