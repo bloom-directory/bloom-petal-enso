@@ -43,45 +43,28 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: bloom-directory/bloom
-          ref: master
+          ref: 0011649ccaac40cf1ca384922814329552ef5d58
           path: bloom
           persist-credentials: false
-      - name: Build key-free debug Bloom CLI for install smoke tests
-        run: cargo build --manifest-path bloom/Cargo.toml -p bloom --bin bloom
+      - name: Build standalone Bloom CLI for install smoke tests
+        run: cargo build --release --manifest-path bloom/Cargo.toml -p bloom --bin bloom
       - name: Validate package and static dispatch
         shell: bash
         run: |
           set -euo pipefail
-          bloom_bin="$GITHUB_WORKSPACE/bloom/target/debug/bloom"
+          bloom_bin="$GITHUB_WORKSPACE/bloom/target/release/bloom"
           home="$(mktemp -d)"
-          cat > "$home/config.toml" <<'EOF'
-          default_chain = "local"
-          [chains.local]
-          name = "local"
-          chain_id = 31337
-          rpc_urls = ["http://127.0.0.1:1"]
-          allow_broadcast = false
-          display_name = "Local smoke"
-          native_symbol = "ETH"
-          native_decimals = 18
-          legacy_tx = false
-          [petals]
-          preinstalled = []
-          EOF
-          export BLOOM_MACHINE_IDENTITY="$home/absent-identity.json"
-          export BLOOM_EDGE_MANIFEST="$home/absent-edge.json"
-          export BLOOM_BROKER_SOCKET="$home/absent-broker.sock"
-          "$bloom_bin" --home "$home" serve >"$RUNNER_TEMP/bloom.log" 2>&1 &
-          bloom_pid=$!
-          trap 'kill "$bloom_pid" 2>/dev/null || true; wait "$bloom_pid" 2>/dev/null || true' EXIT
-          for attempt in {1..60}; do
-            "$bloom_bin" --home "$home" status >/dev/null 2>&1 && break
-            if ! kill -0 "$bloom_pid" 2>/dev/null || [[ "$attempt" == 60 ]]; then
-              cat "$RUNNER_TEMP/bloom.log" >&2
-              exit 1
-            fi
-            sleep 1
-          done
+          printf '%s\n' \
+            'default_chain = "anvil"' \
+            '' \
+            '[petals]' \
+            'preinstalled = []' \
+            '' \
+            '[chains.anvil]' \
+            'name = "anvil"' \
+            'chain_id = 31337' \
+            'rpc_urls = ["http://127.0.0.1:8545"]' \
+            > "$home/config.toml"
           "$bloom_bin" --home "$home" petals build .
           "$bloom_bin" --home "$home" petal install .
           "$bloom_bin" --home "$home" vfs cat /petals/enso/meta/route-contract.json | grep -Fq '"name": "enso"'
