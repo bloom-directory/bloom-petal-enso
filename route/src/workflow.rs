@@ -905,7 +905,6 @@ fn confirm_locked<H: Host>(
                 state.approval = staged.approval.as_ref().map(|approval| {
                     serde_json::json!({
                         "action_id": approval.action_id,
-                        "ceremony_url": approval.ceremony_url,
                         "expires_ms": approval.expires_ms,
                     })
                 });
@@ -1010,7 +1009,6 @@ fn confirm_locked<H: Host>(
             state.approval = staged.approval.as_ref().map(|approval| {
                 serde_json::json!({
                     "action_id": approval.action_id,
-                    "ceremony_url": approval.ceremony_url,
                     "expires_ms": approval.expires_ms,
                 })
             });

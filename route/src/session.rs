@@ -46,9 +46,10 @@ pub struct IntentState {
     /// is broadcast. Used for ERC-20 approve → route ordering.
     #[serde(default)]
     pub depends_on: Option<String>,
-    /// Ceremony approval data returned by `tx_stage` (action_id, ceremony_url,
-    /// expires_ms). Present when the staged transaction requires ceremony
-    /// approval before broadcast.
+    /// Owner-safe approval data returned by `tx_stage` (`action_id` and
+    /// `expires_ms`). Present when the staged transaction requires ceremony
+    /// approval before broadcast; the owner-only ceremony URL is never exposed
+    /// through a Petal route.
     #[serde(default)]
     pub approval: Option<serde_json::Value>,
     pub updated_ms: u64,
