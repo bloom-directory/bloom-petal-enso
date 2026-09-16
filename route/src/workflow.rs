@@ -3,11 +3,13 @@
 //! Lifecycle: create → route discovery → (optional simulate) → confirm →
 //! outbox staging → broadcast → settlement verification.
 
-use crate::api_types::{NATIVE_TOKEN, RouteRequest, RouteResponse};
+use crate::api_types::{IERC20, NATIVE_TOKEN, RouteRequest, RouteResponse, parse_decimal_u256};
 pub use crate::runtime::{BloomHost, Host};
 use crate::session::{self, IntentState, PreparedIntent, Session};
 use crate::{api, input, settings};
-use alloy::primitives::{Address, U256};
+use alloy::primitives::utils::parse_units;
+use alloy::primitives::{Address, U256, hex};
+use alloy::sol_types::SolCall;
 use petal::sdk::EvmTransaction;
 
 // ---------------------------------------------------------------------------
@@ -94,50 +96,36 @@ fn generate_id<H: Host>(host: &mut H) -> Result<String, String> {
 
 /// Parse a human-readable amount into raw smallest-units using explicit
 /// decimals.
+///
+/// alloy's `parse_units` does the scaling, but it silently truncates excess
+/// fractional digits and accepts negatives, so the shape is checked first.
 fn parse_amount(amount: &str, decimals: u8) -> Result<U256, String> {
     let trimmed = amount.trim();
     if trimmed.is_empty() {
         return Err("amount is empty".into());
     }
-
-    let parts: Vec<&str> = trimmed.split('.').collect();
-    if parts.len() > 2 {
+    let (whole, frac) = trimmed.split_once('.').unwrap_or((trimmed, ""));
+    if (whole.is_empty() && frac.is_empty())
+        || !whole
+            .bytes()
+            .chain(frac.bytes())
+            .all(|byte| byte.is_ascii_digit())
+    {
         return Err(format!("invalid amount: {trimmed}"));
     }
-
-    let whole = parts[0];
-    let frac = if parts.len() == 2 { parts[1] } else { "" };
-
-    let whole_val = if whole.is_empty() {
-        U256::from(0u64)
-    } else {
-        U256::from_str_radix(whole, 10).map_err(|_| format!("invalid whole part: {whole}"))?
-    };
-
-    let scaled_whole = whole_val * U256::from(10u64).pow(U256::from(decimals as u64));
-
-    let frac_val = if frac.is_empty() {
-        U256::from(0u64)
-    } else {
-        if frac.len() > decimals as usize {
-            return Err(format!(
-                "too many decimal places: {} has more than {decimals} digits",
-                frac
-            ));
-        }
-        let padded = format!("{:0<width$}", frac, width = decimals as usize);
-        U256::from_str_radix(&padded, 10).map_err(|_| format!("invalid fractional part: {frac}"))?
-    };
-
-    Ok(scaled_whole + frac_val)
+    if frac.len() > decimals as usize {
+        return Err(format!(
+            "too many decimal places: {frac} has more than {decimals} digits"
+        ));
+    }
+    parse_units(trimmed, decimals)
+        .map(|units| units.get_absolute())
+        .map_err(|error| format!("invalid amount {trimmed}: {error}"))
 }
 
 /// Build ERC-20 `approve(spender, amount)` calldata.
-fn build_approve_calldata(spender_hex: &str, amount: U256) -> String {
-    // Selector: approve(address,uint256) = 0x095ea7b3
-    let stripped = spender_hex.strip_prefix("0x").unwrap_or(spender_hex);
-    let padded_spender = format!("{:0>64}", stripped.to_ascii_lowercase());
-    format!("0x095ea7b3{padded_spender}{amount:064x}")
+fn build_approve_calldata(spender: Address, amount: U256) -> String {
+    hex::encode_prefixed(IERC20::approveCall { spender, amount }.abi_encode())
 }
 
 fn classify_receiver(wallet_addr: &str, receiver_addr: &str) -> String {
@@ -151,9 +139,7 @@ fn classify_receiver(wallet_addr: &str, receiver_addr: &str) -> String {
 /// Enso returns the quoted output as a raw integer string (wei units, no
 /// decimal point). This rejects empty, negative, zero, and non-digit values.
 fn valid_positive_decimal(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| byte.is_ascii_digit())
-        && value.bytes().any(|byte| byte != b'0')
+    parse_decimal_u256(value).is_some_and(|value| !value.is_zero())
 }
 
 fn verify_prepared_intents(
@@ -172,7 +158,7 @@ fn verify_prepared_intents(
     }
 
     let router = format!("0x{:x}", route.tx.to);
-    let route_data = format!("0x{}", hex::encode(&route.tx.data));
+    let route_data = hex::encode_prefixed(&route.tx.data);
     let route_intent = sess
         .intents
         .last()
@@ -205,7 +191,7 @@ fn verify_prepared_intents(
 
     let approval = &sess.intents[0];
     let token = format!("0x{:x}", req.token_in);
-    let expected_data = build_approve_calldata(&router, req.amount_in);
+    let expected_data = build_approve_calldata(route.tx.to, req.amount_in);
     if !approval.to.eq_ignore_ascii_case(&token)
         || approval.value_wei != "0"
         || !approval.data_hex.eq_ignore_ascii_case(&expected_data)
@@ -513,13 +499,13 @@ fn prepare_session<H: Host>(
 
     // Resolve decimals for token_in.
     let token_in_hex = format!("0x{:x}", token_in);
-    let decimals = if token_in_hex.eq_ignore_ascii_case(NATIVE_TOKEN) {
+    // Always read ERC-20 decimals on-chain: the same symbol can use different
+    // decimals on different chains (USDC is 6 on Ethereum, 18 on BNB Chain).
+    let decimals = if token_in == NATIVE_TOKEN {
         18u8
-    } else if nat.token_in.starts_with("0x") || nat.token_in.starts_with("0X") {
+    } else {
         host.erc20_decimals(&chain_name, &token_in_hex)
             .map_err(|e| format!("cannot read token decimals: {e}"))?
-    } else {
-        input::decimals_for_symbol(chain_id, &nat.token_in)
     };
 
     // Parse amount with correct decimals.
@@ -574,7 +560,7 @@ fn prepare_session<H: Host>(
     let router_addr = format!("0x{:x}", route_resp.tx.to);
 
     // Check ERC-20 allowance and build approve intent if needed.
-    let token_in_is_native = token_in_hex.eq_ignore_ascii_case(NATIVE_TOKEN);
+    let token_in_is_native = token_in == NATIVE_TOKEN;
     let mut needs_approve = false;
     let mut intents: Vec<PreparedIntent> = Vec::new();
 
@@ -583,9 +569,9 @@ fn prepare_session<H: Host>(
             .erc20_allowance(&chain_name, &token_in_hex, &address, &router_addr)
             .map_err(|e| format!("cannot verify ERC-20 allowance: {e}"))?;
 
-        if lt_decimal(&allowance, &route_req.amount_in.to_string()) {
+        if allowance < route_req.amount_in {
             needs_approve = true;
-            let approve_data = build_approve_calldata(&router_addr, route_req.amount_in);
+            let approve_data = build_approve_calldata(route_resp.tx.to, route_req.amount_in);
             intents.push(PreparedIntent {
                 label: "approve".into(),
                 to: token_in_hex.clone(),
@@ -603,7 +589,7 @@ fn prepare_session<H: Host>(
         label: "route".into(),
         to: router_addr.clone(),
         value_wei: route_resp.tx.value.to_string(),
-        data_hex: format!("0x{}", hex::encode(&route_resp.tx.data)),
+        data_hex: hex::encode_prefixed(&route_resp.tx.data),
         chain: chain_name.clone(),
         approve_token: None,
         approve_spender: None,
@@ -672,7 +658,7 @@ fn prepare_session<H: Host>(
     let observed_before = Some(crate::settlement::observe_balance_before(
         host,
         dest_chain_name,
-        &token_out_hex,
+        route_req.token_out,
         &receiver_addr,
     )?);
 
@@ -1010,7 +996,7 @@ fn confirm_locked<H: Host>(
         let allowance = host
             .erc20_allowance(&sess.chain, &approve.to, &wallet_addr, &router)
             .map_err(|e| format!("cannot re-verify ERC-20 allowance: {e}"))?;
-        if lt_decimal(&allowance, &req.amount_in.to_string()) {
+        if allowance < req.amount_in {
             return Err("approval receipt succeeded but allowance is still insufficient".into());
         }
         sess.updated_ms = now;
@@ -1116,23 +1102,6 @@ pub fn abandon_with_body<H: Host>(
     save(host, &sess)
 }
 
-// ---------------------------------------------------------------------------
-// decimal comparison helper
-// ---------------------------------------------------------------------------
-
-/// Returns true if `a` < `b` where both are decimal strings.
-fn lt_decimal(a: &str, b: &str) -> bool {
-    let a = a.trim_start_matches('0');
-    let b = b.trim_start_matches('0');
-    if a.is_empty() && b.is_empty() {
-        return false; // both zero
-    }
-    if a.len() != b.len() {
-        return a.len() < b.len();
-    }
-    a < b
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1161,9 +1130,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_amounts() {
+        for amount in ["", " ", ".", "-1", "1.2.3", "1e18", "1_000", "0x10", "+1"] {
+            assert!(parse_amount(amount, 18).is_err(), "{amount:?} was accepted");
+        }
+        assert_eq!(parse_amount(".5", 6).unwrap(), U256::from(500_000u64));
+        assert_eq!(parse_amount("1.", 6).unwrap(), U256::from(1_000_000u64));
+        assert!(parse_amount(&"9".repeat(80), 18).is_err());
+    }
+
+    #[test]
     fn approve_calldata_format() {
         let data = build_approve_calldata(
-            "0x1234567890abcdef1234567890abcdef12345678",
+            "0x1234567890abcdef1234567890abcdef12345678"
+                .parse()
+                .unwrap(),
             U256::from(123u64),
         );
         assert!(data.starts_with("0x095ea7b3"));
@@ -1174,12 +1155,11 @@ mod tests {
     }
 
     #[test]
-    fn decimal_less_than() {
-        assert!(lt_decimal("99", "100"));
-        assert!(!lt_decimal("100", "100"));
-        assert!(!lt_decimal("101", "100"));
-        assert!(lt_decimal("0", "1"));
-        assert!(!lt_decimal("0", "0"));
-        assert!(lt_decimal("999999999999999999", "1000000000000000000"));
+    fn quoted_output_must_be_positive_base_units() {
+        assert!(valid_positive_decimal("1"));
+        assert!(!valid_positive_decimal("0"));
+        assert!(!valid_positive_decimal(""));
+        assert!(!valid_positive_decimal("1_000"));
+        assert!(!valid_positive_decimal("1.5"));
     }
 }

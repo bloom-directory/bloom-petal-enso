@@ -1,11 +1,13 @@
-use alloy::primitives::U256;
+use crate::api_types::IERC20;
+use alloy::primitives::{Address, Bytes, U64, U256, hex};
+use alloy::sol_types::{Panic, Revert, SolCall, SolError};
 use petal::sdk::{EvmTransaction, HttpRequest, HttpResponse, OutboxInspection, StagedTransaction};
 
 /// Result of a generic `eth_call`.
 ///
 /// `return_data` is always `0x`-prefixed hex. When `success` is `false` the
-/// `return_data` carries the raw revert payload (e.g. an `Error(string)`
-/// encoding beginning with `0x08c379a0`).
+/// `return_data` carries the raw revert payload (an `Error(string)` or
+/// `Panic(uint256)` encoding).
 #[derive(Debug, Clone)]
 pub struct EthCallResult {
     pub success: bool,
@@ -50,26 +52,26 @@ pub trait Host {
         to: &str,
         data: &str,
         from: Option<&str>,
-        value: Option<&str>,
+        value: Option<U256>,
     ) -> Result<EthCallResult, String>;
 
     /// `eth_chainId` for the chain, returned as the canonical numeric chain id.
     fn chain_id(&mut self, chain: &str) -> Result<u64, String>;
 
-    /// `ERC-20 allowance(owner, spender)` as a decimal string.
+    /// `ERC-20 allowance(owner, spender)`.
     fn erc20_allowance(
         &mut self,
         chain: &str,
         token: &str,
         owner: &str,
         spender: &str,
-    ) -> Result<String, String>;
+    ) -> Result<U256, String>;
 
-    /// `ERC-20 balanceOf(addr)` as a decimal string.
-    fn erc20_balance(&mut self, chain: &str, token: &str, addr: &str) -> Result<String, String>;
+    /// `ERC-20 balanceOf(addr)`.
+    fn erc20_balance(&mut self, chain: &str, token: &str, addr: &str) -> Result<U256, String>;
 
-    /// Native balance from `eth_getBalance`, as a decimal string.
-    fn eth_balance(&mut self, chain: &str, addr: &str) -> Result<String, String>;
+    /// Native balance from `eth_getBalance`.
+    fn eth_balance(&mut self, chain: &str, addr: &str) -> Result<U256, String>;
 
     /// `ERC-20 decimals()`.
     fn erc20_decimals(&mut self, chain: &str, token: &str) -> Result<u8, String>;
@@ -171,50 +173,37 @@ impl Host for BloomHost {
         to: &str,
         data: &str,
         from: Option<&str>,
-        value: Option<&str>,
+        value: Option<U256>,
     ) -> Result<EthCallResult, String> {
-        let mut tx = serde_json::Map::new();
-        tx.insert("to".to_string(), serde_json::Value::String(to.to_string()));
-        tx.insert(
-            "data".to_string(),
-            serde_json::Value::String(data.to_string()),
-        );
-        if let Some(f) = from {
-            tx.insert("from".to_string(), serde_json::Value::String(f.to_string()));
+        let mut tx = serde_json::json!({ "to": to, "data": data });
+        if let Some(from) = from {
+            tx["from"] = from.into();
         }
-        if let Some(v) = value {
-            let quantity = rpc_quantity(v)?;
-            tx.insert("value".to_string(), serde_json::Value::String(quantity));
+        if let Some(value) = value {
+            tx["value"] = format!("0x{value:x}").into();
         }
-        let params = serde_json::json!([serde_json::Value::Object(tx), "latest"]).to_string();
+        let params = serde_json::json!([tx, "latest"]).to_string();
         let raw = self.chain_read(chain, "eth_call", &params)?;
         // chain_read returns the JSON-RPC `result` field verbatim; for eth_call
         // that is a JSON string ("0x...") — unwrap one layer of JSON quoting.
         let hex_data: String = serde_json::from_str(&raw)
             .map_err(|e| format!("eth_call result is not a JSON string: {e}"))?;
-
-        // Error(string) selector — a revert.
-        if hex_data.starts_with("0x08c379a0") {
-            return Ok(EthCallResult {
-                success: false,
-                return_data: hex_data,
-            });
+        if !hex_data.starts_with("0x") {
+            return Err(format!("eth_call returned unexpected value: {hex_data}"));
         }
-        if hex_data.starts_with("0x") {
-            return Ok(EthCallResult {
-                success: true,
-                return_data: hex_data,
-            });
-        }
-        Err(format!("eth_call returned unexpected value: {hex_data}"))
+        let bytes: Bytes = hex_data
+            .parse()
+            .map_err(|e| format!("eth_call returned invalid hex: {e}"))?;
+        Ok(EthCallResult {
+            success: !is_revert_payload(&bytes),
+            return_data: hex_data,
+        })
     }
 
     fn chain_id(&mut self, chain: &str) -> Result<u64, String> {
         let raw = self.chain_read(chain, "eth_chainId", "[]")?;
-        let hex_data: String = serde_json::from_str(&raw)
-            .map_err(|e| format!("eth_chainId result is not a JSON string: {e}"))?;
-        let stripped = hex_data.strip_prefix("0x").unwrap_or(&hex_data);
-        u64::from_str_radix(stripped, 16).map_err(|e| format!("chain id decode: {e}"))
+        let id: U64 = decode_quantity(&raw, "chain id")?;
+        Ok(id.to::<u64>())
     }
 
     fn erc20_allowance(
@@ -223,198 +212,149 @@ impl Host for BloomHost {
         token: &str,
         owner: &str,
         spender: &str,
-    ) -> Result<String, String> {
-        let owner_word = encode_address_word(owner)?;
-        let spender_word = encode_address_word(spender)?;
-        let data = format!("0xdd62ed3e{owner_word}{spender_word}");
-        let res = self.eth_call(chain, token, &data, None, None)?;
-        if !res.success {
-            return Err(format!("erc20 allowance reverted: {}", res.return_data));
-        }
-        decode_uint256(&res.return_data)
+    ) -> Result<U256, String> {
+        let call = IERC20::allowanceCall {
+            owner: parse_address(owner)?,
+            spender: parse_address(spender)?,
+        };
+        erc20_view(self, chain, token, &call)
     }
 
-    fn erc20_balance(&mut self, chain: &str, token: &str, addr: &str) -> Result<String, String> {
-        let addr_word = encode_address_word(addr)?;
-        let data = format!("0x70a08231{addr_word}");
-        let res = self.eth_call(chain, token, &data, None, None)?;
-        if !res.success {
-            return Err(format!("erc20 balance reverted: {}", res.return_data));
-        }
-        decode_uint256(&res.return_data)
+    fn erc20_balance(&mut self, chain: &str, token: &str, addr: &str) -> Result<U256, String> {
+        let call = IERC20::balanceOfCall {
+            account: parse_address(addr)?,
+        };
+        erc20_view(self, chain, token, &call)
     }
 
-    fn eth_balance(&mut self, chain: &str, addr: &str) -> Result<String, String> {
+    fn eth_balance(&mut self, chain: &str, addr: &str) -> Result<U256, String> {
         let params = serde_json::json!([addr, "latest"]).to_string();
         let raw = self.chain_read(chain, "eth_getBalance", &params)?;
-        let quantity: String = serde_json::from_str(&raw)
-            .map_err(|e| format!("eth_getBalance result is not a JSON string: {e}"))?;
-        let hex = quantity.strip_prefix("0x").unwrap_or(&quantity);
-        U256::from_str_radix(if hex.is_empty() { "0" } else { hex }, 16)
-            .map(|value| value.to_string())
-            .map_err(|e| format!("native balance decode: {e}"))
+        decode_quantity(&raw, "native balance")
     }
 
     fn erc20_decimals(&mut self, chain: &str, token: &str) -> Result<u8, String> {
-        let res = self.eth_call(chain, token, "0x313ce567", None, None)?;
-        if !res.success {
-            return Err(format!("erc20 decimals reverted: {}", res.return_data));
-        }
-        let hex = res
-            .return_data
-            .strip_prefix("0x")
-            .unwrap_or(&res.return_data);
-        if hex.len() < 64 {
-            return Err(format!(
-                "decimals return data too short: {}",
-                res.return_data
-            ));
-        }
-        let last_two = &hex[hex.len() - 2..];
-        u8::from_str_radix(last_two, 16).map_err(|e| format!("decimals decode: {e}"))
+        erc20_view(self, chain, token, &IERC20::decimalsCall {})
     }
 }
 
-// --- ABI / hex helpers (no alloy, kept deliberately simple) -----------------
+// --- ABI helpers --------------------------------------------------------------
 
-fn rpc_quantity(value: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err("RPC quantity is empty".into());
-    }
-    if let Some(hex) = trimmed.strip_prefix("0x") {
-        let parsed = U256::from_str_radix(if hex.is_empty() { "0" } else { hex }, 16)
-            .map_err(|e| format!("invalid hexadecimal RPC quantity: {e}"))?;
-        return Ok(format!("0x{parsed:x}"));
-    }
-    let parsed = U256::from_str_radix(trimmed, 10)
-        .map_err(|e| format!("invalid decimal RPC quantity: {e}"))?;
-    Ok(format!("0x{parsed:x}"))
+fn parse_address(addr: &str) -> Result<Address, String> {
+    addr.parse().map_err(|_| format!("invalid address: {addr}"))
 }
 
-/// Encode a 20-byte address as a left-padded 32-byte ABI word (64 lowercase
-/// hex chars, no `0x` prefix).
-fn encode_address_word(addr: &str) -> Result<String, String> {
-    let stripped = addr.strip_prefix("0x").unwrap_or(addr);
-    if stripped.len() != 40 || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!("invalid address: {addr}"));
-    }
-    Ok(format!("{:0>64}", stripped.to_ascii_lowercase()))
+/// Whether `eth_call` return data is a standard Solidity revert payload.
+fn is_revert_payload(data: &[u8]) -> bool {
+    data.get(..4)
+        .is_some_and(|selector| selector == Revert::SELECTOR || selector == Panic::SELECTOR)
 }
 
-/// Decode an ABI-encoded `uint256` word from 0x-prefixed hex return data into
-/// a decimal string. The value occupies the final 32 bytes (64 hex chars).
-fn decode_uint256(return_data: &str) -> Result<String, String> {
-    let hex = return_data.strip_prefix("0x").unwrap_or(return_data);
-    if hex.len() < 64 {
-        return Err(format!("uint256 return data too short: {return_data}"));
+/// Run a read-only ERC-20 call and strictly ABI-decode its return value.
+fn erc20_view<H: Host + ?Sized, C: SolCall>(
+    host: &mut H,
+    chain: &str,
+    token: &str,
+    call: &C,
+) -> Result<C::Return, String> {
+    let data = hex::encode_prefixed(call.abi_encode());
+    let res = host.eth_call(chain, token, &data, None, None)?;
+    if !res.success {
+        return Err(format!(
+            "erc20 {} reverted: {}",
+            C::SIGNATURE,
+            res.return_data
+        ));
     }
-    let word = &hex[hex.len() - 64..];
-    hex_to_decimal_str(word)
+    decode_returns::<C>(&res.return_data)
 }
 
-/// Arbitrary-precision hex (no `0x` prefix) → decimal string, so a full
-/// `uint256` can be represented without pulling in a big-int crate.
-fn hex_to_decimal_str(hex: &str) -> Result<String, String> {
-    if hex.is_empty() {
-        return Ok("0".to_string());
-    }
-    // decimal digits, least-significant first
-    let mut dec: Vec<u8> = vec![0];
-    for ch in hex.chars() {
-        let d = ch
-            .to_digit(16)
-            .ok_or_else(|| format!("invalid hex char '{ch}'"))?;
-        // dec = dec * 16
-        let mut carry = 0u32;
-        for cell in dec.iter_mut() {
-            let v = (*cell as u32) * 16 + carry;
-            *cell = (v % 10) as u8;
-            carry = v / 10;
-        }
-        while carry > 0 {
-            dec.push((carry % 10) as u8);
-            carry /= 10;
-        }
-        // dec += d
-        let mut carry = d;
-        for cell in dec.iter_mut() {
-            let v = (*cell as u32) + carry;
-            *cell = (v % 10) as u8;
-            carry = v / 10;
-            if carry == 0 {
-                break;
-            }
-        }
-        while carry > 0 {
-            dec.push((carry % 10) as u8);
-            carry /= 10;
-        }
-    }
-    let s: String = dec.iter().rev().map(|d| (b'0' + d) as char).collect();
-    Ok(s)
+fn decode_returns<C: SolCall>(return_data: &str) -> Result<C::Return, String> {
+    let bytes: Bytes = return_data
+        .parse()
+        .map_err(|e| format!("erc20 {} returned invalid hex: {e}", C::SIGNATURE))?;
+    C::abi_decode_returns_validate(&bytes)
+        .map_err(|e| format!("erc20 {} return decode: {e}", C::SIGNATURE))
+}
+
+/// Decode a JSON-RPC quantity result such as `"0x3e8"`.
+fn decode_quantity<T: serde::de::DeserializeOwned>(raw: &str, what: &str) -> Result<T, String> {
+    serde_json::from_str(raw).map_err(|e| format!("{what} decode: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn word(value: U256) -> String {
+        format!("0x{value:064x}")
+    }
+
     #[test]
-    fn address_word_left_pads_to_32_bytes() {
-        // 20-byte address left-padded to a 32-byte word (24 zero-hex prefix).
+    fn erc20_calls_use_standard_selectors() {
+        let owner: Address = "0x0123456789abcdef0123456789abcdef01234567"
+            .parse()
+            .unwrap();
+        let data = IERC20::allowanceCall {
+            owner,
+            spender: owner,
+        }
+        .abi_encode();
+        assert_eq!(&data[..4], &[0xdd, 0x62, 0xed, 0x3e]);
+        assert_eq!(&data[4..36], owner.into_word().as_slice());
         assert_eq!(
-            encode_address_word("0x0123456789abcdef0123456789abcdef01234567").unwrap(),
-            "0000000000000000000000000123456789abcdef0123456789abcdef01234567"
+            IERC20::balanceOfCall { account: owner }.abi_encode()[..4],
+            [0x70, 0xa0, 0x82, 0x31]
         );
-    }
-
-    #[test]
-    fn address_word_lowercases_and_accepts_no_prefix() {
         assert_eq!(
-            encode_address_word("ABCDEF0123456789ABCDEF0123456789ABCDEF01").unwrap(),
-            "000000000000000000000000abcdef0123456789abcdef0123456789abcdef01"
+            IERC20::decimalsCall {}.abi_encode(),
+            [0x31, 0x3c, 0xe5, 0x67]
         );
     }
 
     #[test]
-    fn address_word_rejects_bad_length() {
-        assert!(encode_address_word("0x1234").is_err());
-        assert!(encode_address_word("0xZZ3400000000000000000000000000000000000000").is_err());
-    }
-
-    #[test]
-    fn hex_to_decimal_handles_uint256() {
-        assert_eq!(hex_to_decimal_str("").unwrap(), "0");
-        assert_eq!(hex_to_decimal_str("a").unwrap(), "10");
-        assert_eq!(hex_to_decimal_str("ff").unwrap(), "255");
-        // max uint256
+    fn decodes_uint256_returns() {
         assert_eq!(
-            hex_to_decimal_str(&"f".repeat(64)).unwrap(),
-            "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+            decode_returns::<IERC20::balanceOfCall>(&word(U256::from(1000))).unwrap(),
+            U256::from(1000)
         );
-    }
-
-    #[test]
-    fn decode_uint256_takes_last_word() {
-        // 0x...00000000000000000000000000000000000000000000000000000000000003e8 == 1000
-        let word = format!(
-            "0x{}",
-            "00000000000000000000000000000000000000000000000000000000000003e8"
+        assert_eq!(
+            decode_returns::<IERC20::allowanceCall>(&word(U256::MAX)).unwrap(),
+            U256::MAX
         );
-        assert_eq!(decode_uint256(&word).unwrap(), "1000");
+        assert!(decode_returns::<IERC20::balanceOfCall>("0x03e8").is_err());
+        assert!(decode_returns::<IERC20::balanceOfCall>("0xzz").is_err());
     }
 
     #[test]
-    fn rpc_quantity_canonicalizes_decimal_and_hex_values() {
-        assert_eq!(rpc_quantity("0").unwrap(), "0x0");
-        assert_eq!(rpc_quantity("100000").unwrap(), "0x186a0");
-        assert_eq!(rpc_quantity("0x000f").unwrap(), "0xf");
+    fn decimals_reject_out_of_range_words() {
+        assert_eq!(
+            decode_returns::<IERC20::decimalsCall>(&word(U256::from(6))).unwrap(),
+            6
+        );
+        // 0x106 used to be truncated to its last byte and read as 6 decimals.
+        assert!(decode_returns::<IERC20::decimalsCall>(&word(U256::from(0x106))).is_err());
     }
 
     #[test]
-    fn rpc_quantity_rejects_invalid_values() {
-        assert!(rpc_quantity("").is_err());
-        assert!(rpc_quantity("not-a-number").is_err());
-        assert!(rpc_quantity("0xzz").is_err());
+    fn recognizes_revert_payloads() {
+        assert!(is_revert_payload(&Revert::from("nope").abi_encode()));
+        assert!(is_revert_payload(&Panic::from(0x11).abi_encode()));
+        assert!(!is_revert_payload(&[]));
+        assert!(!is_revert_payload(&U256::from(1).to_be_bytes::<32>()));
+    }
+
+    #[test]
+    fn decodes_rpc_quantities() {
+        assert_eq!(
+            decode_quantity::<U64>(r#""0x2105""#, "chain id").unwrap(),
+            U64::from(8453)
+        );
+        assert_eq!(
+            decode_quantity::<U256>(r#""0xde0b6b3a7640000""#, "balance").unwrap(),
+            U256::from(1_000_000_000_000_000_000u64)
+        );
+        assert!(decode_quantity::<U256>(r#""0xzz""#, "balance").is_err());
+        assert!(decode_quantity::<U256>("12", "balance").is_ok());
     }
 }

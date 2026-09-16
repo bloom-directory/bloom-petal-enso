@@ -1,11 +1,12 @@
 //! Simulation of staged Enso transactions via `eth_call`.
 //!
 //! Runs a non-committal `eth_call` against the route's `to`/`data`/`value`
-//! and, on revert, attempts to decode the standard `Error(string)` ABI.
+//! and, on revert, decodes the standard `Error(string)` / `Panic(uint256)` ABI.
 
 use crate::api_types::RouteResponse;
 use crate::runtime::Host;
 use crate::session::Session;
+use alloy::primitives::{Bytes, hex};
 
 /// Simulate a route response directly (used by `create()` before the session
 /// is persisted, and by `simulate_route()` for stored sessions).
@@ -15,11 +16,10 @@ pub fn simulate_route_response<H: Host>(
     route: &RouteResponse,
 ) -> serde_json::Value {
     let to = format!("0x{:x}", route.tx.to);
-    let data = format!("0x{}", hex::encode(&route.tx.data));
+    let data = hex::encode_prefixed(&route.tx.data);
     let from = format!("0x{:x}", route.tx.from);
-    let value = route.tx.value.to_string();
 
-    match host.eth_call(chain, &to, &data, Some(&from), Some(&value)) {
+    match host.eth_call(chain, &to, &data, Some(&from), Some(route.tx.value)) {
         Ok(res) if res.success => serde_json::json!({
             "success": true,
             "return_data": res.return_data,
@@ -27,7 +27,7 @@ pub fn simulate_route_response<H: Host>(
         }),
         Ok(res) => {
             let message =
-                decode_error_string(&res.return_data).unwrap_or_else(|| res.return_data.clone());
+                decode_revert_message(&res.return_data).unwrap_or_else(|| res.return_data.clone());
             serde_json::json!({
                 "success": false,
                 "decoded_error": { "message": message },
@@ -66,60 +66,42 @@ pub fn failure_message(result: &serde_json::Value) -> String {
         .collect()
 }
 
-/// Decode an ABI-encoded `Error(string)` revert payload.
-///
-/// Layout after the 4-byte selector:
-///   32-byte offset (always 0x20 for a single string)
-///   32-byte length
-///   `length` bytes of UTF-8 data, padded to a 32-byte boundary.
-pub fn decode_error_string(hex_data: &str) -> Option<String> {
-    let hex = hex_data
-        .strip_prefix("0x")
-        .or_else(|| hex_data.strip_prefix("0X"))?;
-    if !hex_data.starts_with("0x08c379a0") && !hex_data.starts_with("0X08c379a0") {
-        return None;
-    }
-    // Skip the 4-byte selector (8 hex chars).
-    let body = &hex[8..];
-    if body.len() < 128 {
-        return None;
-    }
-    // Offset word (64 chars) — should be 0x20 for a single-string encoding.
-    let _offset = u64::from_str_radix(&body[..64], 16).ok()?;
-    let len = usize::from_str_radix(&body[64..128], 16).ok()?;
-    let data_start = 128;
-    let need = len * 2;
-    if data_start + need > body.len() {
-        return None;
-    }
-    let bytes = hex::decode(&body[data_start..data_start + need]).ok()?;
-    String::from_utf8(bytes).ok()
+/// Decode a revert payload (`Error(string)`, `Panic(uint256)`, or a raw
+/// UTF-8 reason) with alloy's validating decoder.
+pub fn decode_revert_message(hex_data: &str) -> Option<String> {
+    let bytes: Bytes = hex_data.parse().ok()?;
+    alloy::sol_types::decode_revert_reason(&bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::sol_types::{Panic, Revert, SolError};
 
     #[test]
-    fn decodes_simple_error_string() {
-        // Error("Insufficient allowance") — selector + offset + length + data
-        let msg = "Insufficient allowance";
-        let msg_hex = hex::encode(msg.as_bytes());
-        let len_hex = format!("{:064x}", msg.len());
-        let payload = format!(
-            "0x08c379a0\
-             0000000000000000000000000000000000000000000000000000000000000020\
-             {len_hex}\
-             {msg_hex}\
-             00000000000000000000000000000000000000000000000000000000000000",
+    fn decodes_error_string() {
+        let payload = hex::encode_prefixed(Revert::from("Insufficient allowance").abi_encode());
+        assert_eq!(
+            decode_revert_message(&payload).unwrap(),
+            "revert: Insufficient allowance"
         );
-        assert_eq!(decode_error_string(&payload).unwrap(), msg);
     }
 
     #[test]
-    fn returns_none_for_non_error_revert() {
-        // Panic selector 0x4e487b71 (Panic(uint256)) — not Error(string)
-        let payload = "0x4e487b710000000000000000000000000000000000000000000000000000000000000032";
-        assert!(decode_error_string(payload).is_none());
+    fn decodes_panic_code() {
+        let payload = hex::encode_prefixed(Panic::from(0x11).abi_encode());
+        assert!(
+            decode_revert_message(&payload)
+                .unwrap()
+                .contains("overflow")
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_error_string() {
+        let mut encoded = Revert::from("Insufficient allowance").abi_encode();
+        encoded.truncate(80);
+        assert!(decode_revert_message(&hex::encode_prefixed(encoded)).is_none());
+        assert!(decode_revert_message("0x08c379a0").is_none());
     }
 }

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use petal::sdk::{EvmTransaction, HttpRequest, HttpResponse, OutboxInspection, StagedTransaction};
 
 use crate::runtime::{EthCallResult, Host};
+use alloy::primitives::hex;
 
 /// In-memory mock implementing the full Host trait.
 struct MockHost {
@@ -29,6 +30,8 @@ struct MockHost {
     allowance: String,
     /// Override for erc20_balance (set after create to simulate settlement).
     balance_override: Option<String>,
+    /// On-chain `decimals()` by lowercase token address (default 18).
+    decimals: HashMap<String, u8>,
     /// HTTP status for Enso responses (default 200; set to non-200 to test errors).
     enso_status: u16,
     /// If set, tx_stage will fail after this many successful stages.
@@ -97,6 +100,10 @@ require_calldata_verification = false
                 "115792089237316195423570985008687907853269984665640564039457584007913129639935"
                     .to_string(),
             balance_override: None,
+            decimals: HashMap::from([(
+                "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".to_string(),
+                6,
+            )]),
             enso_status: 200,
             stage_fail_after: None,
             stage_count: 0,
@@ -161,6 +168,14 @@ require_calldata_verification = false
                 receipt_json: Some(receipt.to_string()),
             },
         );
+    }
+
+    fn balance(&self) -> Result<alloy::primitives::U256, String> {
+        self.balance_override
+            .as_deref()
+            .unwrap_or("1000000000000000000")
+            .parse()
+            .map_err(|e| format!("{e}"))
     }
 }
 
@@ -314,7 +329,7 @@ impl Host for MockHost {
         _to: &str,
         _data: &str,
         _from: Option<&str>,
-        _value: Option<&str>,
+        _value: Option<alloy::primitives::U256>,
     ) -> Result<EthCallResult, String> {
         if self.eth_call_success {
             Ok(EthCallResult {
@@ -342,26 +357,33 @@ impl Host for MockHost {
         _token: &str,
         _owner: &str,
         _spender: &str,
-    ) -> Result<String, String> {
-        Ok(self.allowance.clone())
+    ) -> Result<alloy::primitives::U256, String> {
+        self.allowance.parse().map_err(|e| format!("{e}"))
     }
 
-    fn erc20_balance(&mut self, _chain: &str, _token: &str, _addr: &str) -> Result<String, String> {
-        if let Some(ref bal) = self.balance_override {
-            return Ok(bal.clone());
-        }
-        Ok("1000000000000000000".to_string())
+    fn erc20_balance(
+        &mut self,
+        _chain: &str,
+        _token: &str,
+        _addr: &str,
+    ) -> Result<alloy::primitives::U256, String> {
+        self.balance()
     }
 
-    fn eth_balance(&mut self, _chain: &str, _addr: &str) -> Result<String, String> {
-        if let Some(ref bal) = self.balance_override {
-            return Ok(bal.clone());
-        }
-        Ok("1000000000000000000".to_string())
+    fn eth_balance(
+        &mut self,
+        _chain: &str,
+        _addr: &str,
+    ) -> Result<alloy::primitives::U256, String> {
+        self.balance()
     }
 
-    fn erc20_decimals(&mut self, _chain: &str, _token: &str) -> Result<u8, String> {
-        Ok(18)
+    fn erc20_decimals(&mut self, _chain: &str, token: &str) -> Result<u8, String> {
+        Ok(self
+            .decimals
+            .get(&token.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(18))
     }
 }
 
@@ -1201,6 +1223,19 @@ fn create_rejects_route_with_mismatched_amount() {
     let result = crate::workflow::create(&mut host, "test-wallet", body);
 
     assert!(result.is_err());
+    assert!(result.unwrap_err().contains("does not match"));
+}
+
+#[test]
+fn token_amount_uses_on_chain_decimals_not_the_symbol() {
+    // USDC is an 18-decimal token on BNB Chain. The mock route quotes 100 USDC
+    // at 6 decimals, so reading 18 on-chain must scale differently and refuse.
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    host.decimals
+        .insert("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".to_string(), 18);
+
+    let result = crate::workflow::create(&mut host, "test-wallet", b"swap 100.0 usdc to eth");
+
     assert!(result.unwrap_err().contains("does not match"));
 }
 

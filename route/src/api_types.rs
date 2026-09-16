@@ -1,10 +1,23 @@
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, Bytes, U256, address};
 use alloy::sol;
 use alloy::sol_types::{SolCall, SolValue};
 use serde::{Deserialize, Serialize};
 
 /// Sentinel address Enso uses for the chain's native token (ETH, MATIC, …).
-pub const NATIVE_TOKEN: &str = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+pub const NATIVE_TOKEN: Address = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
+// The ERC-20 surface this Petal reads, approves, and verifies settlement with.
+sol! {
+    #[allow(missing_docs)]
+    interface IERC20 {
+        event Transfer(address indexed from, address indexed to, uint256 value);
+
+        function allowance(address owner, address spender) external view returns (uint256);
+        function balanceOf(address account) external view returns (uint256);
+        function decimals() external view returns (uint8);
+        function approve(address spender, uint256 amount) external returns (bool);
+    }
+}
 
 // Enso Router V2 wraps the actual shortcut calldata in one of these calls.
 sol! {
@@ -151,16 +164,14 @@ impl RouteResponse {
                 let Ok((amount,)) = <(U256,)>::abi_decode_params(&token.data) else {
                     return false;
                 };
-                req.token_in == NATIVE_TOKEN.parse::<Address>().unwrap()
-                    && amount == req.amount_in
-                    && self.tx.value == amount
+                req.token_in == NATIVE_TOKEN && amount == req.amount_in && self.tx.value == amount
             }
             1 => {
                 let Ok((token_in, amount)) = <(Address, U256)>::abi_decode_params(&token.data)
                 else {
                     return false;
                 };
-                req.token_in != NATIVE_TOKEN.parse::<Address>().unwrap()
+                req.token_in != NATIVE_TOKEN
                     && token_in == req.token_in
                     && amount == req.amount_in
                     && self.tx.value == U256::ZERO
@@ -214,7 +225,18 @@ impl RouteResponse {
     }
 }
 
-// --- serde helpers ---
+// --- parsing helpers ---
+
+/// Parse a canonical base-unit integer string (ASCII digits only).
+///
+/// `U256::from_str_radix` alone also accepts `_` separators, which are never
+/// valid in an Enso quote or a stored balance observation.
+pub fn parse_decimal_u256(value: &str) -> Option<U256> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    U256::from_str_radix(value, 10).ok()
+}
 
 pub(crate) fn de_bytes_hex<'de, D>(d: D) -> Result<Bytes, D::Error>
 where
@@ -222,14 +244,14 @@ where
 {
     let s = String::deserialize(d)?;
     let s = s.trim();
-    if s.is_empty() || s == "0x" {
+    if s.is_empty() {
         return Ok(Bytes::new());
     }
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    let v = hex::decode(s).map_err(serde::de::Error::custom)?;
-    Ok(Bytes::from(v))
+    s.parse().map_err(serde::de::Error::custom)
 }
 
+/// Enso sends `value` as a decimal string, a hex quantity, a number, `null`,
+/// or an empty string. Everything except the empty forms is parsed by alloy.
 pub(crate) fn de_u256_dec_or_hex<'de, D>(d: D) -> Result<U256, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -238,24 +260,62 @@ where
     let v = serde_json::Value::deserialize(d)?;
     match v {
         serde_json::Value::Null => Ok(U256::ZERO),
-        serde_json::Value::String(s) => {
-            let t = s.trim();
-            if t.is_empty() {
-                return Ok(U256::ZERO);
-            }
-            if let Some(hex) = t.strip_prefix("0x") {
-                U256::from_str_radix(hex, 16).map_err(D::Error::custom)
-            } else {
-                U256::from_str_radix(t, 10).map_err(D::Error::custom)
-            }
+        serde_json::Value::String(ref s) if s.trim().is_empty() => Ok(U256::ZERO),
+        serde_json::Value::String(s) => s.trim().parse().map_err(D::Error::custom),
+        other => U256::deserialize(other).map_err(D::Error::custom),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::sol_types::SolEvent;
+
+    #[derive(Deserialize)]
+    struct Value {
+        #[serde(deserialize_with = "de_u256_dec_or_hex")]
+        value: U256,
+    }
+
+    fn value(json: &str) -> Result<U256, serde_json::Error> {
+        serde_json::from_str::<Value>(json).map(|parsed| parsed.value)
+    }
+
+    #[test]
+    fn route_value_accepts_enso_forms() {
+        assert_eq!(value(r#"{"value":null}"#).unwrap(), U256::ZERO);
+        assert_eq!(value(r#"{"value":""}"#).unwrap(), U256::ZERO);
+        assert_eq!(value(r#"{"value":"1000"}"#).unwrap(), U256::from(1000));
+        assert_eq!(value(r#"{"value":"0x3e8"}"#).unwrap(), U256::from(1000));
+        assert_eq!(value(r#"{"value":1000}"#).unwrap(), U256::from(1000));
+        assert!(value(r#"{"value":"-1"}"#).is_err());
+        assert!(value(r#"{"value":1.5}"#).is_err());
+    }
+
+    #[test]
+    fn decimal_u256_rejects_non_canonical_input() {
+        assert_eq!(parse_decimal_u256("0"), Some(U256::ZERO));
+        assert_eq!(parse_decimal_u256("0012"), Some(U256::from(12)));
+        assert_eq!(parse_decimal_u256(""), None);
+        assert_eq!(parse_decimal_u256("1_000"), None);
+        assert_eq!(parse_decimal_u256("0x10"), None);
+        assert_eq!(parse_decimal_u256(&"9".repeat(80)), None);
+    }
+
+    #[test]
+    fn approve_calldata_uses_the_erc20_selector() {
+        let spender = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let data = IERC20::approveCall {
+            spender,
+            amount: U256::from(123),
         }
-        serde_json::Value::Number(n) => {
-            if let Some(u) = n.as_u64() {
-                Ok(U256::from(u))
-            } else {
-                Err(D::Error::custom("non-u64 number for U256"))
-            }
-        }
-        other => Err(D::Error::custom(format!("unexpected value: {other}"))),
+        .abi_encode();
+        assert_eq!(&data[..4], &[0x09, 0x5e, 0xa7, 0xb3]);
+        assert_eq!(
+            IERC20::Transfer::SIGNATURE_HASH,
+            alloy::primitives::b256!(
+                "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+            )
+        );
     }
 }

@@ -4,12 +4,11 @@
 //! should increase. This module compares a pre-stage baseline (stored in the
 //! session) against the current on-chain balance.
 
-use crate::api_types::NATIVE_TOKEN;
+use crate::api_types::{IERC20, NATIVE_TOKEN, parse_decimal_u256};
 use crate::runtime::Host;
 use crate::session::Session;
-use alloy::primitives::U256;
-
-const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::sol_types::SolEvent;
 
 /// Compute the current settlement status for a session. Same-chain ERC-20
 /// completion requires an attributable receipt log; balance-only observations
@@ -28,10 +27,8 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
     let dest_chain = sess.destination_chain.as_deref().unwrap_or(&sess.chain);
 
     // Determine receiver.
-    let receiver = req
-        .receiver
-        .map(|a| format!("0x{:x}", a))
-        .unwrap_or_else(|| format!("0x{:x}", req.from_address));
+    let receiver_addr = req.receiver.unwrap_or(req.from_address);
+    let receiver = format!("0x{:x}", receiver_addr);
 
     let token_out_hex = format!("0x{:x}", req.token_out);
 
@@ -85,7 +82,7 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
         });
     }
 
-    let current = match read_balance(host, dest_chain, &token_out_hex, &receiver) {
+    let current = match read_balance(host, dest_chain, req.token_out, &receiver) {
         Ok(value) => value,
         Err(error) => {
             return serde_json::json!({
@@ -97,7 +94,7 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
         }
     };
 
-    let Some(before) = sess.observed_before.clone() else {
+    let Some(before) = sess.observed_before.as_deref().and_then(parse_decimal_u256) else {
         return serde_json::json!({
             "status": "unverified_baseline",
             "error": "session has no trusted pre-route balance observation",
@@ -106,29 +103,28 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
         });
     };
 
-    let delta = sub_decimal(&current, &before);
-    let minimum = match sess.route.as_ref().map(|route| route.amount_out.trim()) {
-        Some(value) if is_decimal(value) => value,
-        _ => {
-            return serde_json::json!({
-                "status": "error",
-                "error": "Enso route has no valid quoted output floor",
-            });
-        }
+    let delta = current.saturating_sub(before);
+    let Some(minimum) = sess
+        .route
+        .as_ref()
+        .and_then(|route| parse_decimal_u256(route.amount_out.trim()))
+    else {
+        return serde_json::json!({
+            "status": "error",
+            "error": "Enso route has no valid quoted output floor",
+        });
     };
-    let balance_reached_quote = !lt_decimal(&delta, minimum);
+    let balance_reached_quote = delta >= minimum;
     let same_chain = dest_chain.eq_ignore_ascii_case(&sess.chain);
-    let receipt_transfer = if same_chain && !token_out_hex.eq_ignore_ascii_case(NATIVE_TOKEN) {
+    let receipt_transfer = if same_chain && req.token_out != NATIVE_TOKEN {
         inspection
             .receipt_json
             .as_deref()
-            .and_then(|receipt| transfer_amount_to_receiver(receipt, &token_out_hex, &receiver))
+            .and_then(|receipt| transfer_amount_to_receiver(receipt, req.token_out, receiver_addr))
     } else {
         None
     };
-    let receipt_reached_quote = receipt_transfer
-        .as_deref()
-        .is_some_and(|amount| !lt_decimal(amount, minimum));
+    let receipt_reached_quote = receipt_transfer.is_some_and(|amount| amount >= minimum);
     let status = if receipt_reached_quote {
         "destination_received"
     } else if balance_reached_quote {
@@ -142,64 +138,55 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
         "source_state": inspection.state,
         "source_tx_hash": inspection.tx_hash,
         "route_outbox_id": route_outbox_id,
-        "observed_before": before,
-        "observed_after": current,
-        "delta": delta,
-        "receipt_transfer_amount": receipt_transfer,
-        "minimum_expected": minimum,
+        "observed_before": before.to_string(),
+        "observed_after": current.to_string(),
+        "delta": delta.to_string(),
+        "receipt_transfer_amount": receipt_transfer.map(|amount| amount.to_string()),
+        "minimum_expected": minimum.to_string(),
         "destination_chain": dest_chain,
         "receiver": receiver,
         "token_out": token_out_hex,
     })
 }
 
-fn transfer_amount_to_receiver(receipt: &str, token: &str, receiver: &str) -> Option<String> {
+/// Sum the ERC-20 `Transfer` events from `token` to `receiver` in a receipt.
+///
+/// Logs are decoded with alloy's validating event decoder; anything that is
+/// not a well-formed `Transfer` from the token contract is skipped.
+fn transfer_amount_to_receiver(receipt: &str, token: Address, receiver: Address) -> Option<U256> {
     let receipt: serde_json::Value = serde_json::from_str(receipt).ok()?;
     let logs = receipt.get("logs")?.as_array()?;
-    let receiver = receiver
-        .strip_prefix("0x")
-        .unwrap_or(receiver)
-        .to_ascii_lowercase();
     let mut total = U256::ZERO;
     let mut matched = false;
     for log in logs {
-        let Some(address) = log.get("address").and_then(|value| value.as_str()) else {
+        let Some(transfer) = decode_transfer(log, token) else {
             continue;
         };
-        if !address.eq_ignore_ascii_case(token) {
+        if transfer.to != receiver {
             continue;
         }
-        let Some(topics) = log.get("topics").and_then(|value| value.as_array()) else {
-            continue;
-        };
-        if topics.len() < 3 {
-            continue;
-        }
-        let (Some(event_topic), Some(recipient_topic)) = (topics[0].as_str(), topics[2].as_str())
-        else {
-            continue;
-        };
-        let recipient_topic = recipient_topic.trim_start_matches("0x");
-        if !event_topic.eq_ignore_ascii_case(TRANSFER_TOPIC)
-            || recipient_topic.len() != 64
-            || !recipient_topic[24..].eq_ignore_ascii_case(&receiver)
-        {
-            continue;
-        }
-        let Some(data) = log.get("data").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        let data = data.trim_start_matches("0x");
-        if data.len() != 64 {
-            continue;
-        }
-        let Ok(amount) = U256::from_str_radix(data, 16) else {
-            continue;
-        };
-        total = total.checked_add(amount)?;
+        total = total.checked_add(transfer.value)?;
         matched = true;
     }
-    matched.then(|| total.to_string())
+    matched.then_some(total)
+}
+
+fn decode_transfer(log: &serde_json::Value, token: Address) -> Option<IERC20::Transfer> {
+    let address: Address = log.get("address")?.as_str()?.parse().ok()?;
+    if address != token {
+        return None;
+    }
+    let topics = log
+        .get("topics")?
+        .as_array()?
+        .iter()
+        .map(|topic| topic.as_str()?.parse::<B256>().ok())
+        .collect::<Option<Vec<B256>>>()?;
+    let data: Bytes = log.get("data")?.as_str()?.parse().ok()?;
+    let transfer = IERC20::Transfer::decode_raw_log_validate(topics.iter().copied(), &data).ok()?;
+    // Indexed addresses must be canonical words, not dirty high bytes that
+    // happen to end in the receiver's address.
+    (topics[2] == transfer.to.into_word() && data.len() == 32).then_some(transfer)
 }
 
 /// Observe the pre-stage balance of the output token for the receiver.
@@ -208,174 +195,111 @@ fn transfer_amount_to_receiver(receipt: &str, token: &str, receiver: &str) -> Op
 pub fn observe_balance_before<H: Host>(
     host: &mut H,
     dest_chain: &str,
-    token_out_hex: &str,
+    token_out: Address,
     receiver_hex: &str,
 ) -> Result<String, String> {
-    read_balance(host, dest_chain, token_out_hex, receiver_hex)
+    read_balance(host, dest_chain, token_out, receiver_hex).map(|value| value.to_string())
 }
 
 fn read_balance<H: Host>(
     host: &mut H,
     chain: &str,
-    token: &str,
+    token: Address,
     receiver: &str,
-) -> Result<String, String> {
-    let value = if token.eq_ignore_ascii_case(NATIVE_TOKEN) {
-        host.eth_balance(chain, receiver)?
+) -> Result<U256, String> {
+    if token == NATIVE_TOKEN {
+        host.eth_balance(chain, receiver)
     } else {
-        host.erc20_balance(chain, token, receiver)?
-    };
-    if !is_decimal(&value) {
-        return Err("balance host returned a non-decimal value".into());
+        host.erc20_balance(chain, &format!("0x{token:x}"), receiver)
     }
-    Ok(normalize_decimal(&value))
-}
-
-fn is_decimal(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn normalize_decimal(value: &str) -> String {
-    let normalized = value.trim_start_matches('0');
-    if normalized.is_empty() {
-        "0".into()
-    } else {
-        normalized.into()
-    }
-}
-
-fn lt_decimal(a: &str, b: &str) -> bool {
-    let a = normalize_decimal(a);
-    let b = normalize_decimal(b);
-    if a.len() != b.len() {
-        return a.len() < b.len();
-    }
-    a < b
-}
-
-/// Subtract two non-negative decimal strings: `a - b`. Returns "0" if b > a.
-fn sub_decimal(a: &str, b: &str) -> String {
-    if !is_decimal(a) || !is_decimal(b) {
-        return "0".to_string();
-    }
-    let a_digits: Vec<u8> = a
-        .chars()
-        .rev()
-        .filter_map(|c| c.to_digit(10))
-        .map(|d| d as u8)
-        .collect();
-    let b_digits: Vec<u8> = b
-        .chars()
-        .rev()
-        .filter_map(|c| c.to_digit(10))
-        .map(|d| d as u8)
-        .collect();
-
-    if b_digits.len() > a_digits.len() {
-        return "0".to_string();
-    }
-
-    let mut result = Vec::with_capacity(a_digits.len());
-    let mut borrow = 0i32;
-
-    for i in 0..a_digits.len() {
-        let av = a_digits[i] as i32;
-        let bv = if i < b_digits.len() {
-            b_digits[i] as i32
-        } else {
-            0
-        };
-        let mut diff = av - bv - borrow;
-        if diff < 0 {
-            diff += 10;
-            borrow = 1;
-        } else {
-            borrow = 0;
-        }
-        result.push(diff as u8);
-    }
-
-    // If there's still a borrow, b > a.
-    if borrow > 0 {
-        return "0".to_string();
-    }
-
-    // Strip leading zeros.
-    while result.len() > 1 && *result.last().unwrap() == 0 {
-        result.pop();
-    }
-
-    result.iter().rev().map(|d| (b'0' + d) as char).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::address;
 
-    #[test]
-    fn basic_subtraction() {
-        assert_eq!(sub_decimal("1000", "300"), "700");
-        assert_eq!(sub_decimal("100", "100"), "0");
-        assert_eq!(sub_decimal("50", "100"), "0"); // underflow → 0
-        assert_eq!(sub_decimal("0", "0"), "0");
+    const TOKEN: Address = address!("0x6b175474e89094c44da98b954eedeac495271d0f");
+    const RECEIVER: Address = address!("0x742d35cc6634c0532925a3b844bc9e7595f0beb1");
+
+    fn transfer_log(recipient_topic: String, data: String) -> serde_json::Value {
+        serde_json::json!({
+            "address": format!("0x{TOKEN:x}"),
+            "topics": [
+                IERC20::Transfer::SIGNATURE_HASH,
+                format!("0x{}", "00".repeat(32)),
+                recipient_topic,
+            ],
+            "data": data,
+        })
     }
 
-    #[test]
-    fn large_numbers() {
-        assert_eq!(
-            sub_decimal("1000000000000000000000", "1"),
-            "999999999999999999999"
-        );
-    }
-
-    #[test]
-    fn strip_leading_zeros() {
-        assert_eq!(sub_decimal("1000", "999"), "1");
+    fn amount_word(value: u64) -> String {
+        format!("0x{:064x}", U256::from(value))
     }
 
     #[test]
     fn attributes_erc20_transfer_log_to_receiver() {
-        let token = "0x6b175474e89094c44da98b954eedeac495271d0f";
-        let receiver = "0x742d35cc6634c0532925a3b844bc9e7595f0beb1";
         let receipt = serde_json::json!({
-            "logs": [{
-                "address": token,
-                "topics": [
-                    TRANSFER_TOPIC,
-                    format!("0x{}", "00".repeat(32)),
-                    format!("0x{}{}", "00".repeat(12), receiver.trim_start_matches("0x")),
-                ],
-                "data": format!("0x{:064x}", U256::from(123_u64)),
-            }]
+            "logs": [transfer_log(RECEIVER.into_word().to_string(), amount_word(123))]
         });
         assert_eq!(
-            transfer_amount_to_receiver(&receipt.to_string(), token, receiver).as_deref(),
-            Some("123")
+            transfer_amount_to_receiver(&receipt.to_string(), TOKEN, RECEIVER),
+            Some(U256::from(123))
         );
     }
 
     #[test]
     fn skips_malformed_logs_before_attributable_transfer() {
-        let token = "0x6b175474e89094c44da98b954eedeac495271d0f";
-        let receiver = "0x742d35cc6634c0532925a3b844bc9e7595f0beb1";
         let receipt = serde_json::json!({
             "logs": [
                 {"topics": "not-an-array"},
-                {"address": token, "topics": [TRANSFER_TOPIC, null, null], "data": "0x00"},
-                {
-                    "address": token,
-                    "topics": [
-                        TRANSFER_TOPIC,
-                        format!("0x{}", "00".repeat(32)),
-                        format!("0x{}{}", "00".repeat(12), receiver.trim_start_matches("0x")),
-                    ],
-                    "data": format!("0x{:064x}", U256::from(123_u64)),
-                }
+                {"address": TOKEN, "topics": [IERC20::Transfer::SIGNATURE_HASH, null, null], "data": "0x00"},
+                transfer_log(RECEIVER.into_word().to_string(), amount_word(123)),
             ]
         });
         assert_eq!(
-            transfer_amount_to_receiver(&receipt.to_string(), token, receiver).as_deref(),
-            Some("123")
+            transfer_amount_to_receiver(&receipt.to_string(), TOKEN, RECEIVER),
+            Some(U256::from(123))
         );
+    }
+
+    #[test]
+    fn rejects_dirty_recipient_topic_and_bad_data_length() {
+        let dirty = format!("0x{}{}", "ff".repeat(12), hex_address(RECEIVER));
+        let receipt = serde_json::json!({
+            "logs": [
+                transfer_log(dirty, amount_word(123)),
+                transfer_log(RECEIVER.into_word().to_string(), format!("{}00", amount_word(1))),
+                transfer_log(RECEIVER.into_word().to_string(), "0x01".into()),
+            ]
+        });
+        assert_eq!(
+            transfer_amount_to_receiver(&receipt.to_string(), TOKEN, RECEIVER),
+            None
+        );
+    }
+
+    #[test]
+    fn ignores_transfers_from_other_tokens_and_to_other_receivers() {
+        let other = address!("0x0000000000000000000000000000000000000001");
+        let mut other_token = transfer_log(RECEIVER.into_word().to_string(), amount_word(5));
+        other_token["address"] = format!("0x{other:x}").into();
+        let receipt = serde_json::json!({
+            "logs": [
+                other_token,
+                transfer_log(other.into_word().to_string(), amount_word(7)),
+                transfer_log(RECEIVER.into_word().to_string(), amount_word(2)),
+                transfer_log(RECEIVER.into_word().to_string(), amount_word(3)),
+            ]
+        });
+        assert_eq!(
+            transfer_amount_to_receiver(&receipt.to_string(), TOKEN, RECEIVER),
+            Some(U256::from(5))
+        );
+    }
+
+    fn hex_address(address: Address) -> String {
+        format!("{address:x}")
     }
 }

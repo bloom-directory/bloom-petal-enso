@@ -141,7 +141,7 @@ pub fn resolve_token_symbol(chain_id: u64, sym: &str) -> Option<Address> {
     let upper = s.to_ascii_uppercase();
 
     if is_native_alias(chain_id, &upper) {
-        return NATIVE_TOKEN.parse().ok();
+        return Some(NATIVE_TOKEN);
     }
 
     // Expanded static token registry. Grouped by chain for readability.
@@ -228,30 +228,6 @@ pub fn resolve_token_symbol(chain_id: u64, sym: &str) -> Option<Address> {
     }
 }
 
-/// Common token decimals for a symbol on a chain.
-///
-/// Defaults to the dominant EVM standard of 18. Stablecoins USDC and USDT use 6,
-/// DAI uses 18 (it is an 18-decimal token, *not* 6), and WBTC uses 8. The
-/// `chain_id` is accepted so callers can special-case chain-specific quirks;
-/// the symbol-based map below reflects the canonical values across our table.
-pub fn decimals_for_symbol(chain_id: u64, symbol: &str) -> u8 {
-    let upper = symbol.trim().to_ascii_uppercase();
-    match upper.as_str() {
-        // 6-decimal stablecoins.
-        "USDC" | "USDT" => 6,
-        // DAI is an 18-decimal token — do NOT group it with the 6-dec stables.
-        "DAI" => 18,
-        // Bitcoin wraps use 8 decimals.
-        "WBTC" | "CBBTC" => 8,
-        // Everything else in the registry (WETH, LINK, UNI, AAVE, etc.) is 18.
-        _ => {
-            // Let chain-specific overrides surface if needed in the future.
-            let _ = chain_id;
-            18
-        }
-    }
-}
-
 /// Convenience: resolve `symbol` to `(address, chain_id)` on a named chain.
 ///
 /// Returns `None` if the chain name is unknown or the symbol is not present in
@@ -321,10 +297,7 @@ mod tests {
 
     #[test]
     fn resolves_native_and_known_symbols() {
-        assert_eq!(
-            resolve_token_symbol(1, "ETH").unwrap(),
-            NATIVE_TOKEN.parse::<Address>().unwrap()
-        );
+        assert_eq!(resolve_token_symbol(1, "ETH").unwrap(), NATIVE_TOKEN);
         assert!(resolve_token_symbol(1, "USDC").is_some());
         assert!(resolve_token_symbol(1, "FOOBAR").is_none());
     }
@@ -442,18 +415,15 @@ mod tests {
         for chain in [1u64, 8453, 10, 42161] {
             assert_eq!(
                 resolve_token_symbol(chain, "ETH").unwrap(),
-                NATIVE_TOKEN.parse::<Address>().unwrap(),
+                NATIVE_TOKEN,
                 "ETH native on chain {chain}"
             );
         }
         // MATIC is native on Polygon…
-        assert_eq!(
-            resolve_token_symbol(137, "MATIC").unwrap(),
-            NATIVE_TOKEN.parse::<Address>().unwrap()
-        );
+        assert_eq!(resolve_token_symbol(137, "MATIC").unwrap(), NATIVE_TOKEN);
         // …but a bridged ERC-20 token on Ethereum.
         let matic_on_eth = resolve_token_symbol(1, "MATIC").unwrap();
-        assert_ne!(matic_on_eth, NATIVE_TOKEN.parse::<Address>().unwrap());
+        assert_ne!(matic_on_eth, NATIVE_TOKEN);
         assert_eq!(
             matic_on_eth,
             "0x7d1afa7b718fb893db30a3abc0cfc608aacfebb0"
@@ -461,14 +431,8 @@ mod tests {
                 .unwrap()
         );
         // BNB / AVAX are native on their home chains.
-        assert_eq!(
-            resolve_token_symbol(56, "BNB").unwrap(),
-            NATIVE_TOKEN.parse::<Address>().unwrap()
-        );
-        assert_eq!(
-            resolve_token_symbol(43114, "AVAX").unwrap(),
-            NATIVE_TOKEN.parse::<Address>().unwrap()
-        );
+        assert_eq!(resolve_token_symbol(56, "BNB").unwrap(), NATIVE_TOKEN);
+        assert_eq!(resolve_token_symbol(43114, "AVAX").unwrap(), NATIVE_TOKEN);
     }
 
     #[test]
@@ -481,26 +445,6 @@ mod tests {
                 .parse::<Address>()
                 .unwrap()
         );
-    }
-
-    #[test]
-    fn decimals_for_common_symbols() {
-        assert_eq!(decimals_for_symbol(1, "USDC"), 6);
-        assert_eq!(decimals_for_symbol(1, "USDT"), 6);
-        // DAI is 18, never 6.
-        assert_eq!(decimals_for_symbol(1, "DAI"), 18);
-        assert_eq!(decimals_for_symbol(42161, "DAI"), 18);
-        assert_eq!(decimals_for_symbol(1, "WBTC"), 8);
-        // WETH, LINK, UNI, OP, etc. default to 18.
-        assert_eq!(decimals_for_symbol(1, "WETH"), 18);
-        assert_eq!(decimals_for_symbol(10, "OP"), 18);
-        assert_eq!(decimals_for_symbol(1, "LINK"), 18);
-        assert_eq!(decimals_for_symbol(1, "PEPE"), 18);
-        // Unknown symbols default to 18.
-        assert_eq!(decimals_for_symbol(1, "UNKNOWN"), 18);
-        // Case-insensitive.
-        assert_eq!(decimals_for_symbol(1, "usdc"), 6);
-        assert_eq!(decimals_for_symbol(1, "dai"), 18);
     }
 
     #[test]
