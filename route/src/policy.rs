@@ -62,11 +62,25 @@ impl Default for DefiPolicy {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+const DEFAULT_MAX_SLIPPAGE_BPS: u16 = 100;
+
+fn default_max_slippage_bps() -> Option<u16> {
+    Some(DEFAULT_MAX_SLIPPAGE_BPS)
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MevPolicy {
-    #[serde(default)]
+    #[serde(default = "default_max_slippage_bps")]
     max_slippage_bps: Option<u16>,
+}
+
+impl Default for MevPolicy {
+    fn default() -> Self {
+        Self {
+            max_slippage_bps: default_max_slippage_bps(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -538,5 +552,16 @@ mod tests {
         let text = "[defi]\nenabled = true\nfuture_permission = true\n";
         let err = toml::from_str::<EnsoVenueConfig>(text).unwrap_err();
         assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn partial_configs_keep_the_conservative_slippage_ceiling() {
+        for text in [
+            "[defi]\nenabled = true\n",
+            "[mev]\n[defi]\nenabled = true\n",
+        ] {
+            let config: EnsoVenueConfig = toml::from_str(text).unwrap();
+            assert_eq!(config.mev.max_slippage_bps, Some(DEFAULT_MAX_SLIPPAGE_BPS));
+        }
     }
 }

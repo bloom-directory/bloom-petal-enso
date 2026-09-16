@@ -1431,6 +1431,26 @@ fn slippage_above_venue_configuration_is_rejected() {
     assert!(error.contains("max_slippage"), "{error}");
 }
 
+#[test]
+fn omitted_mev_section_keeps_the_default_slippage_ceiling() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let config = String::from_utf8(
+        host.store
+            .remove("settings/test-wallet/venue.toml")
+            .unwrap(),
+    )
+    .unwrap()
+    .replace("[mev]\nmax_slippage_bps = 100\n\n", "");
+    host.store.insert(
+        "settings/wallets/test-wallet/venue.toml".into(),
+        config.into_bytes(),
+    );
+
+    let body = br#"{"intent":"swap 100.0 usdc to eth","chain":"ethereum","slippage_bps":200}"#;
+    let error = crate::workflow::create(&mut host, "test-wallet", body).unwrap_err();
+    assert!(error.contains("max_slippage"), "{error}");
+}
+
 // ===========================================================================
 // TEST: default slippage is 50 bps when not specified
 // ===========================================================================
