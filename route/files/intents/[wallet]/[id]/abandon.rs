@@ -7,7 +7,7 @@ petal::route_file!(
         )
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
-        let wallet = match petal::wallet_param(ctx) {
+        let wallet = match crate::wallet::param(ctx) {
             Ok(value) => value,
             Err(response) => return response,
         };

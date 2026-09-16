@@ -132,6 +132,21 @@ fn venue_config_key(wallet: &str) -> String {
     format!("settings/wallets/{wallet}/venue.toml")
 }
 
+/// Validate a venue-config write and return its namespaced store key.
+///
+/// Persistence remains a separate operation so route controllers can report
+/// malformed input as `-3` and transient store failures as `-4`.
+pub fn validate_venue_config_write(wallet: &str, body: &[u8]) -> Result<String, String> {
+    crate::wallet::validate_id(wallet)?;
+    if body.len() > MAX_VENUE_CONFIG_BYTES {
+        return Err("Enso venue configuration exceeds 256 KiB".into());
+    }
+    let text = std::str::from_utf8(body).map_err(|_| "Enso venue configuration must be UTF-8")?;
+    toml::from_str::<EnsoVenueConfig>(text)
+        .map_err(|e| format!("Enso venue configuration is invalid: {e}"))?;
+    Ok(venue_config_key(wallet))
+}
+
 /// The effective initial configuration is shared by the read surface and the
 /// workflow. Explicit user configuration retains conservative field defaults.
 const DEFAULT_VENUE_CONFIG: &[u8] = include_bytes!("venue-defaults.toml");
@@ -148,7 +163,7 @@ pub fn load_venue_config<H: Host>(host: &mut H, wallet: &str) -> Result<Verified
 }
 
 pub fn read_venue_config<H: Host>(host: &mut H, wallet: &str) -> Result<Vec<u8>, String> {
-    petal::validate_wallet_id(wallet)?;
+    crate::wallet::validate_id(wallet)?;
     if let Some(bytes) = host.get(&venue_config_key(wallet), MAX_VENUE_CONFIG_BYTES)? {
         return Ok(bytes);
     }
@@ -163,14 +178,8 @@ pub fn read_venue_config<H: Host>(host: &mut H, wallet: &str) -> Result<Vec<u8>,
 }
 
 pub fn write_venue_config<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<(), String> {
-    petal::validate_wallet_id(wallet)?;
-    if body.len() > MAX_VENUE_CONFIG_BYTES {
-        return Err("Enso venue configuration exceeds 256 KiB".into());
-    }
-    let text = std::str::from_utf8(body).map_err(|_| "Enso venue configuration must be UTF-8")?;
-    toml::from_str::<EnsoVenueConfig>(text)
-        .map_err(|e| format!("Enso venue configuration is invalid: {e}"))?;
-    host.put(&venue_config_key(wallet), body, false)
+    let key = validate_venue_config_write(wallet, body)?;
+    host.put(&key, body, false)
 }
 
 pub fn evaluate(policy: &VerifiedPolicy, ctx: &RoutePolicyContext<'_>) -> serde_json::Value {

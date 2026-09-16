@@ -23,7 +23,7 @@ fn save<H: Host>(host: &mut H, s: &Session) -> Result<(), String> {
 }
 
 pub fn load<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<Session, String> {
-    petal::validate_wallet_id(wallet)?;
+    crate::wallet::validate_id(wallet)?;
     validate_session_id(id)?;
     let raw = host
         .get(&session::key(wallet, id), 2 * 1024 * 1024)?
@@ -43,7 +43,7 @@ fn resolve_api_key<H: Host>(host: &mut H) -> Result<String, String> {
 }
 
 fn wallet_address<H: Host>(host: &mut H, wallet: &str) -> Result<String, String> {
-    petal::validate_wallet_id(wallet)?;
+    crate::wallet::validate_id(wallet)?;
     let address =
         String::from_utf8(host.vfs_read(&format!("wallets/{wallet}/0/address.evm"), 128)?)
             .map_err(|_| "wallet EVM address is not UTF-8")?
@@ -686,7 +686,7 @@ fn acquire_confirm_lock<H: Host>(
     wallet: &str,
     id: &str,
 ) -> Result<(String, Vec<u8>), String> {
-    petal::validate_wallet_id(wallet)?;
+    crate::wallet::validate_id(wallet)?;
     validate_session_id(id)?;
     let key = confirm_lock_key(wallet, id);
     let now = host.now_ms();

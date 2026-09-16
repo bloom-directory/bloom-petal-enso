@@ -13,7 +13,7 @@ petal::route_file!(
                 if let Some(rest) = key.strip_prefix(prefix)
                     && let Some((wallet, file)) = rest.split_once('/')
                     && file == "venue.toml"
-                    && petal::validate_wallet_id(wallet).is_ok()
+                    && crate::wallet::validate_id(wallet).is_ok()
                 {
                     children.insert(wallet.to_string());
                 }

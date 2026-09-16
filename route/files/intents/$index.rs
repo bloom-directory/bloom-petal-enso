@@ -12,7 +12,7 @@ petal::route_file!(
         for key in keys {
             if let Some(rest) = key.strip_prefix(&prefix)
                 && let Some((wallet, _)) = rest.split_once('/')
-                && petal::validate_wallet_id(wallet).is_ok()
+                && crate::wallet::validate_id(wallet).is_ok()
             {
                 wallets.insert(wallet.to_string());
             }
