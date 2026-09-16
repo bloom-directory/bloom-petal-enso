@@ -129,22 +129,18 @@ fn receiver_matches(set: &BTreeSet<String>, ctx: &RoutePolicyContext<'_>) -> boo
 const MAX_VENUE_CONFIG_BYTES: usize = 256 * 1024;
 
 fn venue_config_key(wallet: &str) -> String {
-    format!("settings/{wallet}/venue.toml")
+    format!("settings/wallets/{wallet}/venue.toml")
 }
 
-/// Load Enso-owned advisory preferences. Missing configuration fails closed
-/// because `DefiPolicy::default()` leaves the venue disabled.
+/// The effective initial configuration is shared by the read surface and the
+/// workflow. Explicit user configuration retains conservative field defaults.
+const DEFAULT_VENUE_CONFIG: &[u8] = include_bytes!("venue-defaults.toml");
+
 pub fn load_venue_config<H: Host>(host: &mut H, wallet: &str) -> Result<VerifiedPolicy, String> {
-    petal::validate_wallet_id(wallet)?;
-    let policy = match host.get(&venue_config_key(wallet), MAX_VENUE_CONFIG_BYTES)? {
-        Some(bytes) => {
-            let text =
-                std::str::from_utf8(&bytes).map_err(|_| "Enso venue configuration is not UTF-8")?;
-            toml::from_str::<EnsoVenueConfig>(text)
-                .map_err(|e| format!("Enso venue configuration is invalid: {e}"))?
-        }
-        None => EnsoVenueConfig::default(),
-    };
+    let bytes = read_venue_config(host, wallet)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| "Enso venue configuration is not UTF-8")?;
+    let policy = toml::from_str::<EnsoVenueConfig>(text)
+        .map_err(|e| format!("Enso venue configuration is invalid: {e}"))?;
     Ok(VerifiedPolicy {
         defi: policy.defi,
         max_slippage_bps: policy.mev.max_slippage_bps,
@@ -153,22 +149,17 @@ pub fn load_venue_config<H: Host>(host: &mut H, wallet: &str) -> Result<Verified
 
 pub fn read_venue_config<H: Host>(host: &mut H, wallet: &str) -> Result<Vec<u8>, String> {
     petal::validate_wallet_id(wallet)?;
+    if let Some(bytes) = host.get(&venue_config_key(wallet), MAX_VENUE_CONFIG_BYTES)? {
+        return Ok(bytes);
+    }
+    // Preserve settings written by PR 7 before the route namespace move,
+    // including explicit opt-outs. Writes always use the new key.
     Ok(host
-        .get(&venue_config_key(wallet), MAX_VENUE_CONFIG_BYTES)?
-        .unwrap_or_else(|| {
-            b"# Enso-owned advisory preferences; Bloom wallet policy remains host-enforced.\n\
-[defi]\n\
-enabled = false\n\
-allowed_source_chains = []\n\
-allowed_destination_chains = []\n\
-allowed_receivers = [\"class:wallet_eoa\"]\n\
-denied_receivers = []\n\
-allowed_routers = []\n\
-denied_protocols = []\n\
-allow_unknown_protocols = false\n\
-require_calldata_verification = true\n"
-                .to_vec()
-        }))
+        .get(
+            &format!("settings/{wallet}/venue.toml"),
+            MAX_VENUE_CONFIG_BYTES,
+        )?
+        .unwrap_or_else(|| DEFAULT_VENUE_CONFIG.to_vec()))
 }
 
 pub fn write_venue_config<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<(), String> {
@@ -496,6 +487,35 @@ mod tests {
         ctx.slippage_bps = 101;
         let checks = evaluate(&policy(), &ctx);
         assert!(deny_reason(&checks).is_some());
+    }
+
+    #[test]
+    fn bundled_defaults_allow_supported_routes_and_keep_boundaries() {
+        let defaults: EnsoVenueConfig =
+            toml::from_str(std::str::from_utf8(DEFAULT_VENUE_CONFIG).unwrap()).unwrap();
+        let policy = VerifiedPolicy {
+            defi: defaults.defi,
+            max_slippage_bps: defaults.mev.max_slippage_bps,
+        };
+        let mut ctx = context(&[]);
+        ctx.protocols_unknown = true;
+        for source in &policy.defi.allowed_source_chains {
+            for destination in &policy.defi.allowed_destination_chains {
+                ctx.source_chain = source;
+                ctx.destination_chain = destination;
+                ctx.cross_chain = source != destination;
+                let checks = evaluate(&policy, &ctx);
+                assert!(deny_reason(&checks).is_none(), "{checks:#}");
+            }
+        }
+        ctx.source_chain = "base";
+        ctx.destination_chain = "base";
+        ctx.cross_chain = false;
+        ctx.slippage_bps = 101;
+        assert!(deny_reason(&evaluate(&policy, &ctx)).is_some());
+        ctx.slippage_bps = 50;
+        ctx.receiver_class = "external";
+        assert!(deny_reason(&evaluate(&policy, &ctx)).is_some());
     }
 
     #[test]

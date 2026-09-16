@@ -1,0 +1,27 @@
+# Enso-owned advisory preferences; Bloom wallet policy remains host-enforced.
+# Defaults cover all seven chains supported by this Petal's token registry.
+# Router V2 deployments: https://docs.enso.build/pages/build/reference/deployments
+[mev]
+max_slippage_bps = 100
+
+[defi]
+enabled = true
+allowed_source_chains = ["ethereum", "polygon", "base", "optimism", "arbitrum", "bnb", "avalanche"]
+allowed_destination_chains = ["ethereum", "polygon", "base", "optimism", "arbitrum", "bnb", "avalanche"]
+allowed_receivers = ["class:wallet_eoa"]
+denied_receivers = []
+allowed_routers = [
+  "ethereum:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+  "polygon:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+  "base:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+  "optimism:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+  "arbitrum:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+  "bnb:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+  "avalanche:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+]
+denied_protocols = []
+# Missing protocol metadata is surfaced as a warning in the review plan.
+allow_unknown_protocols = true
+# Router V2 action bytes are not fully decoded. Receiver and minimum-output
+# guarantees remain unverified and require operator review before broadcast.
+require_calldata_verification = false
