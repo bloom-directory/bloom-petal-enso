@@ -53,7 +53,7 @@ impl MockHost {
         );
         let mut store = HashMap::new();
         store.insert(
-            crate::policy::ROUTE_RULES.to_string(),
+            crate::policy::route_rules_key("test-wallet"),
             br#"
 [mev]
 max_slippage_bps = 100
@@ -723,12 +723,102 @@ fn missing_account_zero_address_names_the_expected_path() {
 #[test]
 fn missing_route_rules_deny_with_configuration_path() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
-    host.store.remove(crate::policy::ROUTE_RULES);
+    host.store
+        .remove(&crate::policy::route_rules_key("test-wallet"));
 
     let error =
         crate::workflow::create(&mut host, "test-wallet", b"swap 100 usdc to eth").unwrap_err();
     assert!(error.contains("defi.enabled"), "{error}");
-    assert!(error.contains("settings/route-rules.toml"), "{error}");
+    assert!(
+        error.contains("settings/test-wallet/route-rules.toml"),
+        "{error}"
+    );
+}
+
+#[test]
+fn route_rules_apply_only_to_their_wallet() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let rules = host
+        .store
+        .remove(&crate::policy::route_rules_key("test-wallet"))
+        .unwrap();
+    host.store
+        .insert(crate::policy::route_rules_key("other-wallet"), rules);
+
+    let error =
+        crate::workflow::create(&mut host, "test-wallet", b"swap 100 usdc to eth").unwrap_err();
+    assert!(error.contains("defi.enabled"), "{error}");
+    assert!(
+        error.contains("settings/test-wallet/route-rules.toml"),
+        "{error}"
+    );
+}
+
+#[test]
+fn failed_create_is_recorded_for_latest_and_status() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    host.store
+        .remove(&crate::policy::route_rules_key("test-wallet"));
+
+    let error =
+        crate::workflow::create(&mut host, "test-wallet", b"swap 100 usdc to eth").unwrap_err();
+    let id = String::from_utf8(host.store["intents/test-wallet/latest"].clone()).unwrap();
+    assert!(
+        error.starts_with(&format!(
+            "intent {id} failed (intents/test-wallet/{id}/status.json): "
+        )),
+        "{error}"
+    );
+    let record: serde_json::Value =
+        serde_json::from_slice(&host.store[&crate::session::failure_key("test-wallet", &id)])
+            .unwrap();
+    assert_eq!(record["schema"], "enso.intent_failure.v1");
+    assert_eq!(record["state"], "failed");
+    assert_eq!(record["stage"], "create");
+    assert!(
+        record["error"].as_str().unwrap().contains("defi.enabled"),
+        "{record}"
+    );
+    assert!(
+        !host
+            .store
+            .contains_key(&format!("intents/test-wallet/{id}/session.json"))
+    );
+}
+
+#[test]
+fn unconfigured_wallet_is_denied_before_any_network_call() {
+    let mut host = MockHost::new();
+    host.store
+        .remove(&crate::policy::route_rules_key("test-wallet"));
+    host.chain_ids.clear();
+    host.vfs.clear();
+    host.secrets.clear();
+
+    let error =
+        crate::workflow::create(&mut host, "test-wallet", b"swap 100 usdc to eth").unwrap_err();
+    assert!(error.contains("policy denied [defi.enabled]"), "{error}");
+    assert!(
+        error.contains("settings/test-wallet/route-rules.toml"),
+        "{error}"
+    );
+}
+
+#[test]
+fn source_chain_outside_rules_is_denied_before_quoting() {
+    let mut host = MockHost::new();
+    host.chain_ids.clear();
+
+    let error = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 100 usdc to eth on arbitrum",
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("policy denied [defi.source_chain]"),
+        "{error}"
+    );
 }
 
 #[test]

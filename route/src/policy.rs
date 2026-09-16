@@ -86,6 +86,7 @@ pub struct VerifiedPolicy {
 
 #[derive(Debug)]
 pub struct RoutePolicyContext<'a> {
+    pub wallet: &'a str,
     pub source_chain: &'a str,
     pub destination_chain: &'a str,
     pub cross_chain: bool,
@@ -127,33 +128,94 @@ fn receiver_matches(set: &BTreeSet<String>, ctx: &RoutePolicyContext<'_>) -> boo
     set_contains_case_insensitive(set, &literal) || set_contains_case_insensitive(set, &class)
 }
 
-pub const ROUTE_RULES: &str = "settings/route-rules.toml";
+/// Private store key for one wallet's route rules. Rules are per wallet and
+/// deliberately separate from Bloom's canonical wallet policy, which governs
+/// package authorization. There is no shared or default rule set.
+pub fn route_rules_key(wallet: &str) -> String {
+    format!("settings/{wallet}/route-rules.toml")
+}
 
-/// Parse Enso's private route rules. These rules are deliberately separate
-/// from Bloom's canonical wallet policy, which governs package authorization.
+/// Parse one wallet's Enso route rules.
 pub fn parse_route_rules(bytes: &[u8]) -> Result<VerifiedPolicy, String> {
     if bytes.is_empty() || bytes.len() > 256 * 1024 {
         return Err("route rules must be 1..=262144 bytes".into());
     }
     let text = std::str::from_utf8(bytes).map_err(|_| "route rules must be UTF-8")?;
     let policy: RouteRules =
-        toml::from_str(text).map_err(|e| format!("settings/route-rules.toml is invalid: {e}"))?;
+        toml::from_str(text).map_err(|e| format!("route-rules.toml is invalid: {e}"))?;
     Ok(VerifiedPolicy {
         defi: policy.defi,
         max_slippage_bps: policy.mev.max_slippage_bps,
     })
 }
 
-/// Load Enso's private route rules. An absent configuration is intentionally
+/// Load one wallet's route rules. An absent configuration is intentionally
 /// fail-closed: `DefiPolicy::default()` disables all generic DeFi routes.
-pub fn load_route_rules<H: Host>(host: &mut H) -> Result<VerifiedPolicy, String> {
-    match host.get(ROUTE_RULES, 256 * 1024)? {
+pub fn load_route_rules<H: Host>(host: &mut H, wallet: &str) -> Result<VerifiedPolicy, String> {
+    match host.get(&route_rules_key(wallet), 256 * 1024)? {
         Some(bytes) => parse_route_rules(&bytes),
         None => Ok(VerifiedPolicy {
             defi: DefiPolicy::default(),
             max_slippage_bps: None,
         }),
     }
+}
+
+/// The checks that need only the wallet's rules and the requested chains.
+/// Intent creation runs them before any network call, and `evaluate` repeats
+/// them in the full check.
+pub fn preflight_checks(
+    policy: &VerifiedPolicy,
+    wallet: &str,
+    source_chain: &str,
+    destination_chain: &str,
+    cross_chain: bool,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let defi = &policy.defi;
+
+    out.push(check(
+        "enabled",
+        if defi.enabled { "pass" } else { "deny" },
+        if defi.enabled {
+            "DeFi routes enabled".to_string()
+        } else {
+            format!(
+                "generic DeFi routes are disabled for wallet {wallet}; configure settings/{wallet}/route-rules.toml"
+            )
+        },
+    ));
+
+    let source_allowed = set_contains_case_insensitive(
+        &defi.allowed_source_chains,
+        &source_chain.to_ascii_lowercase(),
+    );
+    out.push(check(
+        "source_chain",
+        if source_allowed { "pass" } else { "deny" },
+        if source_allowed {
+            format!("source chain {source_chain} allowed")
+        } else {
+            format!("source chain {source_chain} is not allowlisted")
+        },
+    ));
+
+    if cross_chain {
+        let destination_allowed = set_contains_case_insensitive(
+            &defi.allowed_destination_chains,
+            &destination_chain.to_ascii_lowercase(),
+        );
+        out.push(check(
+            "destination_chain",
+            if destination_allowed { "pass" } else { "deny" },
+            if destination_allowed {
+                format!("destination chain {destination_chain} allowed")
+            } else {
+                format!("destination chain {destination_chain} is not allowlisted")
+            },
+        ));
+    }
+    out
 }
 
 pub fn evaluate(policy: &VerifiedPolicy, ctx: &RoutePolicyContext<'_>) -> serde_json::Value {
@@ -170,48 +232,13 @@ pub fn evaluate(policy: &VerifiedPolicy, ctx: &RoutePolicyContext<'_>) -> serde_
         },
     ));
 
-    out.push(check(
-        "enabled",
-        if defi.enabled { "pass" } else { "deny" },
-        if defi.enabled {
-            "DeFi routes enabled"
-        } else {
-            "generic DeFi routes are disabled; configure settings/route-rules.toml"
-        },
+    out.extend(preflight_checks(
+        policy,
+        ctx.wallet,
+        ctx.source_chain,
+        ctx.destination_chain,
+        ctx.cross_chain,
     ));
-
-    let source_allowed = set_contains_case_insensitive(
-        &defi.allowed_source_chains,
-        &ctx.source_chain.to_ascii_lowercase(),
-    );
-    out.push(check(
-        "source_chain",
-        if source_allowed { "pass" } else { "deny" },
-        if source_allowed {
-            format!("source chain {} allowed", ctx.source_chain)
-        } else {
-            format!("source chain {} is not allowlisted", ctx.source_chain)
-        },
-    ));
-
-    if ctx.cross_chain {
-        let destination_allowed = set_contains_case_insensitive(
-            &defi.allowed_destination_chains,
-            &ctx.destination_chain.to_ascii_lowercase(),
-        );
-        out.push(check(
-            "destination_chain",
-            if destination_allowed { "pass" } else { "deny" },
-            if destination_allowed {
-                format!("destination chain {} allowed", ctx.destination_chain)
-            } else {
-                format!(
-                    "destination chain {} is not allowlisted",
-                    ctx.destination_chain
-                )
-            },
-        ));
-    }
 
     let receiver_literal = format!(
         "{}:{}:{}",
@@ -437,6 +464,7 @@ mod tests {
 
     fn context<'a>(protocols: &'a [String]) -> RoutePolicyContext<'a> {
         RoutePolicyContext {
+            wallet: "main",
             source_chain: "base",
             destination_chain: "base",
             cross_chain: false,
@@ -490,7 +518,7 @@ mod tests {
         assert!(
             deny_reason(&checks)
                 .unwrap()
-                .contains("settings/route-rules.toml")
+                .contains("settings/main/route-rules.toml")
         );
     }
 }

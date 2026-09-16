@@ -57,7 +57,7 @@ fn wallet_address<H: Host>(host: &mut H, wallet: &str) -> Result<String, String>
     Ok(address)
 }
 
-fn validate_wallet_name(wallet: &str) -> Result<(), String> {
+pub fn validate_wallet_name(wallet: &str) -> Result<(), String> {
     if wallet.is_empty()
         || wallet.len() > 128
         || !wallet
@@ -395,12 +395,54 @@ fn render_plan_md(view: PlanView<'_>) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String, String> {
+    validate_wallet_name(wallet)?;
+    let id = generate_id(host)?;
+    match prepare_session(host, wallet, &id, body) {
+        Ok(()) => {
+            // Store latest pointer for convenience lookups.
+            let _ = host.put(&format!("intents/{wallet}/latest"), id.as_bytes(), false);
+            Ok(id)
+        }
+        Err(error) => Err(record_create_failure(host, wallet, &id, error)),
+    }
+}
+
+/// Record a failed intent under its own ID, so `latest` and `status.json`
+/// still explain the failure after the write that reported it is gone. The
+/// returned error names that record first, ahead of any truncation.
+fn record_create_failure<H: Host>(host: &mut H, wallet: &str, id: &str, error: String) -> String {
+    let record = serde_json::json!({
+        "schema": "enso.intent_failure.v1",
+        "id": id,
+        "wallet": wallet,
+        "state": "failed",
+        "stage": "create",
+        "error": crate::redaction::sanitize_message(&error),
+        "failed_ms": host.now_ms(),
+    });
+    let Ok(bytes) = serde_json::to_vec_pretty(&record) else {
+        return error;
+    };
+    if host
+        .put(&crate::session::failure_key(wallet, id), &bytes, false)
+        .is_err()
+    {
+        return error;
+    }
+    let _ = host.put(&format!("intents/{wallet}/latest"), id.as_bytes(), false);
+    format!("intent {id} failed (intents/{wallet}/{id}/status.json): {error}")
+}
+
+fn prepare_session<H: Host>(
+    host: &mut H,
+    wallet: &str,
+    id: &str,
+    body: &[u8],
+) -> Result<(), String> {
     let now = host.now_ms();
     let parsed = input::parse_new_body(body)?;
-    let address = wallet_address(host, wallet)?;
-    let api_key = resolve_api_key(host)?;
 
-    // Determine source chain.
+    // Determine source and destination chains.
     let nat_opt = input::parse_natural_intent(&parsed.intent);
     let nat_chain = nat_opt.as_ref().and_then(|n| n.chain.clone());
     let chain_name = parsed
@@ -409,6 +451,32 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
         .or(nat_chain.as_deref())
         .unwrap_or("ethereum")
         .to_ascii_lowercase();
+    let destination_chain = parsed
+        .destination_chain
+        .as_ref()
+        .map(|chain| chain.to_ascii_lowercase());
+    let dest_chain_name = destination_chain.as_deref().unwrap_or(&chain_name);
+    let cross_chain = destination_chain
+        .as_deref()
+        .is_some_and(|dest| !dest.eq_ignore_ascii_case(&chain_name));
+
+    // Enforce the wallet's route rules that need no network first, so an
+    // unconfigured wallet learns what to configure before any wallet read,
+    // RPC call, or Enso quote.
+    let verified_policy = crate::policy::load_route_rules(host, wallet)?;
+    let preflight = crate::policy::preflight_checks(
+        &verified_policy,
+        wallet,
+        &chain_name,
+        dest_chain_name,
+        cross_chain,
+    );
+    if let Some(reason) = crate::policy::deny_reason(&serde_json::Value::Array(preflight)) {
+        return Err(reason);
+    }
+
+    let address = wallet_address(host, wallet)?;
+    let api_key = resolve_api_key(host)?;
 
     // Resolve the configured RPC and prove that it is the requested chain.
     let chain_id = host
@@ -427,12 +495,6 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
     let token_in = input::resolve_token_symbol(chain_id, &nat.token_in)
         .ok_or_else(|| format!("could not resolve token symbol: {}", nat.token_in))?;
 
-    // Determine destination chain.
-    let destination_chain = parsed
-        .destination_chain
-        .as_ref()
-        .map(|chain| chain.to_ascii_lowercase());
-    let dest_chain_name = destination_chain.as_deref().unwrap_or(&chain_name);
     let dest_chain_id = if let Some(ref dest) = destination_chain {
         Some(
             host.chain_id(dest)
@@ -471,11 +533,6 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
     let mut route_req = RouteRequest::new(from_address, chain_id, token_in, token_out, amount_raw);
     route_req.slippage_bps = parsed.slippage_bps.unwrap_or(50);
 
-    let cross_chain = destination_chain.is_some()
-        && !destination_chain
-            .as_deref()
-            .map(|d| d.eq_ignore_ascii_case(&chain_name))
-            .unwrap_or(false);
     if let Some(dest_id) = dest_chain_id
         && dest_id != chain_id
     {
@@ -562,10 +619,10 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
 
     // Load and enforce Enso's current route rules.
     let protocols = route_resp.protocols();
-    let verified_policy = crate::policy::load_route_rules(host)?;
     let policy_checks = crate::policy::evaluate(
         &verified_policy,
         &crate::policy::RoutePolicyContext {
+            wallet,
             source_chain: &chain_name,
             destination_chain: dest_chain_name,
             cross_chain,
@@ -619,9 +676,6 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
         &receiver_addr,
     )?);
 
-    // Generate session ID.
-    let id = generate_id(host)?;
-
     // Build plan markdown.
     let plan_md = render_plan_md(PlanView {
         intent_text: &parsed.intent,
@@ -655,7 +709,7 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
 
     let mut sess = Session {
         schema_version: 1,
-        id: id.clone(),
+        id: id.to_owned(),
         wallet: wallet.to_string(),
         wallet_address: address,
         chain: chain_name,
@@ -678,12 +732,7 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
         history: Vec::new(),
     };
     sess.transition(now, "prepared", "route discovered and verified");
-    save(host, &sess)?;
-
-    // Store latest pointer for convenience lookups.
-    let _ = host.put(&format!("intents/{wallet}/latest"), id.as_bytes(), false);
-
-    Ok(id)
+    save(host, &sess)
 }
 
 // ---------------------------------------------------------------------------
@@ -842,10 +891,11 @@ fn confirm_locked<H: Host>(
     let token_out = format!("0x{:x}", req.token_out);
     let router = format!("0x{:x}", route.tx.to);
     let protocols = route.protocols();
-    let verified_policy = crate::policy::load_route_rules(host)?;
+    let verified_policy = crate::policy::load_route_rules(host, &sess.wallet)?;
     sess.policy_checks = crate::policy::evaluate(
         &verified_policy,
         &crate::policy::RoutePolicyContext {
+            wallet: &sess.wallet,
             source_chain: &sess.chain,
             destination_chain,
             cross_chain,

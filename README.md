@@ -50,21 +50,28 @@ Release builds can embed the repository secret `ENSO_API_KEY`. A key written to
 runtime setting `enso-api-key` remains a compatibility fallback, and
 `settings/status.json` reports the selected source without exposing the key.
 
-Set Enso's route rules separately from the wallet's canonical Bloom policy:
+Set Enso's route rules for each wallet, separately from the wallet's canonical
+Bloom policy:
 
 ```
-read:  /petals/enso/settings/route-rules.toml
-write: /petals/enso/settings/route-rules.toml
+read:  /petals/enso/settings/<wallet>/route-rules.toml
+write: /petals/enso/settings/<wallet>/route-rules.toml
 body:  <the validated TOML example returned by the read>
 ```
 
-Route rules are stored privately by Enso. Until configured, all generic DeFi
-routes fail closed. Bloom's wallet `policy.json` continues to authorize the
+Route rules are stored privately by Enso, one set per wallet. There is no
+shared or default rule set: until a wallet's rules are configured, all of that
+wallet's generic DeFi routes fail closed. Bloom's wallet `policy.json` continues to authorize the
 package and is enforced independently at signing.
 
 `allowed_routers` is intentionally empty in the example. Populate it only
 with an operator-approved Enso route target in `<chain>:<0x-address>` form;
 the value must not be inferred from a generic swap-router example.
+
+Users can write or replace these rules whenever their risk parameters change.
+The current rules are evaluated for every new intent and again at confirmation.
+Rules, wallet addresses, and intent sessions are all per wallet, so changing
+one wallet's rules never changes another wallet's.
 
 ## Safety Model
 
@@ -101,11 +108,12 @@ transactions, not unattended autonomous value movement.
 | `intents/<wallet>/<id>/tx.json` | file | Prepared EVM transaction |
 | `intents/<wallet>/<id>/simulation.json` | file | Simulation result |
 | `intents/<wallet>/<id>/settlement.json` | file | Settlement status |
-| `intents/<wallet>/<id>/status.json` | file | Session status |
+| `intents/<wallet>/<id>/status.json` | file | Session status, or the failure record when creating the intent failed |
 | `intents/<wallet>/<id>/confirm` | writable | Stage into outbox |
 | `settings/status.json` | file | API key credential status |
 | `settings/api-key` | writable | Write Enso API key |
-| `settings/route-rules.toml` | writable | Read or write validated Enso route rules |
+| `settings/` | dir | Credential status, API key, and wallets with route rules |
+| `settings/<wallet>/route-rules.toml` | writable | Read or write that wallet's validated Enso route rules |
 
 ## Development
 

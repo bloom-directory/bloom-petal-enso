@@ -1,13 +1,21 @@
 petal::route_file!(
     spec: petal::write_spec().caps(&["bloom:store"]),
-    read: |_ctx: &petal::Ctx| {
+    read: |ctx: &petal::Ctx| {
         use crate::workflow::Host;
 
+        let wallet = match petal::param(ctx, "wallet") {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        if let Err(error) = crate::workflow::validate_wallet_name(wallet) {
+            return petal::error(-3, error);
+        }
         let mut host = crate::workflow::BloomHost;
-        match host.get(crate::policy::ROUTE_RULES, 256 * 1024) {
+        match host.get(&crate::policy::route_rules_key(wallet), 256 * 1024) {
             Ok(Some(rules)) => petal::DispatchResponse::Read(rules),
             Ok(None) => petal::DispatchResponse::Read(br#"# configured: false
-# Write validated Enso route rules here. Missing rules deny all routes.
+# Write validated Enso route rules for this wallet here. Rules apply only to
+# this wallet; while none are configured, all of its routes are denied.
 [mev]
 max_slippage_bps = 100
 
@@ -27,14 +35,21 @@ require_calldata_verification = true
             Err(error) => petal::error(-4, crate::redaction::sanitize_message(&error)),
         }
     },
-    write: |_ctx: &petal::Ctx, body: &[u8]| {
+    write: |ctx: &petal::Ctx, body: &[u8]| {
         use crate::workflow::Host;
 
+        let wallet = match petal::param(ctx, "wallet") {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        if let Err(error) = crate::workflow::validate_wallet_name(wallet) {
+            return petal::error(-3, error);
+        }
         if let Err(error) = crate::policy::parse_route_rules(body) {
             return petal::error(-3, error);
         }
         let mut host = crate::workflow::BloomHost;
-        match host.put(crate::policy::ROUTE_RULES, body, false) {
+        match host.put(&crate::policy::route_rules_key(wallet), body, false) {
             Ok(()) => petal::DispatchResponse::Write,
             Err(error) => petal::error(-4, crate::redaction::sanitize_message(&error)),
         }
