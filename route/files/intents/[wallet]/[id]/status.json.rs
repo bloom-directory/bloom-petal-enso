@@ -11,12 +11,8 @@ petal::route_file!(
             Ok(value) => value,
             Err(response) => return response,
         };
-        let owner = match crate::session::SessionOwner::scope(ctx, wallet) {
-            Ok(value) => value,
-            Err(error) => return petal::error(-3, error),
-        };
         let mut host = crate::workflow::BloomHost;
-        match crate::workflow::load_for_ctx(&mut host, ctx, wallet, id) {
+        match crate::workflow::load(&mut host, wallet, id) {
             Ok(session) => {
                 // Derive route_verified from policy_checks.
                 let route_verified = session
@@ -59,7 +55,7 @@ petal::route_file!(
                 }))
             }
             Err(error) => match host.get(
-                &crate::session::failure_key(&owner, id),
+                &crate::session::failure_key(wallet, id),
                 64 * 1024,
             ) {
                 Ok(Some(raw)) => petal::DispatchResponse::Read(raw),

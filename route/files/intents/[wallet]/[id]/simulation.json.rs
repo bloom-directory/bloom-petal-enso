@@ -10,7 +10,7 @@ petal::route_file!(
             Err(response) => return response,
         };
         let mut host = crate::workflow::BloomHost;
-        let session = match crate::workflow::load_for_ctx(&mut host, ctx, wallet, id) {
+        let session = match crate::workflow::load(&mut host, wallet, id) {
             Ok(value) => value,
             Err(error) => return petal::error(-1, error),
         };

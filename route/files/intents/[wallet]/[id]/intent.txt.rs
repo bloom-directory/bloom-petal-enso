@@ -8,7 +8,7 @@ petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
         Err(response) => return response,
     };
     let mut host = crate::workflow::BloomHost;
-    match crate::workflow::load_for_ctx(&mut host, ctx, wallet, id) {
+    match crate::workflow::load(&mut host, wallet, id) {
         Ok(session) => petal::DispatchResponse::Read(session.intent_text.into_bytes()),
         Err(error) => petal::error(-1, error),
     }

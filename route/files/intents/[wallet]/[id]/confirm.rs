@@ -3,6 +3,7 @@ petal::route_file!(
         "bloom:store",
         "bloom:tx.outbox",
         "bloom:chain",
+        "bloom:vfs.read",
     ]),
     read: |_ctx: &petal::Ctx| {
         petal::DispatchResponse::Read(
@@ -19,7 +20,7 @@ petal::route_file!(
             Err(response) => return response,
         };
         let mut host = crate::workflow::BloomHost;
-        match crate::workflow::confirm_for_ctx(&mut host, ctx, wallet, id, body) {
+        match crate::workflow::confirm(&mut host, wallet, id, body) {
             Ok(()) => petal::DispatchResponse::Write,
             Err(error) => petal::error(-4, crate::redaction::sanitize_message(&error)),
         }

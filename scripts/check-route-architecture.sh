@@ -16,9 +16,9 @@ fi
 route_count="$(
   find "$ROOT/route/files" -type f -name '*.rs' | wc -l | tr -d ' '
 )"
-if [[ "$route_count" != "29" ]]; then
-  echo "expected 29 file-based route controllers, found $route_count" >&2
+if [[ "$route_count" != "27" ]]; then
+  echo "expected 27 file-based route controllers, found $route_count" >&2
   exit 1
 fi
 
-echo "checked 29 file-based route controllers"
+echo "checked 27 file-based route controllers"

@@ -1,8 +1,8 @@
-//! Petal-owned Enso venue preferences and fail-closed route evaluation.
+//! Signed wallet DeFi policy loading and fail-closed route evaluation.
 //!
-//! Bloom's Broker/Signer-authoritative wallet policy and approval limits are
-//! enforced independently by the host. Enso-specific preferences live in the
-//! Petal store; this guest must not interpret authoritative wallet policy.
+//! Bloom's generic outbox policy still applies when a transaction is staged.
+//! This module enforces the route-specific `[defi]` fields that the generic
+//! EVM transaction shape cannot express.
 
 use std::collections::BTreeSet;
 
@@ -63,18 +63,23 @@ impl Default for DefiPolicy {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct MevPolicy {
     #[serde(default)]
     max_slippage_bps: Option<u16>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-struct EnsoVenueConfig {
+struct WalletPolicy {
     #[serde(default)]
     defi: DefiPolicy,
     #[serde(default)]
     mev: MevPolicy,
+}
+
+#[derive(Debug, Deserialize)]
+struct WalletStatus {
+    kind: String,
+    policy_status: String,
 }
 
 #[derive(Debug)]
@@ -126,60 +131,30 @@ fn receiver_matches(set: &BTreeSet<String>, ctx: &RoutePolicyContext<'_>) -> boo
     set_contains_case_insensitive(set, &literal) || set_contains_case_insensitive(set, &class)
 }
 
-const MAX_VENUE_CONFIG_BYTES: usize = 256 * 1024;
+/// Load the current wallet policy and prove that a passkey wallet's policy is
+/// signed. Bloom's transaction staging path independently verifies the
+/// signature again, closing the read-to-stage race.
+pub fn load_verified_policy<H: Host>(host: &mut H, wallet: &str) -> Result<VerifiedPolicy, String> {
+    let policy_bytes = host.vfs_read(&format!("wallets/{wallet}/policy.toml"), 256 * 1024)?;
+    let status_bytes = host.vfs_read(&format!("wallets/{wallet}/addresses.json"), 64 * 1024)?;
+    let status: WalletStatus = serde_json::from_slice(&status_bytes)
+        .map_err(|_| "wallet policy status is unavailable or malformed")?;
 
-fn venue_config_key(wallet: &str) -> String {
-    format!("settings/{wallet}/venue.toml")
-}
+    if status.kind == "passkey" && status.policy_status != "signed" {
+        return Err(format!(
+            "passkey wallet policy is {}; a current policy signature is required",
+            status.policy_status
+        ));
+    }
 
-/// Load Enso-owned advisory preferences. Missing configuration fails closed
-/// because `DefiPolicy::default()` leaves the venue disabled.
-pub fn load_venue_config<H: Host>(host: &mut H, wallet: &str) -> Result<VerifiedPolicy, String> {
-    petal::validate_wallet_id(wallet)?;
-    let policy = match host.get(&venue_config_key(wallet), MAX_VENUE_CONFIG_BYTES)? {
-        Some(bytes) => {
-            let text =
-                std::str::from_utf8(&bytes).map_err(|_| "Enso venue configuration is not UTF-8")?;
-            toml::from_str::<EnsoVenueConfig>(text)
-                .map_err(|e| format!("Enso venue configuration is invalid: {e}"))?
-        }
-        None => EnsoVenueConfig::default(),
-    };
+    let policy_text =
+        std::str::from_utf8(&policy_bytes).map_err(|_| "wallet policy is not UTF-8")?;
+    let policy: WalletPolicy =
+        toml::from_str(policy_text).map_err(|e| format!("wallet [defi] policy is invalid: {e}"))?;
     Ok(VerifiedPolicy {
         defi: policy.defi,
         max_slippage_bps: policy.mev.max_slippage_bps,
     })
-}
-
-pub fn read_venue_config<H: Host>(host: &mut H, wallet: &str) -> Result<Vec<u8>, String> {
-    petal::validate_wallet_id(wallet)?;
-    Ok(host
-        .get(&venue_config_key(wallet), MAX_VENUE_CONFIG_BYTES)?
-        .unwrap_or_else(|| {
-            b"# Enso-owned advisory preferences; Bloom wallet policy remains host-enforced.\n\
-[defi]\n\
-enabled = false\n\
-allowed_source_chains = []\n\
-allowed_destination_chains = []\n\
-allowed_receivers = [\"class:wallet_eoa\"]\n\
-denied_receivers = []\n\
-allowed_routers = []\n\
-denied_protocols = []\n\
-allow_unknown_protocols = false\n\
-require_calldata_verification = true\n"
-                .to_vec()
-        }))
-}
-
-pub fn write_venue_config<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<(), String> {
-    petal::validate_wallet_id(wallet)?;
-    if body.len() > MAX_VENUE_CONFIG_BYTES {
-        return Err("Enso venue configuration exceeds 256 KiB".into());
-    }
-    let text = std::str::from_utf8(body).map_err(|_| "Enso venue configuration must be UTF-8")?;
-    toml::from_str::<EnsoVenueConfig>(text)
-        .map_err(|e| format!("Enso venue configuration is invalid: {e}"))?;
-    host.put(&venue_config_key(wallet), body, false)
 }
 
 pub fn evaluate(policy: &VerifiedPolicy, ctx: &RoutePolicyContext<'_>) -> serde_json::Value {
@@ -284,7 +259,7 @@ pub fn evaluate(policy: &VerifiedPolicy, ctx: &RoutePolicyContext<'_>) -> serde_
             } else if defi.require_calldata_verification {
                 "route receiver is not cryptographically proven by decoded calldata"
             } else {
-                "route receiver is request-bound but not calldata-verified; Enso venue preferences accept this residual risk"
+                "route receiver is request-bound but not calldata-verified; wallet policy accepts this residual risk"
             },
         ));
     }
@@ -300,7 +275,7 @@ pub fn evaluate(policy: &VerifiedPolicy, ctx: &RoutePolicyContext<'_>) -> serde_
             if defi.require_calldata_verification {
                 "no decoded minimum-output floor is enforced"
             } else {
-                "minimum output is Enso-quoted, not calldata-verified; Enso venue preferences accept this residual risk"
+                "minimum output is Enso-quoted, not calldata-verified; wallet policy accepts this residual risk"
             },
         ));
     } else {
@@ -336,9 +311,9 @@ pub fn evaluate(policy: &VerifiedPolicy, ctx: &RoutePolicyContext<'_>) -> serde_
                 "deny"
             },
             if defi.allow_unknown_protocols {
-                "route protocol metadata is unknown; Enso venue preferences permit this with a warning"
+                "route protocol metadata is unknown; wallet policy permits this with a warning"
             } else {
-                "route protocol metadata is unknown and Enso venue preferences refuse it"
+                "route protocol metadata is unknown and wallet policy refuses it"
             },
         ));
     } else if let Some(protocol) = ctx
@@ -501,7 +476,7 @@ mod tests {
     #[test]
     fn unsupported_defi_field_is_rejected() {
         let text = "[defi]\nenabled = true\nfuture_permission = true\n";
-        let err = toml::from_str::<EnsoVenueConfig>(text).unwrap_err();
+        let err = toml::from_str::<WalletPolicy>(text).unwrap_err();
         assert!(err.to_string().contains("unknown field"));
     }
 }
