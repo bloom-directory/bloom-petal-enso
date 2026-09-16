@@ -52,11 +52,15 @@ runtime setting `enso-api-key` remains a compatibility fallback, and
 
 Per-wallet Enso venue preferences live at `settings/wallets/<wallet>/venue.toml` in
 the Petal's own state. No setup write is needed: an unconfigured wallet reads
-and uses the bundled defaults. Swaps are enabled on all seven supported chains
-(Ethereum, Polygon, Base, Optimism, Arbitrum, BNB, and Avalanche), with the
-[canonical Enso Router V2](https://docs.enso.build/pages/build/reference/deployments)
+and uses the bundled defaults. Swaps are enabled on all 13 chains supported by Bloom and Enso
+(Ethereum, Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart
+Chain, Avalanche, Gnosis, Linea, HyperEVM, and Arc), with the
+[canonical Enso Router V2](https://docs.enso.build/pages/build/reference/deployments.md)
 allowlisted on each chain, the wallet itself as receiver, and a 100 bps (1%)
 slippage ceiling. The default request slippage remains 50 bps (0.5%).
+HyperEVM uses Bloom's chain key `hyperliquid`; Robinhood Chain uses `robinhood`.
+Chain allowlisting is independent of the static token-symbol registry: use token
+contract addresses when a symbol is not in the registry for that chain.
 
 Read this file to see the full effective TOML; edit it and write the full document
 back to override it. To disable swaps, write `[defi]` followed by `enabled = false`.

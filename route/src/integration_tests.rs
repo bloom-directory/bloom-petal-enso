@@ -769,6 +769,50 @@ fn venue_defaults_are_identical_when_read_and_loaded() {
     }
 }
 
+#[test]
+fn venue_defaults_cover_bloom_enso_intersection() {
+    let mut host = MockHost::new();
+    host.store.clear();
+    let policy = crate::policy::load_venue_config(&mut host, "test-wallet").unwrap();
+    let common = "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf";
+    for (chain, router) in [
+        ("ethereum", common),
+        ("base", common),
+        ("arbitrum", common),
+        ("optimism", common),
+        ("polygon", common),
+        ("bnb", common),
+        ("avalanche", common),
+        ("gnosis", common),
+        ("hyperliquid", common),
+        ("linea", "0xa146d46823f3f594b785200102be5385cafce9b5"),
+        ("robinhood", "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"),
+        ("arc", "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"),
+        ("tempo", "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"),
+    ] {
+        assert!(policy.defi.allowed_source_chains.contains(chain), "{chain}");
+        assert!(
+            policy.defi.allowed_destination_chains.contains(chain),
+            "{chain}"
+        );
+        assert!(
+            policy
+                .defi
+                .allowed_routers
+                .contains(&format!("{chain}:{router}"))
+        );
+    }
+    assert_eq!(policy.defi.allowed_source_chains.len(), 13);
+    assert_eq!(policy.defi.allowed_destination_chains.len(), 13);
+    assert!(!policy.defi.allowed_source_chains.contains("unsupported"));
+    assert!(
+        !policy
+            .defi
+            .allowed_destination_chains
+            .contains("unsupported")
+    );
+}
+
 // ===========================================================================
 // TEST: abandon a session before staging
 // ===========================================================================

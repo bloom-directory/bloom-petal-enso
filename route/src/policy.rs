@@ -500,6 +500,11 @@ mod tests {
         let mut ctx = context(&[]);
         ctx.protocols_unknown = true;
         for source in &policy.defi.allowed_source_chains {
+            ctx.router = match source.as_str() {
+                "linea" => "0xa146d46823f3f594b785200102be5385cafce9b5",
+                "robinhood" | "arc" | "tempo" => "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7",
+                _ => "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+            };
             for destination in &policy.defi.allowed_destination_chains {
                 ctx.source_chain = source;
                 ctx.destination_chain = destination;
@@ -509,6 +514,7 @@ mod tests {
             }
         }
         ctx.source_chain = "base";
+        ctx.router = "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf";
         ctx.destination_chain = "base";
         ctx.cross_chain = false;
         ctx.slippage_bps = 101;

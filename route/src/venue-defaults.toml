@@ -1,13 +1,13 @@
 # Enso-owned advisory preferences; Bloom wallet policy remains host-enforced.
-# Defaults cover all seven chains supported by this Petal's token registry.
-# Router V2 deployments: https://docs.enso.build/pages/build/reference/deployments
+# Defaults cover all 13 Bloom chains with Enso Router V2 deployments.
+# Router V2 deployments: https://docs.enso.build/pages/build/reference/deployments.md (verified 2026-09-16)
 [mev]
 max_slippage_bps = 100
 
 [defi]
 enabled = true
-allowed_source_chains = ["ethereum", "polygon", "base", "optimism", "arbitrum", "bnb", "avalanche"]
-allowed_destination_chains = ["ethereum", "polygon", "base", "optimism", "arbitrum", "bnb", "avalanche"]
+allowed_source_chains = ["ethereum", "polygon", "base", "optimism", "arbitrum", "bnb", "avalanche", "gnosis", "linea", "hyperliquid", "robinhood", "arc", "tempo"]
+allowed_destination_chains = ["ethereum", "polygon", "base", "optimism", "arbitrum", "bnb", "avalanche", "gnosis", "linea", "hyperliquid", "robinhood", "arc", "tempo"]
 allowed_receivers = ["class:wallet_eoa"]
 denied_receivers = []
 allowed_routers = [
@@ -18,6 +18,12 @@ allowed_routers = [
   "arbitrum:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
   "bnb:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
   "avalanche:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+  "gnosis:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+  "hyperliquid:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+  "linea:0xa146d46823f3f594b785200102be5385cafce9b5",
+  "robinhood:0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7",
+  "arc:0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7",
+  "tempo:0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7",
 ]
 denied_protocols = []
 # Missing protocol metadata is surfaced as a warning in the review plan.
