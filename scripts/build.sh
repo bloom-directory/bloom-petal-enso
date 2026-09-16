@@ -21,8 +21,6 @@ rm -rf -- "$ROOT/artifacts"
 
 if [[ -n "${PETAL_BIN:-}" ]]; then
   "$PETAL_BIN" build --root "$ROOT"
-elif command -v petal >/dev/null 2>&1; then
-  petal build --root "$ROOT"
 else
   tool_root="$ROOT/target/petal-tool"
   cargo install \

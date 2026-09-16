@@ -34,7 +34,7 @@ petal::route_file!(spec: petal::static_read_spec(), read: |_ctx: &petal::Ctx| {
 ## Safety Model
 
 - Route discovery uses the Enso Shortcuts API and Petal secret storage
-- The signed wallet DeFi policy is enforced at create and confirm
+- Enso route rules at `settings/route-rules.toml` are enforced at create and confirm
 - Simulation must pass before the route transaction is staged
 - ERC-20 approval is exact-amount and must succeed before a second confirm
 - Same-chain ERC-20 settlement requires an attributable receipt Transfer

@@ -1,7 +1,7 @@
-//! Signed wallet DeFi policy loading and fail-closed route evaluation.
+//! Enso-owned route-rule loading and fail-closed route evaluation.
 //!
 //! Bloom's generic outbox policy still applies when a transaction is staged.
-//! This module enforces the route-specific `[defi]` fields that the generic
+//! This module enforces route-specific fields that the generic
 //! EVM transaction shape cannot express.
 
 use std::collections::BTreeSet;
@@ -63,23 +63,19 @@ impl Default for DefiPolicy {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MevPolicy {
     #[serde(default)]
     max_slippage_bps: Option<u16>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-struct WalletPolicy {
+#[serde(deny_unknown_fields)]
+struct RouteRules {
     #[serde(default)]
     defi: DefiPolicy,
     #[serde(default)]
     mev: MevPolicy,
-}
-
-#[derive(Debug, Deserialize)]
-struct WalletStatus {
-    kind: String,
-    policy_status: String,
 }
 
 #[derive(Debug)]
@@ -131,30 +127,33 @@ fn receiver_matches(set: &BTreeSet<String>, ctx: &RoutePolicyContext<'_>) -> boo
     set_contains_case_insensitive(set, &literal) || set_contains_case_insensitive(set, &class)
 }
 
-/// Load the current wallet policy and prove that a passkey wallet's policy is
-/// signed. Bloom's transaction staging path independently verifies the
-/// signature again, closing the read-to-stage race.
-pub fn load_verified_policy<H: Host>(host: &mut H, wallet: &str) -> Result<VerifiedPolicy, String> {
-    let policy_bytes = host.vfs_read(&format!("wallets/{wallet}/policy.toml"), 256 * 1024)?;
-    let status_bytes = host.vfs_read(&format!("wallets/{wallet}/addresses.json"), 64 * 1024)?;
-    let status: WalletStatus = serde_json::from_slice(&status_bytes)
-        .map_err(|_| "wallet policy status is unavailable or malformed")?;
+pub const ROUTE_RULES: &str = "settings/route-rules.toml";
 
-    if status.kind == "passkey" && status.policy_status != "signed" {
-        return Err(format!(
-            "passkey wallet policy is {}; a current policy signature is required",
-            status.policy_status
-        ));
+/// Parse Enso's private route rules. These rules are deliberately separate
+/// from Bloom's canonical wallet policy, which governs package authorization.
+pub fn parse_route_rules(bytes: &[u8]) -> Result<VerifiedPolicy, String> {
+    if bytes.is_empty() || bytes.len() > 256 * 1024 {
+        return Err("route rules must be 1..=262144 bytes".into());
     }
-
-    let policy_text =
-        std::str::from_utf8(&policy_bytes).map_err(|_| "wallet policy is not UTF-8")?;
-    let policy: WalletPolicy =
-        toml::from_str(policy_text).map_err(|e| format!("wallet [defi] policy is invalid: {e}"))?;
+    let text = std::str::from_utf8(bytes).map_err(|_| "route rules must be UTF-8")?;
+    let policy: RouteRules =
+        toml::from_str(text).map_err(|e| format!("settings/route-rules.toml is invalid: {e}"))?;
     Ok(VerifiedPolicy {
         defi: policy.defi,
         max_slippage_bps: policy.mev.max_slippage_bps,
     })
+}
+
+/// Load Enso's private route rules. An absent configuration is intentionally
+/// fail-closed: `DefiPolicy::default()` disables all generic DeFi routes.
+pub fn load_route_rules<H: Host>(host: &mut H) -> Result<VerifiedPolicy, String> {
+    match host.get(ROUTE_RULES, 256 * 1024)? {
+        Some(bytes) => parse_route_rules(&bytes),
+        None => Ok(VerifiedPolicy {
+            defi: DefiPolicy::default(),
+            max_slippage_bps: None,
+        }),
+    }
 }
 
 pub fn evaluate(policy: &VerifiedPolicy, ctx: &RoutePolicyContext<'_>) -> serde_json::Value {
@@ -177,7 +176,7 @@ pub fn evaluate(policy: &VerifiedPolicy, ctx: &RoutePolicyContext<'_>) -> serde_
         if defi.enabled {
             "DeFi routes enabled"
         } else {
-            "generic DeFi routes are disabled for this wallet"
+            "generic DeFi routes are disabled; configure settings/route-rules.toml"
         },
     ));
 
@@ -476,7 +475,22 @@ mod tests {
     #[test]
     fn unsupported_defi_field_is_rejected() {
         let text = "[defi]\nenabled = true\nfuture_permission = true\n";
-        let err = toml::from_str::<WalletPolicy>(text).unwrap_err();
+        let err = toml::from_str::<RouteRules>(text).unwrap_err();
         assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn missing_rules_fail_closed() {
+        let policy = VerifiedPolicy {
+            defi: DefiPolicy::default(),
+            max_slippage_bps: None,
+        };
+        let protocols = vec!["enso".into()];
+        let checks = evaluate(&policy, &context(&protocols));
+        assert!(
+            deny_reason(&checks)
+                .unwrap()
+                .contains("settings/route-rules.toml")
+        );
     }
 }

@@ -3,7 +3,6 @@ petal::route_file!(
         "bloom:store",
         "bloom:tx.outbox",
         "bloom:chain",
-        "bloom:vfs.read",
     ]),
     read: |_ctx: &petal::Ctx| {
         petal::DispatchResponse::Read(

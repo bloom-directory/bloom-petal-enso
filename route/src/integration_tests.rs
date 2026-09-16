@@ -48,15 +48,12 @@ impl MockHost {
 
         let mut vfs = HashMap::new();
         vfs.insert(
-            "wallets/test-wallet/address".to_string(),
+            "wallets/test-wallet/0/address.evm".to_string(),
             b"0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1".to_vec(),
         );
-        vfs.insert(
-            "wallets/test-wallet/addresses.json".to_string(),
-            br#"{"wallet":"test-wallet","kind":"local","policy_status":"not_applicable"}"#.to_vec(),
-        );
-        vfs.insert(
-            "wallets/test-wallet/policy.toml".to_string(),
+        let mut store = HashMap::new();
+        store.insert(
+            crate::policy::ROUTE_RULES.to_string(),
             br#"
 [mev]
 max_slippage_bps = 100
@@ -87,7 +84,7 @@ require_calldata_verification = false
 
         Self {
             now: 1_000_000,
-            store: HashMap::new(),
+            store,
             secrets,
             vfs,
             tx_counter: 0,
@@ -711,16 +708,34 @@ fn empty_confirmation_is_rejected() {
 }
 
 #[test]
-fn stale_passkey_policy_is_rejected() {
+fn missing_account_zero_address_names_the_expected_path() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
-    host.vfs.insert(
-        "wallets/test-wallet/addresses.json".into(),
-        br#"{"wallet":"test-wallet","kind":"passkey","policy_status":"stale"}"#.to_vec(),
-    );
+    host.vfs.remove("wallets/test-wallet/0/address.evm");
 
     let error =
         crate::workflow::create(&mut host, "test-wallet", b"swap 100 usdc to eth").unwrap_err();
-    assert!(error.contains("current policy signature"), "{error}");
+    assert!(
+        error.contains("wallets/test-wallet/0/address.evm"),
+        "{error}"
+    );
+}
+
+#[test]
+fn missing_route_rules_deny_with_configuration_path() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    host.store.remove(crate::policy::ROUTE_RULES);
+
+    let error =
+        crate::workflow::create(&mut host, "test-wallet", b"swap 100 usdc to eth").unwrap_err();
+    assert!(error.contains("defi.enabled"), "{error}");
+    assert!(error.contains("settings/route-rules.toml"), "{error}");
+}
+
+#[test]
+fn route_rules_reject_unknown_fields() {
+    let error =
+        crate::policy::parse_route_rules(b"[defi]\nenabled = true\nunknown = true\n").unwrap_err();
+    assert!(error.contains("unknown field"), "{error}");
 }
 
 // ===========================================================================

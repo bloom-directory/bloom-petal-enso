@@ -50,6 +50,22 @@ Release builds can embed the repository secret `ENSO_API_KEY`. A key written to
 runtime setting `enso-api-key` remains a compatibility fallback, and
 `settings/status.json` reports the selected source without exposing the key.
 
+Set Enso's route rules separately from the wallet's canonical Bloom policy:
+
+```
+read:  /petals/enso/settings/route-rules.toml
+write: /petals/enso/settings/route-rules.toml
+body:  <the validated TOML example returned by the read>
+```
+
+Route rules are stored privately by Enso. Until configured, all generic DeFi
+routes fail closed. Bloom's wallet `policy.json` continues to authorize the
+package and is enforced independently at signing.
+
+`allowed_routers` is intentionally empty in the example. Populate it only
+with an operator-approved Enso route target in `<chain>:<0x-address>` form;
+the value must not be inferred from a generic swap-router example.
+
 ## Safety Model
 
 - Route discovery uses the Enso Shortcuts API (requires an API key)
@@ -57,8 +73,8 @@ runtime setting `enso-api-key` remains a compatibility fallback, and
   `100000000` base units)
 - Route source asset, amount, sender, and native value are verified against
   the Enso Router V2 calldata envelope
-- The wallet's current signed `[defi]` policy is evaluated at create and
-  confirm; a stale or unsigned passkey policy fails closed
+- Enso's private route rules are evaluated at create and confirm; absent rules
+  fail closed and the canonical wallet policy is enforced separately at signing
 - Simulation must pass before the route transaction is staged
 - ERC-20 approval is exact-amount and must have a successful receipt first
 - Broadcast requires the standard outbox confirm (owner gate)
@@ -89,6 +105,7 @@ transactions, not unattended autonomous value movement.
 | `intents/<wallet>/<id>/confirm` | writable | Stage into outbox |
 | `settings/status.json` | file | API key credential status |
 | `settings/api-key` | writable | Write Enso API key |
+| `settings/route-rules.toml` | writable | Read or write validated Enso route rules |
 
 ## Development
 

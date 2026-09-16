@@ -44,11 +44,16 @@ fn resolve_api_key<H: Host>(host: &mut H) -> Result<String, String> {
 
 fn wallet_address<H: Host>(host: &mut H, wallet: &str) -> Result<String, String> {
     validate_wallet_name(wallet)?;
-    let address = String::from_utf8(host.vfs_read(&format!("wallets/{wallet}/address"), 128)?)
-        .map_err(|_| "wallet address is not UTF-8")?
-        .trim()
-        .to_string();
-    validate_address(&address)?;
+    let path = format!("wallets/{wallet}/0/address.evm");
+    let address = String::from_utf8(
+        host.vfs_read(&path, 128)
+            .map_err(|_| format!("wallet {wallet} has no EVM address at {path}"))?,
+    )
+    .map_err(|_| format!("wallet {wallet} has a non-UTF-8 EVM address at {path}"))?
+    .trim()
+    .to_string();
+    validate_address(&address)
+        .map_err(|_| format!("wallet {wallet} has an invalid EVM address at {path}"))?;
     Ok(address)
 }
 
@@ -65,7 +70,7 @@ fn validate_wallet_name(wallet: &str) -> Result<(), String> {
 }
 
 fn validate_address(addr: &str) -> Result<(), String> {
-    if !addr.starts_with("0x") || addr.len() != 42 {
+    if !addr.starts_with("0x") || addr.len() != 42 || hex::decode(&addr[2..]).is_err() {
         return Err("wallet address must be a 0x-prefixed 20-byte hex string".into());
     }
     Ok(())
@@ -555,9 +560,9 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
     let receiver_class = classify_receiver(&address, &receiver_addr);
     let token_out_hex = format!("0x{:x}", route_req.token_out);
 
-    // Load and enforce the wallet's current signed route policy.
+    // Load and enforce Enso's current route rules.
     let protocols = route_resp.protocols();
-    let verified_policy = crate::policy::load_verified_policy(host, wallet)?;
+    let verified_policy = crate::policy::load_route_rules(host)?;
     let policy_checks = crate::policy::evaluate(
         &verified_policy,
         &crate::policy::RoutePolicyContext {
@@ -821,8 +826,7 @@ fn confirm_locked<H: Host>(
         ));
     }
 
-    // Re-read and enforce the current signed policy at the last possible
-    // moment. The outbox host verifies the passkey policy signature again.
+    // Re-read and enforce Enso's route rules at the last possible moment.
     let needs_approve = sess.intents.iter().any(|i| i.label == "approve");
     let cross_chain = sess
         .destination_chain
@@ -838,7 +842,7 @@ fn confirm_locked<H: Host>(
     let token_out = format!("0x{:x}", req.token_out);
     let router = format!("0x{:x}", route.tx.to);
     let protocols = route.protocols();
-    let verified_policy = crate::policy::load_verified_policy(host, wallet)?;
+    let verified_policy = crate::policy::load_route_rules(host)?;
     sess.policy_checks = crate::policy::evaluate(
         &verified_policy,
         &crate::policy::RoutePolicyContext {
