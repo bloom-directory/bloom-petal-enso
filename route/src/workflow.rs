@@ -23,7 +23,7 @@ fn save<H: Host>(host: &mut H, s: &Session) -> Result<(), String> {
 }
 
 pub fn load<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<Session, String> {
-    validate_wallet_name(wallet)?;
+    petal::validate_wallet_id(wallet)?;
     validate_session_id(id)?;
     let raw = host
         .get(&session::key(wallet, id), 2 * 1024 * 1024)?
@@ -43,25 +43,14 @@ fn resolve_api_key<H: Host>(host: &mut H) -> Result<String, String> {
 }
 
 fn wallet_address<H: Host>(host: &mut H, wallet: &str) -> Result<String, String> {
-    validate_wallet_name(wallet)?;
-    let address = String::from_utf8(host.vfs_read(&format!("wallets/{wallet}/address"), 128)?)
-        .map_err(|_| "wallet address is not UTF-8")?
-        .trim()
-        .to_string();
+    petal::validate_wallet_id(wallet)?;
+    let address =
+        String::from_utf8(host.vfs_read(&format!("wallets/{wallet}/0/address.evm"), 128)?)
+            .map_err(|_| "wallet EVM address is not UTF-8")?
+            .trim()
+            .to_string();
     validate_address(&address)?;
     Ok(address)
-}
-
-fn validate_wallet_name(wallet: &str) -> Result<(), String> {
-    if wallet.is_empty()
-        || wallet.len() > 128
-        || !wallet
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-    {
-        return Err("wallet name is invalid".into());
-    }
-    Ok(())
 }
 
 fn validate_address(addr: &str) -> Result<(), String> {
@@ -555,9 +544,10 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
     let receiver_class = classify_receiver(&address, &receiver_addr);
     let token_out_hex = format!("0x{:x}", route_req.token_out);
 
-    // Load and enforce the wallet's current signed route policy.
+    // Load and enforce the Petal-owned Enso venue preferences. Bloom applies
+    // authoritative wallet policy independently when staging.
     let protocols = route_resp.protocols();
-    let verified_policy = crate::policy::load_verified_policy(host, wallet)?;
+    let verified_policy = crate::policy::load_venue_config(host, wallet)?;
     let policy_checks = crate::policy::evaluate(
         &verified_policy,
         &crate::policy::RoutePolicyContext {
@@ -696,7 +686,7 @@ fn acquire_confirm_lock<H: Host>(
     wallet: &str,
     id: &str,
 ) -> Result<(String, Vec<u8>), String> {
-    validate_wallet_name(wallet)?;
+    petal::validate_wallet_id(wallet)?;
     validate_session_id(id)?;
     let key = confirm_lock_key(wallet, id);
     let now = host.now_ms();
@@ -821,8 +811,8 @@ fn confirm_locked<H: Host>(
         ));
     }
 
-    // Re-read and enforce the current signed policy at the last possible
-    // moment. The outbox host verifies the passkey policy signature again.
+    // Re-read the current Enso venue preferences at the last possible moment.
+    // The outbox host independently enforces authoritative wallet policy.
     let needs_approve = sess.intents.iter().any(|i| i.label == "approve");
     let cross_chain = sess
         .destination_chain
@@ -838,7 +828,7 @@ fn confirm_locked<H: Host>(
     let token_out = format!("0x{:x}", req.token_out);
     let router = format!("0x{:x}", route.tx.to);
     let protocols = route.protocols();
-    let verified_policy = crate::policy::load_verified_policy(host, wallet)?;
+    let verified_policy = crate::policy::load_venue_config(host, wallet)?;
     sess.policy_checks = crate::policy::evaluate(
         &verified_policy,
         &crate::policy::RoutePolicyContext {

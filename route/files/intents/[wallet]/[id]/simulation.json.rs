@@ -1,7 +1,7 @@
 petal::route_file!(
     spec: petal::store_read_spec().caps(&["bloom:store", "bloom:chain"]),
     read: |ctx: &petal::Ctx| {
-        let wallet = match petal::param(ctx, "wallet") {
+        let wallet = match petal::wallet_param(ctx) {
             Ok(value) => value,
             Err(response) => return response,
         };

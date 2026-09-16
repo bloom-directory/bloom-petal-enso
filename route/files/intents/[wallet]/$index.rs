@@ -3,7 +3,7 @@ petal::route_file!(
     ctx_list: |ctx: &petal::Ctx| {
         use crate::workflow::Host;
 
-        let wallet = petal::param(ctx, "wallet")?;
+        let wallet = petal::wallet_param(ctx)?;
         let prefix = format!("intents/{wallet}/");
         let mut host = crate::workflow::BloomHost;
         let keys = host

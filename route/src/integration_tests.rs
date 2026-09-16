@@ -10,6 +10,15 @@ use petal::sdk::{EvmTransaction, HttpRequest, HttpResponse, OutboxInspection, St
 
 use crate::runtime::{EthCallResult, Host};
 
+#[test]
+fn venue_configuration_is_petal_owned_not_wallet_policy() {
+    let source = include_str!("policy.rs");
+    assert!(source.contains("settings/{wallet}/venue.toml"));
+    assert!(source.contains("host.get(&venue_config_key"));
+    assert!(!source.contains("wallets/{wallet}/policy.toml"));
+    assert!(!source.contains("wallets/{wallet}/addresses.json"));
+}
+
 /// In-memory mock implementing the full Host trait.
 struct MockHost {
     now: u64,
@@ -48,15 +57,12 @@ impl MockHost {
 
         let mut vfs = HashMap::new();
         vfs.insert(
-            "wallets/test-wallet/address".to_string(),
+            "wallets/test-wallet/0/address.evm".to_string(),
             b"0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1".to_vec(),
         );
-        vfs.insert(
-            "wallets/test-wallet/addresses.json".to_string(),
-            br#"{"wallet":"test-wallet","kind":"local","policy_status":"not_applicable"}"#.to_vec(),
-        );
-        vfs.insert(
-            "wallets/test-wallet/policy.toml".to_string(),
+        let mut store = HashMap::new();
+        store.insert(
+            "settings/test-wallet/venue.toml".to_string(),
             br#"
 [mev]
 max_slippage_bps = 100
@@ -87,7 +93,7 @@ require_calldata_verification = false
 
         Self {
             now: 1_000_000,
-            store: HashMap::new(),
+            store,
             secrets,
             vfs,
             tx_counter: 0,
@@ -711,16 +717,16 @@ fn empty_confirmation_is_rejected() {
 }
 
 #[test]
-fn stale_passkey_policy_is_rejected() {
+fn missing_venue_configuration_is_rejected() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
-    host.vfs.insert(
-        "wallets/test-wallet/addresses.json".into(),
-        br#"{"wallet":"test-wallet","kind":"passkey","policy_status":"stale"}"#.to_vec(),
-    );
+    host.store.remove("settings/test-wallet/venue.toml");
 
     let error =
         crate::workflow::create(&mut host, "test-wallet", b"swap 100 usdc to eth").unwrap_err();
-    assert!(error.contains("current policy signature"), "{error}");
+    assert!(
+        error.contains("generic DeFi routes are disabled"),
+        "{error}"
+    );
 }
 
 // ===========================================================================
@@ -1333,7 +1339,7 @@ fn double_confirm_with_approve_is_idempotent() {
 // ===========================================================================
 
 #[test]
-fn slippage_above_wallet_policy_is_rejected() {
+fn slippage_above_venue_configuration_is_rejected() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
     let body = br#"{"intent":"swap 100.0 usdc to eth","chain":"ethereum","slippage_bps":200}"#;

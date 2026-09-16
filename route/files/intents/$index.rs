@@ -11,9 +11,8 @@ petal::route_file!(
         let mut wallets = std::collections::BTreeSet::new();
         for key in keys {
             if let Some(rest) = key.strip_prefix(&prefix)
-                && let Some((wallet, file)) = rest.split_once('/')
-                && matches!(file, "session.json" | "failure.json")
-                && petal::is_safe_segment(wallet)
+                && let Some((wallet, _)) = rest.split_once('/')
+                && petal::validate_wallet_id(wallet).is_ok()
             {
                 wallets.insert(wallet.to_string());
             }
