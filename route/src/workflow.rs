@@ -5,7 +5,7 @@
 
 use crate::api_types::{NATIVE_TOKEN, RouteRequest, RouteResponse};
 pub use crate::runtime::{BloomHost, Host};
-use crate::session::{self, IntentState, PreparedIntent, Session};
+use crate::session::{IntentState, PreparedIntent, Session, SessionOwner};
 use crate::{api, input, settings};
 use alloy::primitives::{Address, U256};
 use petal::sdk::EvmTransaction;
@@ -23,12 +23,35 @@ fn save<H: Host>(host: &mut H, s: &Session) -> Result<(), String> {
 }
 
 pub fn load<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<Session, String> {
-    validate_wallet_name(wallet)?;
+    let owner = SessionOwner::from_params(wallet, None, None)?;
+    load_scoped(host, &owner, id)
+}
+
+pub fn load_for_ctx<H: Host>(
+    host: &mut H,
+    ctx: &petal::Ctx,
+    wallet: &str,
+    id: &str,
+) -> Result<Session, String> {
+    let owner = SessionOwner::scope(ctx, wallet)?;
+    load_scoped(host, &owner, id)
+}
+
+pub fn load_scoped<H: Host>(
+    host: &mut H,
+    owner: &SessionOwner,
+    id: &str,
+) -> Result<Session, String> {
     validate_session_id(id)?;
     let raw = host
-        .get(&session::key(wallet, id), 2 * 1024 * 1024)?
+        .get(&owner.key(id, "session.json"), 2 * 1024 * 1024)?
         .ok_or("session not found")?;
-    serde_json::from_slice(&raw).map_err(|e| format!("corrupt session: {e}"))
+    let session: Session =
+        serde_json::from_slice(&raw).map_err(|e| format!("corrupt session: {e}"))?;
+    if session.wallet != owner.wallet() || session.account != owner.account() {
+        return Err("session owner does not match the mounted account".into());
+    }
+    Ok(session)
 }
 
 // ---------------------------------------------------------------------------
@@ -42,26 +65,14 @@ fn resolve_api_key<H: Host>(host: &mut H) -> Result<String, String> {
     Ok(resolved.key.expose().to_string())
 }
 
-fn wallet_address<H: Host>(host: &mut H, wallet: &str) -> Result<String, String> {
-    validate_wallet_name(wallet)?;
-    let address = String::from_utf8(host.vfs_read(&format!("wallets/{wallet}/address"), 128)?)
-        .map_err(|_| "wallet address is not UTF-8")?
+fn wallet_address<H: Host>(host: &mut H, owner: &SessionOwner) -> Result<String, String> {
+    let path = format!("{}/address.evm", owner.vfs_account_root());
+    let address = String::from_utf8(host.vfs_read(&path, 128)?)
+        .map_err(|_| "wallet EVM address is not UTF-8")?
         .trim()
         .to_string();
     validate_address(&address)?;
     Ok(address)
-}
-
-fn validate_wallet_name(wallet: &str) -> Result<(), String> {
-    if wallet.is_empty()
-        || wallet.len() > 128
-        || !wallet
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-    {
-        return Err("wallet name is invalid".into());
-    }
-    Ok(())
 }
 
 fn validate_address(addr: &str) -> Result<(), String> {
@@ -390,9 +401,29 @@ fn render_plan_md(view: PlanView<'_>) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String, String> {
+    let owner = SessionOwner::from_params(wallet, None, None)?;
+    create_scoped(host, &owner, body)
+}
+
+pub fn create_for_ctx<H: Host>(
+    host: &mut H,
+    ctx: &petal::Ctx,
+    wallet: &str,
+    body: &[u8],
+) -> Result<String, String> {
+    let owner = SessionOwner::scope(ctx, wallet)?;
+    create_scoped(host, &owner, body)
+}
+
+pub fn create_scoped<H: Host>(
+    host: &mut H,
+    owner: &SessionOwner,
+    body: &[u8],
+) -> Result<String, String> {
     let now = host.now_ms();
     let parsed = input::parse_new_body(body)?;
-    let address = wallet_address(host, wallet)?;
+    let wallet = owner.wallet();
+    let address = wallet_address(host, owner)?;
     let api_key = resolve_api_key(host)?;
 
     // Determine source chain.
@@ -555,9 +586,10 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
     let receiver_class = classify_receiver(&address, &receiver_addr);
     let token_out_hex = format!("0x{:x}", route_req.token_out);
 
-    // Load and enforce the wallet's current signed route policy.
+    // Load and enforce the Petal-owned Enso venue preferences. Bloom applies
+    // authoritative wallet policy independently when staging.
     let protocols = route_resp.protocols();
-    let verified_policy = crate::policy::load_verified_policy(host, wallet)?;
+    let verified_policy = crate::policy::load_venue_config(host, wallet)?;
     let policy_checks = crate::policy::evaluate(
         &verified_policy,
         &crate::policy::RoutePolicyContext {
@@ -652,6 +684,7 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
         schema_version: 1,
         id: id.clone(),
         wallet: wallet.to_string(),
+        account: owner.account(),
         wallet_address: address,
         chain: chain_name,
         destination_chain: destination_chain.clone(),
@@ -676,7 +709,7 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
     save(host, &sess)?;
 
     // Store latest pointer for convenience lookups.
-    let _ = host.put(&format!("intents/{wallet}/latest"), id.as_bytes(), false);
+    let _ = host.put(&owner.latest_key(), id.as_bytes(), false);
 
     Ok(id)
 }
@@ -687,18 +720,17 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
 
 const CONFIRM_LOCK_TTL_MS: u64 = 10 * 60 * 1000;
 
-fn confirm_lock_key(wallet: &str, id: &str) -> String {
-    format!("intents/{wallet}/{id}/confirm.lock")
+fn confirm_lock_key(owner: &SessionOwner, id: &str) -> String {
+    owner.key(id, "confirm.lock")
 }
 
 fn acquire_confirm_lock<H: Host>(
     host: &mut H,
-    wallet: &str,
+    owner: &SessionOwner,
     id: &str,
 ) -> Result<(String, Vec<u8>), String> {
-    validate_wallet_name(wallet)?;
     validate_session_id(id)?;
-    let key = confirm_lock_key(wallet, id);
+    let key = confirm_lock_key(owner, id);
     let now = host.now_ms();
     let nonce = hex::encode(host.random(16)?);
     let value = serde_json::to_vec(&serde_json::json!({
@@ -728,8 +760,29 @@ fn acquire_confirm_lock<H: Host>(
 }
 
 pub fn confirm<H: Host>(host: &mut H, wallet: &str, id: &str, body: &[u8]) -> Result<(), String> {
-    let (lock_key, lock_value) = acquire_confirm_lock(host, wallet, id)?;
-    let result = confirm_locked(host, wallet, id, body);
+    let owner = SessionOwner::from_params(wallet, None, None)?;
+    confirm_scoped(host, &owner, id, body)
+}
+
+pub fn confirm_for_ctx<H: Host>(
+    host: &mut H,
+    ctx: &petal::Ctx,
+    wallet: &str,
+    id: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let owner = SessionOwner::scope(ctx, wallet)?;
+    confirm_scoped(host, &owner, id, body)
+}
+
+pub fn confirm_scoped<H: Host>(
+    host: &mut H,
+    owner: &SessionOwner,
+    id: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let (lock_key, lock_value) = acquire_confirm_lock(host, owner, id)?;
+    let result = confirm_locked(host, owner, id, body);
     let unlock = host.delete_if(&lock_key, &lock_value);
     match (result, unlock) {
         (Err(error), _) => Err(error),
@@ -742,10 +795,11 @@ pub fn confirm<H: Host>(host: &mut H, wallet: &str, id: &str, body: &[u8]) -> Re
 
 fn confirm_locked<H: Host>(
     host: &mut H,
-    wallet: &str,
+    owner: &SessionOwner,
     id: &str,
     body: &[u8],
 ) -> Result<(), String> {
+    let wallet = owner.wallet();
     let confirmation = std::str::from_utf8(body)
         .map_err(|_| "confirmation body must be UTF-8")?
         .trim();
@@ -754,7 +808,7 @@ fn confirm_locked<H: Host>(
     }
 
     let now = host.now_ms();
-    let mut sess = load(host, wallet, id)?;
+    let mut sess = load_scoped(host, owner, id)?;
 
     // SECURITY: verify wallet ownership.
     if sess.wallet != wallet {
@@ -821,8 +875,8 @@ fn confirm_locked<H: Host>(
         ));
     }
 
-    // Re-read and enforce the current signed policy at the last possible
-    // moment. The outbox host verifies the passkey policy signature again.
+    // Re-read the current Enso venue preferences at the last possible moment.
+    // The outbox host independently enforces authoritative wallet policy.
     let needs_approve = sess.intents.iter().any(|i| i.label == "approve");
     let cross_chain = sess
         .destination_chain
@@ -838,7 +892,7 @@ fn confirm_locked<H: Host>(
     let token_out = format!("0x{:x}", req.token_out);
     let router = format!("0x{:x}", route.tx.to);
     let protocols = route.protocols();
-    let verified_policy = crate::policy::load_verified_policy(host, wallet)?;
+    let verified_policy = crate::policy::load_venue_config(host, wallet)?;
     sess.policy_checks = crate::policy::evaluate(
         &verified_policy,
         &crate::policy::RoutePolicyContext {
@@ -1036,6 +1090,28 @@ pub fn abandon_with_body<H: Host>(
     id: &str,
     body: &[u8],
 ) -> Result<(), String> {
+    let owner = SessionOwner::from_params(wallet, None, None)?;
+    abandon_scoped(host, &owner, id, body)
+}
+
+pub fn abandon_for_ctx<H: Host>(
+    host: &mut H,
+    ctx: &petal::Ctx,
+    wallet: &str,
+    id: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let owner = SessionOwner::scope(ctx, wallet)?;
+    abandon_scoped(host, &owner, id, body)
+}
+
+pub fn abandon_scoped<H: Host>(
+    host: &mut H,
+    owner: &SessionOwner,
+    id: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let wallet = owner.wallet();
     let command = std::str::from_utf8(body)
         .map_err(|_| "abandon body must be UTF-8")?
         .trim();
@@ -1043,7 +1119,7 @@ pub fn abandon_with_body<H: Host>(
         return Err("write exactly `abandon` to cancel this session".into());
     }
     let now = host.now_ms();
-    let mut sess = load(host, wallet, id)?;
+    let mut sess = load_scoped(host, owner, id)?;
 
     if sess.wallet != wallet {
         return Err("wallet mismatch: session does not belong to this wallet".into());

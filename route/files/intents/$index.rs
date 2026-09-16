@@ -1,9 +1,19 @@
 petal::route_file!(
     spec: petal::store_dir_spec().caps(&["bloom:store"]),
-    ctx_list: |_ctx: &petal::Ctx| {
+    ctx_list: |ctx: &petal::Ctx| {
         use crate::workflow::Host;
 
-        let prefix = "intents/".to_string();
+        let account = match petal::route_param(ctx, "bloom.account") {
+            None => 0,
+            Some(raw) => raw
+                .parse::<u32>()
+                .map_err(|error| petal::error(-3, format!("bloom.account must be a u32: {error}")))?,
+        };
+        let prefix = if account == 0 {
+            "intents/".to_string()
+        } else {
+            format!("account-intents/{account}/")
+        };
         let mut host = crate::workflow::BloomHost;
         let keys = host
             .list(&prefix, 1024 * 1024)

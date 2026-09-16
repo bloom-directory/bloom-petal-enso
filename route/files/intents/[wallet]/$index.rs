@@ -4,7 +4,9 @@ petal::route_file!(
         use crate::workflow::Host;
 
         let wallet = petal::param(ctx, "wallet")?;
-        let prefix = format!("intents/{wallet}/");
+        let owner = crate::session::SessionOwner::scope(ctx, wallet)
+            .map_err(|error| petal::error(-3, error))?;
+        let prefix = owner.store_prefix();
         let mut host = crate::workflow::BloomHost;
         let keys = host
             .list(&prefix, 1024 * 1024)

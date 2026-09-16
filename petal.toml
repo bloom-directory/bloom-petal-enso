@@ -9,6 +9,9 @@ repository = "bloom-directory/bloom-petal-enso"
 command = "scripts/build.sh"
 outputs = ["petal/enso"]
 
+[account]
+aware = true
+
 [consent]
 summary = "Request Enso Shortcuts route discovery, simulate and stage EVM swap transactions through Bloom, and track settlement."
 

@@ -8,7 +8,7 @@ petal::route_file!(spec: petal::store_read_spec().caps(&["bloom:store"]), read: 
         Err(response) => return response,
     };
     let mut host = crate::workflow::BloomHost;
-    match crate::workflow::load(&mut host, wallet, id) {
+    match crate::workflow::load_for_ctx(&mut host, ctx, wallet, id) {
         Ok(session) => {
             petal::read_json_value(&serde_json::json!({
                 "overall": session.policy_overall(),

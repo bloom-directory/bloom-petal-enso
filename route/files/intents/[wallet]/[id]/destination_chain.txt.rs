@@ -8,7 +8,7 @@ petal::route_file!(spec: petal::store_read_spec().caps(&["bloom:store"]), read: 
         Err(response) => return response,
     };
     let mut host = crate::workflow::BloomHost;
-    match crate::workflow::load(&mut host, wallet, id) {
+    match crate::workflow::load_for_ctx(&mut host, ctx, wallet, id) {
         Ok(session) => {
             let dest = session.destination_chain.as_deref().unwrap_or(&session.chain);
             petal::DispatchResponse::Read(dest.as_bytes().to_vec())

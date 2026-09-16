@@ -27,7 +27,7 @@ read: /petals/enso/intents/<wallet>/<session>/simulation.json
 ```
 write: /petals/enso/intents/<wallet>/<session>/confirm
 body:  confirm
-write: /wallets/<wallet>/chains/<chain>/outbox/pending/<id>/confirm  # Broadcast
+write: /wallets/<wallet>/<account>/chains/<chain>/outbox/pending/<id>/confirm  # Broadcast
 ```
 
 For an ERC-20 route that needs approval, the first Petal confirmation stages
@@ -50,6 +50,16 @@ Release builds can embed the repository secret `ENSO_API_KEY`. A key written to
 runtime setting `enso-api-key` remains a compatibility fallback, and
 `settings/status.json` reports the selected source without exposing the key.
 
+Per-wallet Enso venue preferences live at `settings/<wallet>/venue.toml` in
+the Petal's own state. Missing configuration defaults to disabled. These are
+advisory application preferences only: Bloom's Broker/Signer-authoritative
+wallet policy, approval budgets, and signing limits remain host-enforced and
+are never interpreted by this Petal.
+
+This Petal is account-aware. The flat mount is account 0; sessions for numbered
+accounts are isolated, and EVM identity is read from
+`wallets/<wallet>/<account>/address.evm`.
+
 ## Safety Model
 
 - Route discovery uses the Enso Shortcuts API (requires an API key)
@@ -57,8 +67,9 @@ runtime setting `enso-api-key` remains a compatibility fallback, and
   `100000000` base units)
 - Route source asset, amount, sender, and native value are verified against
   the Enso Router V2 calldata envelope
-- The wallet's current signed `[defi]` policy is evaluated at create and
-  confirm; a stale or unsigned passkey policy fails closed
+- The Petal's `[defi]` venue preferences are evaluated at create and confirm;
+  missing configuration fails closed, while authoritative wallet policy is
+  independently enforced by Bloom when a transaction is staged
 - Simulation must pass before the route transaction is staged
 - ERC-20 approval is exact-amount and must have a successful receipt first
 - Broadcast requires the standard outbox confirm (owner gate)
@@ -89,6 +100,7 @@ transactions, not unattended autonomous value movement.
 | `intents/<wallet>/<id>/confirm` | writable | Stage into outbox |
 | `settings/status.json` | file | API key credential status |
 | `settings/api-key` | writable | Write Enso API key |
+| `settings/<wallet>/venue.toml` | writable | Configure Enso-owned advisory venue preferences |
 
 ## Development
 

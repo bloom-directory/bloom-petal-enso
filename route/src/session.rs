@@ -1,4 +1,5 @@
 use crate::api_types::{RouteRequest, RouteResponse};
+use petal::Ctx;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -9,8 +10,80 @@ pub struct History {
     pub reason: String,
 }
 
-pub fn failure_key(wallet: &str, id: &str) -> String {
-    format!("intents/{wallet}/{id}/failure.json")
+/// The account that owns an intent session. The flat `/petals/enso/...`
+/// mount and account 0 deliberately share the legacy `intents/<wallet>/`
+/// store tree. Numbered accounts use separate trees.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionOwner {
+    wallet: String,
+    account: u32,
+}
+
+impl SessionOwner {
+    pub fn scope(ctx: &Ctx, wallet: &str) -> Result<Self, String> {
+        Self::from_params(
+            wallet,
+            petal::route_param(ctx, "bloom.wallet"),
+            petal::route_param(ctx, "bloom.account"),
+        )
+    }
+
+    pub fn from_params(
+        wallet: &str,
+        mounted_wallet: Option<&str>,
+        account: Option<&str>,
+    ) -> Result<Self, String> {
+        petal::validate_wallet_id(wallet)?;
+        if let Some(mounted) = mounted_wallet
+            && mounted != wallet
+        {
+            return Err(format!(
+                "intent wallet {wallet:?} is not the mounted wallet {mounted:?}"
+            ));
+        }
+        let account = match account {
+            None => 0,
+            Some(raw) => raw
+                .parse::<u32>()
+                .map_err(|error| format!("bloom.account must be a u32: {error}"))?,
+        };
+        Ok(Self {
+            wallet: wallet.to_owned(),
+            account,
+        })
+    }
+
+    pub fn wallet(&self) -> &str {
+        &self.wallet
+    }
+
+    pub fn account(&self) -> u32 {
+        self.account
+    }
+
+    pub fn store_prefix(&self) -> String {
+        if self.account == 0 {
+            format!("intents/{}/", self.wallet)
+        } else {
+            format!("account-intents/{}/{}/", self.account, self.wallet)
+        }
+    }
+
+    pub fn vfs_account_root(&self) -> String {
+        format!("wallets/{}/{}", self.wallet, self.account)
+    }
+
+    pub fn key(&self, id: &str, file: &str) -> String {
+        format!("{}{id}/{file}", self.store_prefix())
+    }
+
+    pub fn latest_key(&self) -> String {
+        format!("{}latest", self.store_prefix())
+    }
+}
+
+pub fn failure_key(owner: &SessionOwner, id: &str) -> String {
+    owner.key(id, "failure.json")
 }
 
 /// One EVM transaction to stage into the outbox. A session typically holds two:
@@ -63,6 +136,8 @@ pub struct Session {
     pub schema_version: u32,
     pub id: String,
     pub wallet: String,
+    #[serde(default)]
+    pub account: u32,
     pub wallet_address: String,
     pub chain: String,
     #[serde(default)]
@@ -122,7 +197,14 @@ impl Session {
     }
 
     pub fn key(&self) -> String {
-        format!("intents/{}/{}/session.json", self.wallet, self.id)
+        if self.account == 0 {
+            format!("intents/{}/{}/session.json", self.wallet, self.id)
+        } else {
+            format!(
+                "account-intents/{}/{}/{}/session.json",
+                self.account, self.wallet, self.id
+            )
+        }
     }
 
     pub fn terminal(&self) -> bool {
@@ -165,4 +247,42 @@ impl Session {
 
 pub fn key(wallet: &str, id: &str) -> String {
     format!("intents/{wallet}/{id}/session.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flat_mount_and_account_zero_share_legacy_state() {
+        let flat = SessionOwner::from_params("wallet", None, None).unwrap();
+        let zero = SessionOwner::from_params("wallet", Some("wallet"), Some("0")).unwrap();
+        let one = SessionOwner::from_params("wallet", Some("wallet"), Some("1")).unwrap();
+
+        assert_eq!(flat, zero);
+        assert_eq!(flat.store_prefix(), "intents/wallet/");
+        assert_eq!(one.store_prefix(), "account-intents/1/wallet/");
+        assert_eq!(one.vfs_account_root(), "wallets/wallet/1");
+    }
+
+    #[test]
+    fn mounted_scope_rejects_foreign_wallets_and_bad_account_numbers() {
+        assert!(SessionOwner::from_params("other", Some("wallet"), Some("1")).is_err());
+        assert!(SessionOwner::from_params("wallet", Some("wallet"), Some("-1")).is_err());
+        assert!(SessionOwner::from_params("wallet", Some("wallet"), Some("01x")).is_err());
+    }
+
+    #[test]
+    fn account_state_keys_do_not_overlap() {
+        let zero = SessionOwner::from_params("wallet", Some("wallet"), Some("0")).unwrap();
+        let one = SessionOwner::from_params("wallet", Some("wallet"), Some("1")).unwrap();
+        assert_eq!(
+            zero.key("0123456789abcdef", "session.json"),
+            "intents/wallet/0123456789abcdef/session.json"
+        );
+        assert_eq!(
+            one.key("0123456789abcdef", "session.json"),
+            "account-intents/1/wallet/0123456789abcdef/session.json"
+        );
+    }
 }

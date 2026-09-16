@@ -16,7 +16,7 @@ petal::route_file!(
             Err(response) => return response,
         };
         let mut host = crate::workflow::BloomHost;
-        match crate::workflow::abandon_with_body(&mut host, wallet, id, body) {
+        match crate::workflow::abandon_for_ctx(&mut host, ctx, wallet, id, body) {
             Ok(()) => petal::DispatchResponse::Write,
             Err(error) => petal::error(-4, crate::redaction::sanitize_message(&error)),
         }
