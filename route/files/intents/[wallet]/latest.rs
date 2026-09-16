@@ -1,7 +1,7 @@
 petal::route_file!(spec: petal::store_read_spec(), read: |ctx: &petal::Ctx| {
     use crate::workflow::Host;
 
-    let wallet = match petal::param(ctx, "wallet") {
+    let wallet = match crate::wallet::param(ctx) {
         Ok(value) => value,
         Err(response) => return response,
     };

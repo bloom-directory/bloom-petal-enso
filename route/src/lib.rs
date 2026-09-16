@@ -8,6 +8,7 @@ pub mod session;
 pub mod settings;
 pub mod settlement;
 pub mod simulation;
+pub mod wallet;
 pub mod workflow;
 
 #[cfg(test)]

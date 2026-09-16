@@ -411,7 +411,7 @@ The petal `Host` trait (runtime.rs) is missing methods that the original handler
 | B20.4 | ERC-20 symbol read | `chain.erc20_symbol()` | **NO** | important |
 | B20.5 | `eth_call` with revert capture | `chain.eth_call_capture_revert()` | **NO** — Only generic `chain_read`. | **critical** |
 | B20.6 | Chain spec (native symbol/decimals) | `chain.spec()` | **NO** | important |
-| B20.7 | Keystore info (wallet address, policy) | `self.keystore.info(wallet)` | **PARTIAL** — `vfs_read("wallets/{wallet}/address")` only; no policy access. | **critical** |
+| B20.7 | Keystore info (wallet address, policy) | `self.keystore.info(wallet)` | **PARTIAL** — reads the canonical EVM identity from `wallets/{wallet}/0/address.evm`; authoritative policy remains host-enforced. | **critical** |
 | B20.8 | Outbox read/inspect by ID | `tx_engine.outbox.read()` | `tx_inspect()` | ✅ | — |
 | B20.9 | Outbox dependency setting | `outbox.set_pending_depends_on()` | **NO** | **critical** |
 | B20.10 | Wallet policy access | `info.policy.defi` | **NO** | **critical** |

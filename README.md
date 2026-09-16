@@ -50,6 +50,33 @@ Release builds can embed the repository secret `ENSO_API_KEY`. A key written to
 runtime setting `enso-api-key` remains a compatibility fallback, and
 `settings/status.json` reports the selected source without exposing the key.
 
+Per-wallet Enso venue preferences live at `settings/wallets/<wallet>/venue.toml` in
+the Petal's own state. No setup write is needed: an unconfigured wallet reads
+and uses the bundled defaults. Swaps are enabled on all 13 chains supported by Bloom and Enso
+(Ethereum, Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart
+Chain, Avalanche, Gnosis, Linea, HyperEVM, and Arc), with the
+[canonical Enso Router V2](https://docs.enso.build/pages/build/reference/deployments.md)
+allowlisted on each chain, the wallet itself as receiver, and a 100 bps (1%)
+slippage ceiling. The default request slippage remains 50 bps (0.5%).
+HyperEVM uses Bloom's chain key `hyperliquid`; Robinhood Chain uses `robinhood`.
+Chain allowlisting is independent of the static token-symbol registry: use token
+contract addresses when a symbol is not in the registry for that chain.
+
+Read this file to see the full effective TOML; edit it and write the full document
+back to override it. To disable swaps, write `[defi]` followed by `enabled = false`.
+Existing configuration at the former `settings/<wallet>/venue.toml` storage key
+is retained as a fallback until settings are written at the new path. Explicit
+configuration is never merged with permissive defaults: omitted fields retain
+their conservative behavior, and malformed configuration fails closed.
+
+Defaults permit missing protocol metadata and disable strict calldata
+verification, with explicit review warnings. Receiver and minimum-output
+parameters are not fully proven from Router V2 action bytes; inspect the plan
+before approving a transaction. These are advisory application preferences only:
+Bloom's Broker/Signer-authoritative wallet policy, approval budgets, and signing
+limits remain host-enforced and
+are never interpreted by this Petal.
+
 ## Safety Model
 
 - Route discovery uses the Enso Shortcuts API (requires an API key)
@@ -57,8 +84,9 @@ runtime setting `enso-api-key` remains a compatibility fallback, and
   `100000000` base units)
 - Route source asset, amount, sender, and native value are verified against
   the Enso Router V2 calldata envelope
-- The wallet's current signed `[defi]` policy is evaluated at create and
-  confirm; a stale or unsigned passkey policy fails closed
+- The Petal's `[defi]` venue preferences are evaluated at create and confirm;
+  bundled defaults apply to unconfigured wallets, while authoritative wallet
+  policy is independently enforced by Bloom when a transaction is staged
 - Simulation must pass before the route transaction is staged
 - ERC-20 approval is exact-amount and must have a successful receipt first
 - Broadcast requires the standard outbox confirm (owner gate)
@@ -89,6 +117,7 @@ transactions, not unattended autonomous value movement.
 | `intents/<wallet>/<id>/confirm` | writable | Stage into outbox |
 | `settings/status.json` | file | API key credential status |
 | `settings/api-key` | writable | Write Enso API key |
+| `settings/wallets/<wallet>/venue.toml` | writable | Configure Enso-owned advisory venue preferences |
 
 ## Development
 

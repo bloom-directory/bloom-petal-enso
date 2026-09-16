@@ -48,15 +48,12 @@ impl MockHost {
 
         let mut vfs = HashMap::new();
         vfs.insert(
-            "wallets/test-wallet/address".to_string(),
+            "wallets/test-wallet/0/address.evm".to_string(),
             b"0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1".to_vec(),
         );
-        vfs.insert(
-            "wallets/test-wallet/addresses.json".to_string(),
-            br#"{"wallet":"test-wallet","kind":"local","policy_status":"not_applicable"}"#.to_vec(),
-        );
-        vfs.insert(
-            "wallets/test-wallet/policy.toml".to_string(),
+        let mut store = HashMap::new();
+        store.insert(
+            "settings/test-wallet/venue.toml".to_string(),
             br#"
 [mev]
 max_slippage_bps = 100
@@ -87,7 +84,7 @@ require_calldata_verification = false
 
         Self {
             now: 1_000_000,
-            store: HashMap::new(),
+            store,
             secrets,
             vfs,
             tx_counter: 0,
@@ -711,16 +708,109 @@ fn empty_confirmation_is_rejected() {
 }
 
 #[test]
-fn stale_passkey_policy_is_rejected() {
-    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
-    host.vfs.insert(
-        "wallets/test-wallet/addresses.json".into(),
-        br#"{"wallet":"test-wallet","kind":"passkey","policy_status":"stale"}"#.to_vec(),
-    );
+fn missing_venue_configuration_allows_canonical_route() {
+    let response = String::from_utf8(build_enso_response_erc20())
+        .unwrap()
+        .replace(
+            "0x1234567890abcdef1234567890abcdef12345678",
+            "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+        );
+    let mut host = MockHost::new().with_enso_response(response.into_bytes());
+    host.store.clear();
+    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 100 usdc to eth").unwrap();
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    assert!(host.stage_count > 0);
+}
 
-    let error =
-        crate::workflow::create(&mut host, "test-wallet", b"swap 100 usdc to eth").unwrap_err();
-    assert!(error.contains("current policy signature"), "{error}");
+#[test]
+fn venue_settings_use_namespaced_keys_and_preserve_custom_configuration() {
+    let mut host = MockHost::new();
+    for wallet in ["api-key", "StatusJson", "wallets"] {
+        crate::policy::write_venue_config(&mut host, wallet, b"[defi]\nenabled = false\n").unwrap();
+        assert!(
+            host.store
+                .contains_key(&format!("settings/wallets/{wallet}/venue.toml"))
+        );
+        assert!(
+            !crate::policy::load_venue_config(&mut host, wallet)
+                .unwrap()
+                .defi
+                .enabled
+        );
+    }
+}
+
+#[test]
+fn venue_defaults_are_identical_when_read_and_loaded() {
+    let mut host = MockHost::new();
+    host.store.clear();
+    let bytes = crate::policy::read_venue_config(&mut host, "test-wallet").unwrap();
+    let document: toml::Value = toml::from_str(std::str::from_utf8(&bytes).unwrap()).unwrap();
+    assert_eq!(document["defi"]["enabled"].as_bool(), Some(true));
+    let loaded = crate::policy::load_venue_config(&mut host, "test-wallet").unwrap();
+    assert!(loaded.defi.enabled);
+    assert_eq!(loaded.max_slippage_bps, Some(100));
+    assert!(loaded.defi.allow_unknown_protocols);
+    assert!(!loaded.defi.require_calldata_verification);
+    for chain in [
+        "ethereum",
+        "optimism",
+        "bnb",
+        "polygon",
+        "base",
+        "arbitrum",
+        "avalanche",
+    ] {
+        assert!(loaded.defi.allowed_source_chains.contains(chain));
+        assert!(loaded.defi.allowed_destination_chains.contains(chain));
+        assert!(loaded.defi.allowed_routers.contains(&format!(
+            "{chain}:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+        )));
+    }
+}
+
+#[test]
+fn venue_defaults_cover_bloom_enso_intersection() {
+    let mut host = MockHost::new();
+    host.store.clear();
+    let policy = crate::policy::load_venue_config(&mut host, "test-wallet").unwrap();
+    let common = "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf";
+    for (chain, router) in [
+        ("ethereum", common),
+        ("base", common),
+        ("arbitrum", common),
+        ("optimism", common),
+        ("polygon", common),
+        ("bnb", common),
+        ("avalanche", common),
+        ("gnosis", common),
+        ("hyperliquid", common),
+        ("linea", "0xa146d46823f3f594b785200102be5385cafce9b5"),
+        ("robinhood", "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"),
+        ("arc", "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"),
+        ("tempo", "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"),
+    ] {
+        assert!(policy.defi.allowed_source_chains.contains(chain), "{chain}");
+        assert!(
+            policy.defi.allowed_destination_chains.contains(chain),
+            "{chain}"
+        );
+        assert!(
+            policy
+                .defi
+                .allowed_routers
+                .contains(&format!("{chain}:{router}"))
+        );
+    }
+    assert_eq!(policy.defi.allowed_source_chains.len(), 13);
+    assert_eq!(policy.defi.allowed_destination_chains.len(), 13);
+    assert!(!policy.defi.allowed_source_chains.contains("unsupported"));
+    assert!(
+        !policy
+            .defi
+            .allowed_destination_chains
+            .contains("unsupported")
+    );
 }
 
 // ===========================================================================
@@ -1333,8 +1423,28 @@ fn double_confirm_with_approve_is_idempotent() {
 // ===========================================================================
 
 #[test]
-fn slippage_above_wallet_policy_is_rejected() {
+fn slippage_above_venue_configuration_is_rejected() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+
+    let body = br#"{"intent":"swap 100.0 usdc to eth","chain":"ethereum","slippage_bps":200}"#;
+    let error = crate::workflow::create(&mut host, "test-wallet", body).unwrap_err();
+    assert!(error.contains("max_slippage"), "{error}");
+}
+
+#[test]
+fn omitted_mev_section_keeps_the_default_slippage_ceiling() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let config = String::from_utf8(
+        host.store
+            .remove("settings/test-wallet/venue.toml")
+            .unwrap(),
+    )
+    .unwrap()
+    .replace("[mev]\nmax_slippage_bps = 100\n\n", "");
+    host.store.insert(
+        "settings/wallets/test-wallet/venue.toml".into(),
+        config.into_bytes(),
+    );
 
     let body = br#"{"intent":"swap 100.0 usdc to eth","chain":"ethereum","slippage_bps":200}"#;
     let error = crate::workflow::create(&mut host, "test-wallet", body).unwrap_err();
@@ -1387,6 +1497,31 @@ fn multiple_sessions_same_wallet_are_independent() {
 // ===========================================================================
 // TEST: invalid wallet name is rejected
 // ===========================================================================
+
+#[test]
+fn mixed_case_bloom_wallet_name_is_supported() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let venue = host
+        .store
+        .get("settings/test-wallet/venue.toml")
+        .cloned()
+        .unwrap();
+    host.store
+        .insert("settings/wallets/Alice/venue.toml".to_string(), venue);
+    host.vfs.insert(
+        "wallets/Alice/0/address.evm".to_string(),
+        b"0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1".to_vec(),
+    );
+
+    let id = crate::workflow::create(&mut host, "Alice", b"swap 100.0 usdc to eth")
+        .expect("mixed-case Bloom wallet names must remain usable");
+    let session = crate::workflow::load(&mut host, "Alice", &id).unwrap();
+    assert_eq!(session.wallet, "Alice");
+    assert!(
+        host.store
+            .contains_key(&format!("intents/Alice/{id}/session.json"))
+    );
+}
 
 #[test]
 fn invalid_wallet_name_rejected() {
@@ -1585,4 +1720,56 @@ fn unknown_token_symbol_rejected() {
     );
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("could not resolve"));
+}
+
+#[test]
+fn legacy_venue_restrictions_survive_until_explicit_override() {
+    let mut host = MockHost::new();
+    host.store.insert(
+        "settings/test-wallet/venue.toml".into(),
+        b"[defi]\nenabled = false\n".to_vec(),
+    );
+    assert!(
+        !crate::policy::load_venue_config(&mut host, "test-wallet")
+            .unwrap()
+            .defi
+            .enabled
+    );
+    crate::policy::write_venue_config(&mut host, "test-wallet", b"[defi]\nenabled = true\n")
+        .unwrap();
+    let policy = crate::policy::load_venue_config(&mut host, "test-wallet").unwrap();
+    assert!(policy.defi.enabled);
+    assert!(policy.defi.allowed_source_chains.is_empty());
+    assert!(policy.defi.require_calldata_verification);
+}
+
+#[test]
+fn default_venue_rejects_noncanonical_router() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    host.store.clear();
+    let error =
+        crate::workflow::create(&mut host, "test-wallet", b"swap 100 usdc to eth").unwrap_err();
+    assert!(error.contains("router"), "{error}");
+    assert_eq!(host.stage_count, 0);
+}
+
+#[test]
+fn venue_disable_is_rechecked_before_staging() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 100 usdc to eth").unwrap();
+    crate::policy::write_venue_config(&mut host, "test-wallet", b"[defi]\nenabled = false\n")
+        .unwrap();
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    assert!(error.contains("disabled"), "{error}");
+    assert_eq!(host.stage_count, 0);
+}
+
+#[test]
+fn malformed_saved_venue_configuration_does_not_use_enabled_defaults() {
+    let mut host = MockHost::new();
+    host.store.insert(
+        "settings/wallets/test-wallet/venue.toml".into(),
+        b"invalid toml".to_vec(),
+    );
+    assert!(crate::policy::load_venue_config(&mut host, "test-wallet").is_err());
 }
