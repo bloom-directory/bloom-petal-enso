@@ -8,7 +8,7 @@ simulation, and swap execution through the Bloom transaction pipeline.
 ### 1. Create an intent
 
 ```
-write: /petals/enso/intents/<wallet>/new
+write: /petals/enso/wallets/<wallet>/<account>/intents/new
 body:  {"intent":"swap 100 usdc to eth","chain":"ethereum"}
   or:  swap 100 usdc to eth
 ```
@@ -16,16 +16,16 @@ body:  {"intent":"swap 100 usdc to eth","chain":"ethereum"}
 ### 2. Inspect the plan
 
 ```
-read: /petals/enso/intents/<wallet>/<session>/plan.md
-read: /petals/enso/intents/<wallet>/<session>/route.json
-read: /petals/enso/intents/<wallet>/<session>/tx.json
-read: /petals/enso/intents/<wallet>/<session>/simulation.json
+read: /petals/enso/wallets/<wallet>/<account>/intents/<session>/plan.md
+read: /petals/enso/wallets/<wallet>/<account>/intents/<session>/route.json
+read: /petals/enso/wallets/<wallet>/<account>/intents/<session>/tx.json
+read: /petals/enso/wallets/<wallet>/<account>/intents/<session>/simulation.json
 ```
 
 ### 3. Confirm
 
 ```
-write: /petals/enso/intents/<wallet>/<session>/confirm
+write: /petals/enso/wallets/<wallet>/<account>/intents/<session>/confirm
 body:  confirm
 write: /wallets/<wallet>/chains/<chain>/outbox/pending/<id>/confirm  # Broadcast
 ```
@@ -41,7 +41,7 @@ pending approval.
 Set the Enso API key:
 
 ```
-write: /petals/enso/settings/api-key
+write: /petals/enso/wallets/<wallet>/<account>/settings/api-key
 body:  your-enso-api-key-here
 ```
 
@@ -50,7 +50,7 @@ Release builds can embed the repository secret `ENSO_API_KEY`. A key written to
 runtime setting `enso-api-key` remains a compatibility fallback, and
 `settings/status.json` reports the selected source without exposing the key.
 
-Per-wallet Enso venue preferences live at `settings/wallets/<wallet>/venue.toml` in
+Per-wallet Enso venue preferences live at `settings/wallets/venue.toml` in
 the Petal's own state. No setup write is needed: an unconfigured wallet reads
 and uses the bundled defaults. Swaps are enabled on all 13 chains supported by Bloom and Enso
 (Ethereum, Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart
@@ -117,7 +117,7 @@ transactions, not unattended autonomous value movement.
 | `intents/<wallet>/<id>/confirm` | writable | Stage into outbox |
 | `settings/status.json` | file | API key credential status |
 | `settings/api-key` | writable | Write Enso API key |
-| `settings/wallets/<wallet>/venue.toml` | writable | Configure Enso-owned advisory venue preferences |
+| `settings/wallets/venue.toml` | writable | Configure Enso-owned advisory venue preferences |
 
 ## Development
 
@@ -127,3 +127,7 @@ cargo test --manifest-path route/Cargo.toml
 scripts/build.sh
 petal check --root .
 ```
+
+## Account-scoped routes
+
+Select a wallet and numbered account under `/petals/enso/wallets/<wallet>/<account>/`. Petal operations and settings live below that directory. Account 0 keeps its existing private records; other accounts have separate stores. The core wallet tree remains `/wallets/<wallet>/<account>/`.

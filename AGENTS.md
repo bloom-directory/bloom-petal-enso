@@ -41,3 +41,7 @@ Key differences from the monorepo:
   `bloom_proto::tokens`. Expand it as needed.
 - Amount decimal scaling is simplified — see `workflow::parse_amount`.
 - Simulation uses `eth_call` via `chain_read`, not a separate Quoter endpoint.
+
+## Account-scoped routes
+
+Select a wallet and numbered account under `/petals/enso/wallets/<wallet>/<account>/`. Petal operations and settings live below that directory. Account 0 keeps its existing private records; other accounts have separate stores. The core wallet tree remains `/wallets/<wallet>/<account>/`.

@@ -42,10 +42,10 @@ fn resolve_api_key<H: Host>(host: &mut H) -> Result<String, String> {
     Ok(resolved.key.expose().to_string())
 }
 
-fn wallet_address<H: Host>(host: &mut H, wallet: &str) -> Result<String, String> {
+fn wallet_address<H: Host>(host: &mut H, wallet: &str, account: u32) -> Result<String, String> {
     crate::wallet::validate_id(wallet)?;
     let address =
-        String::from_utf8(host.vfs_read(&format!("wallets/{wallet}/0/address.evm"), 128)?)
+        String::from_utf8(host.vfs_read(&format!("wallets/{wallet}/{account}/address.evm"), 128)?)
             .map_err(|_| "wallet EVM address is not UTF-8")?
             .trim()
             .to_string();
@@ -379,9 +379,19 @@ fn render_plan_md(view: PlanView<'_>) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String, String> {
+    create_for_account(host, wallet, 0, body)
+}
+
+/// Create for Bloom's trusted selected account.
+pub fn create_for_account<H: Host>(
+    host: &mut H,
+    wallet: &str,
+    account: u32,
+    body: &[u8],
+) -> Result<String, String> {
     let now = host.now_ms();
     let parsed = input::parse_new_body(body)?;
-    let address = wallet_address(host, wallet)?;
+    let address = wallet_address(host, wallet, account)?;
     let api_key = resolve_api_key(host)?;
 
     // Determine source chain.

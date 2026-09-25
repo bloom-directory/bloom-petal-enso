@@ -6,7 +6,7 @@ petal::route_file!(spec: petal::static_read_spec(), read: |_ctx: &petal::Ctx| {
 ### Default venue settings
 
 No configuration write is needed. Read and override preferences at:
-`/petals/enso/settings/wallets/<wallet>/venue.toml`.
+`/petals/enso/wallets/<wallet>/<account>/settings/wallets/venue.toml`.
 Defaults enable swaps on all 13 Bloom/Enso chains: Ethereum, Base, Tempo,
 Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche,
 Gnosis, Linea, HyperEVM, and Arc. Use `hyperliquid` for HyperEVM and
@@ -21,30 +21,30 @@ disables swaps. Existing saved restrictions take precedence over defaults.
 
 ### 1. Create an intent
 ```json
- write: /petals/enso/intents/<wallet>/new
+ write: /petals/enso/wallets/<wallet>/<account>/intents/new
  example: {"intent":"swap 100 usdc to eth","chain":"ethereum"}
  or just NL text: swap 100 usdc to eth
 ```
 
 ### 2. Inspect the plan
 ```json
- read: /petals/enso/intents/<wallet>/<session>/plan.md
- read: /petals/enso/intents/<wallet>/<session>/route.json
- read: /petals/enso/intents/<wallet>/<session>/tx.json
- read: /petals/enso/intents/<wallet>/<session>/simulation.json
- read: /petals/enso/intents/<wallet>/<session>/policy_check.json
+ read: /petals/enso/wallets/<wallet>/<account>/intents/<session>/plan.md
+ read: /petals/enso/wallets/<wallet>/<account>/intents/<session>/route.json
+ read: /petals/enso/wallets/<wallet>/<account>/intents/<session>/tx.json
+ read: /petals/enso/wallets/<wallet>/<account>/intents/<session>/simulation.json
+ read: /petals/enso/wallets/<wallet>/<account>/intents/<session>/policy_check.json
 ```
 
 ### 3. Confirm
 ```json
- write: /petals/enso/intents/<wallet>/<session>/confirm
+ write: /petals/enso/wallets/<wallet>/<account>/intents/<session>/confirm
  body: confirm
 ```
 
 ### 4. Verify settlement
 ```json
- read: /petals/enso/intents/<wallet>/<session>/settlement.json
- read: /petals/enso/intents/<wallet>/<session>/wait_settlement.json
+ read: /petals/enso/wallets/<wallet>/<account>/intents/<session>/settlement.json
+ read: /petals/enso/wallets/<wallet>/<account>/intents/<session>/wait_settlement.json
 ```
 
 ## Safety Model

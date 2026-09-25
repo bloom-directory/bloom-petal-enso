@@ -1773,3 +1773,19 @@ fn malformed_saved_venue_configuration_does_not_use_enabled_defaults() {
     );
     assert!(crate::policy::load_venue_config(&mut host, "test-wallet").is_err());
 }
+
+#[test]
+fn create_on_account_one_reads_only_its_numbered_address() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let address = host
+        .vfs
+        .remove("wallets/test-wallet/0/address.evm")
+        .unwrap();
+    host.vfs
+        .insert("wallets/test-wallet/1/address.evm".into(), address);
+    let id =
+        crate::workflow::create_for_account(&mut host, "test-wallet", 1, b"swap 100.0 usdc to eth")
+            .expect("account one has the selected EVM address");
+    let session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(session.wallet, "test-wallet");
+}

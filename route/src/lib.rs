@@ -18,3 +18,10 @@ pub mod prelude {
     pub use crate::workflow::*;
     pub use petal::*;
 }
+
+/// Trusted account selected by Bloom; legacy hosts omit it and select account 0.
+pub fn account_number(ctx: &petal::Ctx) -> u32 {
+    petal::route_param(ctx, "bloom.account")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
