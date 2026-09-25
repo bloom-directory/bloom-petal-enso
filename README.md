@@ -10,8 +10,10 @@ simulation, and swap execution through the Bloom transaction pipeline.
 ```
 write: /petals/enso/intents/<wallet>/new
 body:  {"intent":"swap 100 usdc to eth","chain":"ethereum"}
-  or:  swap 100 usdc to eth
+  or:  swap 100 usdc to eth on ethereum
 ```
+
+The source chain is required: set `"chain"` or end the text with `on <chain>`.
 
 ### 2. Inspect the plan
 

@@ -384,28 +384,29 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
     let address = wallet_address(host, wallet)?;
     let api_key = resolve_api_key(host)?;
 
-    // Determine source chain.
-    let nat_opt = input::parse_natural_intent(&parsed.intent);
-    let nat_chain = nat_opt.as_ref().and_then(|n| n.chain.clone());
+    // Determine source chain. It must be named: a guessed chain would quote
+    // the swap on a network the caller never chose.
+    let nat = input::parse_natural_intent(&parsed.intent).ok_or_else(|| {
+        format!(
+            "could not parse intent '{}' (expected `swap <amount> <tok> to <tok> on <chain>`)",
+            parsed.intent
+        )
+    })?;
     let chain_name = parsed
         .chain
         .as_deref()
-        .or(nat_chain.as_deref())
-        .unwrap_or("ethereum")
+        .or(nat.chain.as_deref())
+        .ok_or(
+            "name the source chain: add \"chain\" to the JSON body \
+             (for example {\"intent\":\"swap 0.003 ETH to USDC\",\"chain\":\"base\"}) \
+             or end the intent with `on <chain>`",
+        )?
         .to_ascii_lowercase();
 
     // Resolve the configured RPC and prove that it is the requested chain.
     let chain_id = host
         .chain_id(&chain_name)
         .map_err(|e| format!("cannot verify source chain {chain_name}: {e}"))?;
-
-    // Parse the natural intent.
-    let nat = nat_opt.ok_or_else(|| {
-        format!(
-            "could not parse intent '{}' (expected `swap <amount> <tok> to <tok>`)",
-            parsed.intent
-        )
-    })?;
 
     // Resolve token_in on source chain.
     let token_in = input::resolve_token_symbol(chain_id, &nat.token_in)

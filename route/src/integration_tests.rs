@@ -687,7 +687,7 @@ fn full_lifecycle_create_confirm_stages_outbox() {
 fn confirm_is_idempotent() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let id =
         crate::workflow::create(&mut host, "test-wallet", body).expect("create should succeed");
 
@@ -708,7 +708,12 @@ fn confirm_is_idempotent() {
 #[test]
 fn empty_confirmation_is_rejected() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
-    let id = crate::workflow::create(&mut host, "test-wallet", br#"swap 100 usdc to eth"#).unwrap();
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        br#"swap 100 usdc to eth on ethereum"#,
+    )
+    .unwrap();
 
     let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"").unwrap_err();
     assert!(error.contains("exactly `confirm`"), "{error}");
@@ -725,7 +730,12 @@ fn missing_venue_configuration_allows_canonical_route() {
         );
     let mut host = MockHost::new().with_enso_response(response.into_bytes());
     host.store.clear();
-    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 100 usdc to eth").unwrap();
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 100 usdc to eth on ethereum",
+    )
+    .unwrap();
     crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
     assert!(host.stage_count > 0);
 }
@@ -829,7 +839,7 @@ fn venue_defaults_cover_bloom_enso_intersection() {
 fn abandon_before_staging_works() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let id =
         crate::workflow::create(&mut host, "test-wallet", body).expect("create should succeed");
 
@@ -851,7 +861,7 @@ fn abandon_before_staging_works() {
 fn abandon_after_staging_fails() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let id =
         crate::workflow::create(&mut host, "test-wallet", body).expect("create should succeed");
 
@@ -871,7 +881,7 @@ fn abandon_after_staging_fails() {
 fn wrong_wallet_cannot_load_session() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let id =
         crate::workflow::create(&mut host, "test-wallet", body).expect("create should succeed");
 
@@ -915,7 +925,7 @@ fn session_roundtrip_preserves_all_fields() {
 fn native_eth_swap_has_correct_value() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_native());
 
-    let body = br#"swap 1.0 eth to usdc"#;
+    let body = br#"swap 1.0 eth to usdc on ethereum"#;
     let id = crate::workflow::create(&mut host, "test-wallet", body).unwrap();
 
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
@@ -934,7 +944,7 @@ fn native_eth_swap_has_correct_value() {
 fn policy_overall_aggregation() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let id = crate::workflow::create(&mut host, "test-wallet", body).unwrap();
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
 
@@ -951,7 +961,7 @@ fn policy_overall_aggregation() {
 fn erc20_sufficient_allowance_no_approve() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let id = crate::workflow::create(&mut host, "test-wallet", body).unwrap();
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
 
@@ -971,7 +981,7 @@ fn erc20_zero_allowance_adds_approve_intent() {
         .with_enso_response(build_enso_response_erc20())
         .with_allowance("0");
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let id = crate::workflow::create(&mut host, "test-wallet", body).unwrap();
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
 
@@ -1048,7 +1058,7 @@ fn simulation_failure_rejects_session() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
     host.eth_call_success = false;
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let error = crate::workflow::create(&mut host, "test-wallet", body)
         .expect_err("create must reject a failed simulation");
     assert!(error.contains("simulation failed"), "{error}");
@@ -1068,7 +1078,7 @@ fn full_lifecycle_with_approve_two_intents() {
         .with_enso_response(build_enso_response_erc20())
         .with_allowance("0");
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let id =
         crate::workflow::create(&mut host, "test-wallet", body).expect("create should succeed");
 
@@ -1113,7 +1123,7 @@ fn full_lifecycle_with_approve_two_intents() {
 fn confirm_on_abandoned_session_should_fail() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let id =
         crate::workflow::create(&mut host, "test-wallet", body).expect("create should succeed");
 
@@ -1171,7 +1181,7 @@ fn same_chain_different_case_not_cross_chain() {
 fn create_rejects_route_with_mismatched_token() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_wrong_token());
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let result = crate::workflow::create(&mut host, "test-wallet", body);
 
     assert!(result.is_err());
@@ -1190,7 +1200,7 @@ fn create_rejects_route_with_mismatched_token() {
 fn create_rejects_route_with_mismatched_amount() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_wrong_amount());
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let result = crate::workflow::create(&mut host, "test-wallet", body);
 
     assert!(result.is_err());
@@ -1205,7 +1215,7 @@ fn create_rejects_route_with_mismatched_amount() {
 fn create_rejects_native_route_with_wrong_value() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_native_wrong_value());
 
-    let body = br#"swap 1.0 eth to usdc"#;
+    let body = br#"swap 1.0 eth to usdc on ethereum"#;
     let result = crate::workflow::create(&mut host, "test-wallet", body);
 
     assert!(result.is_err());
@@ -1221,7 +1231,7 @@ fn enso_api_error_propagates() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
     host.enso_status = 500;
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let result = crate::workflow::create(&mut host, "test-wallet", body);
 
     assert!(result.is_err());
@@ -1236,7 +1246,7 @@ fn enso_api_error_propagates() {
 fn chain_id_mismatch_rejected_at_confirm() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let id =
         crate::workflow::create(&mut host, "test-wallet", body).expect("create should succeed");
 
@@ -1257,7 +1267,7 @@ fn settlement_not_broadcast_for_prepared_session() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
     // Use DAI as output (non-native) so settlement tracking is active
-    let body = br#"swap 100.0 usdc to dai"#;
+    let body = br#"swap 100.0 usdc to dai on ethereum"#;
     let id = crate::workflow::create(&mut host, "test-wallet", body).unwrap();
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
 
@@ -1278,7 +1288,7 @@ fn settlement_native_output_is_trackable() {
 
     // Before the route is staged, native output has the same safe lifecycle
     // classification as ERC-20 output.
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let id = crate::workflow::create(&mut host, "test-wallet", body).unwrap();
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
 
@@ -1297,7 +1307,7 @@ fn settlement_native_output_is_trackable() {
 fn settlement_received_after_balance_increase() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
-    let body = br#"swap 100.0 usdc to dai"#;
+    let body = br#"swap 100.0 usdc to dai on ethereum"#;
     let id = crate::workflow::create(&mut host, "test-wallet", body).unwrap();
 
     // Stage the intents so staged_ids is non-empty
@@ -1333,7 +1343,7 @@ fn settlement_received_after_balance_increase() {
 fn settlement_source_pending_before_receipt() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
-    let body = br#"swap 100.0 usdc to dai"#;
+    let body = br#"swap 100.0 usdc to dai on ethereum"#;
     let id = crate::workflow::create(&mut host, "test-wallet", body).unwrap();
 
     crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
@@ -1358,7 +1368,7 @@ fn partial_staging_failure_is_recoverable() {
         .with_enso_response(build_enso_response_erc20())
         .with_allowance("0"); // creates 2 intents: approve + route
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let id =
         crate::workflow::create(&mut host, "test-wallet", body).expect("create should succeed");
 
@@ -1406,7 +1416,7 @@ fn double_confirm_with_approve_is_idempotent() {
         .with_enso_response(build_enso_response_erc20())
         .with_allowance("0");
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let id =
         crate::workflow::create(&mut host, "test-wallet", body).expect("create should succeed");
 
@@ -1467,7 +1477,7 @@ fn omitted_mev_section_keeps_the_default_slippage_ceiling() {
 fn default_slippage_is_50_bps() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
-    let body = br#"swap 100.0 usdc to eth"#;
+    let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let id = crate::workflow::create(&mut host, "test-wallet", body).unwrap();
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
 
@@ -1482,11 +1492,19 @@ fn default_slippage_is_50_bps() {
 fn multiple_sessions_same_wallet_are_independent() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
-    let id1 =
-        crate::workflow::create(&mut host, "test-wallet", br#"swap 100.0 usdc to eth"#).unwrap();
+    let id1 = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        br#"swap 100.0 usdc to eth on ethereum"#,
+    )
+    .unwrap();
     // Same intent — IDs differ because random() generates unique session IDs.
-    let id2 =
-        crate::workflow::create(&mut host, "test-wallet", br#"swap 100.0 usdc to eth"#).unwrap();
+    let id2 = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        br#"swap 100.0 usdc to eth on ethereum"#,
+    )
+    .unwrap();
 
     assert_ne!(id1, id2, "sessions should have different IDs");
 
@@ -1521,7 +1539,7 @@ fn mixed_case_bloom_wallet_name_is_supported() {
         b"0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1".to_vec(),
     );
 
-    let id = crate::workflow::create(&mut host, "Alice", b"swap 100.0 usdc to eth")
+    let id = crate::workflow::create(&mut host, "Alice", b"swap 100.0 usdc to eth on ethereum")
         .expect("mixed-case Bloom wallet names must remain usable");
     let session = crate::workflow::load(&mut host, "Alice", &id).unwrap();
     assert_eq!(session.wallet, "Alice");
@@ -1536,15 +1554,23 @@ fn invalid_wallet_name_rejected() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
     // Wallet name with slash — path traversal attempt
-    let result = crate::workflow::create(&mut host, "../etc", br#"swap 100.0 usdc to eth"#);
+    let result = crate::workflow::create(
+        &mut host,
+        "../etc",
+        br#"swap 100.0 usdc to eth on ethereum"#,
+    );
     assert!(result.is_err());
 
     // Empty wallet name
-    let result = crate::workflow::create(&mut host, "", br#"swap 100.0 usdc to eth"#);
+    let result = crate::workflow::create(&mut host, "", br#"swap 100.0 usdc to eth on ethereum"#);
     assert!(result.is_err());
 
     // Wallet name with space
-    let result = crate::workflow::create(&mut host, "test wallet", br#"swap 100.0 usdc to eth"#);
+    let result = crate::workflow::create(
+        &mut host,
+        "test wallet",
+        br#"swap 100.0 usdc to eth on ethereum"#,
+    );
     assert!(result.is_err());
 }
 
@@ -1560,7 +1586,12 @@ fn oversized_intent_body_is_rejected_before_external_work() {
 #[test]
 fn abandon_requires_exact_command() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
-    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 100.0 usdc to eth").unwrap();
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 100.0 usdc to eth on ethereum",
+    )
+    .unwrap();
     let error =
         crate::workflow::abandon_with_body(&mut host, "test-wallet", &id, b"yes").unwrap_err();
     assert!(error.contains("exactly `abandon`"), "{error}");
@@ -1575,7 +1606,12 @@ fn abandon_requires_exact_command() {
 #[test]
 fn active_confirmation_lock_prevents_duplicate_staging() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
-    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 100.0 usdc to eth").unwrap();
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 100.0 usdc to eth on ethereum",
+    )
+    .unwrap();
     let lock_key = format!("intents/test-wallet/{id}/confirm.lock");
     let lock = serde_json::to_vec(&serde_json::json!({
         "created_ms": host.now,
@@ -1592,7 +1628,12 @@ fn active_confirmation_lock_prevents_duplicate_staging() {
 #[test]
 fn stale_confirmation_lock_is_recovered() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
-    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 100.0 usdc to eth").unwrap();
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 100.0 usdc to eth on ethereum",
+    )
+    .unwrap();
     let lock_key = format!("intents/test-wallet/{id}/confirm.lock");
     let stale = serde_json::to_vec(&serde_json::json!({
         "created_ms": 1,
@@ -1609,7 +1650,12 @@ fn stale_confirmation_lock_is_recovered() {
 #[test]
 fn confirm_rejects_tampered_prepared_transaction() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
-    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 100.0 usdc to eth").unwrap();
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 100.0 usdc to eth on ethereum",
+    )
+    .unwrap();
     let mut session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     session.intents.last_mut().unwrap().to = "0x000000000000000000000000000000000000dead".into();
     host.put(
@@ -1667,7 +1713,12 @@ fn confirm_accepts_legacy_cross_chain_destination_metadata() {
 #[test]
 fn unrelated_balance_increase_is_not_claimed_as_settlement() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
-    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 100.0 usdc to dai").unwrap();
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 100.0 usdc to dai on ethereum",
+    )
+    .unwrap();
     crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
     let session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     let route_id = session.intent_states[0].outbox_id.clone().unwrap();
@@ -1709,7 +1760,7 @@ fn unparseable_intent_rejected() {
     assert!(result.is_err());
 
     // Missing amount
-    let result = crate::workflow::create(&mut host, "test-wallet", b"swap usdc to eth");
+    let result = crate::workflow::create(&mut host, "test-wallet", b"swap usdc to eth on ethereum");
     assert!(result.is_err());
 }
 
@@ -1724,7 +1775,7 @@ fn unknown_token_symbol_rejected() {
     let result = crate::workflow::create(
         &mut host,
         "test-wallet",
-        b"swap 100.0 nonexistenttoken to eth",
+        b"swap 100.0 nonexistenttoken to eth on ethereum",
     );
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("could not resolve"));
@@ -1755,8 +1806,12 @@ fn legacy_venue_restrictions_survive_until_explicit_override() {
 fn default_venue_rejects_noncanonical_router() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
     host.store.clear();
-    let error =
-        crate::workflow::create(&mut host, "test-wallet", b"swap 100 usdc to eth").unwrap_err();
+    let error = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 100 usdc to eth on ethereum",
+    )
+    .unwrap_err();
     assert!(error.contains("router"), "{error}");
     assert_eq!(host.stage_count, 0);
 }
@@ -1764,7 +1819,12 @@ fn default_venue_rejects_noncanonical_router() {
 #[test]
 fn venue_disable_is_rechecked_before_staging() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
-    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 100 usdc to eth").unwrap();
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 100 usdc to eth on ethereum",
+    )
+    .unwrap();
     crate::policy::write_venue_config(&mut host, "test-wallet", b"[defi]\nenabled = false\n")
         .unwrap();
     let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
@@ -1841,8 +1901,12 @@ fn quoted_session(delay_ms: u64) -> (MockHost, String) {
         "3000000000",
         DEFAULT_ROUTER,
     ));
-    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 1.0 eth to usdc")
-        .expect("create should succeed");
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 1.0 eth to usdc on ethereum",
+    )
+    .expect("create should succeed");
     host.now += delay_ms;
     (host, id)
 }

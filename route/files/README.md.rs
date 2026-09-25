@@ -23,7 +23,8 @@ disables swaps. Existing saved restrictions take precedence over defaults.
 ```json
  write: /petals/enso/intents/<wallet>/new
  example: {"intent":"swap 100 usdc to eth","chain":"ethereum"}
- or just NL text: swap 100 usdc to eth
+ or just NL text: swap 100 usdc to eth on ethereum
+ The source chain is required: set "chain" or end the text with `on <chain>`.
 ```
 
 ### 2. Inspect the plan
