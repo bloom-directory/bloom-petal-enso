@@ -85,4 +85,4 @@ jobs:
           "$bloom_bin" --home "$home" petals build .
           "$bloom_bin" --home "$home" petal install .
           "$bloom_bin" --home "$home" vfs cat /petals/enso/meta/route-contract.json | grep -Fq '"name": "enso"'
-          "$bloom_bin" --home "$home" vfs cat /petals/enso/README.md | grep -Fq '/petals/enso/intents/'
+          "$bloom_bin" --home "$home" vfs cat /petals/enso/README.md | grep -Fq '/petals/enso/wallets/<wallet>/<account>/intents/'
