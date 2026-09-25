@@ -41,6 +41,16 @@ disables swaps. Existing saved restrictions take precedence over defaults.
  body: confirm
 ```
 
+Bloom refuses an Enso quote older than five minutes on every outbox
+confirm, including the one after the owner's approval. When the stored
+quote is older than 30 seconds, this confirm fetches a fresh one and stages
+it only if it keeps the reviewed router and native value and quotes at least
+the reviewed output less its slippage. Otherwise nothing is staged and
+`status.json` `last_error` says why: abandon the intent and create a new one.
+Confirm the outbox entry promptly after staging. `status.json` `quote` gives
+`expires_at_ms`; once a staged, unsent quote expires, `last_error` says to
+cancel that outbox entry and create a new intent. Retrying cannot help.
+
 ### 4. Verify settlement
 ```json
  read: /petals/enso/intents/<wallet>/<session>/settlement.json
@@ -53,6 +63,7 @@ disables swaps. Existing saved restrictions take precedence over defaults.
 - Enso-owned venue preferences are enforced at create and confirm
 - Bloom wallet policy and approval limits remain host-enforced
 - Simulation must pass before the route transaction is staged
+- An aged quote is refreshed at staging only within the reviewed bounds
 - ERC-20 approval is exact-amount and must succeed before a second confirm
 - Same-chain ERC-20 settlement requires an attributable receipt Transfer
 - Native and cross-chain balance changes are reported as unattributed

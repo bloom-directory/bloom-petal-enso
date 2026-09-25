@@ -814,41 +814,8 @@ fn confirm_locked<H: Host>(
     // Re-read the current Enso venue preferences at the last possible moment.
     // The outbox host independently enforces authoritative wallet policy.
     let needs_approve = sess.intents.iter().any(|i| i.label == "approve");
-    let cross_chain = sess
-        .destination_chain
-        .as_deref()
-        .map(|d| !d.eq_ignore_ascii_case(&sess.chain))
-        .unwrap_or(false);
-    let destination_chain = sess.destination_chain.as_deref().unwrap_or(&sess.chain);
-    let receiver_class = sess.receiver_class.as_deref().unwrap_or("unknown");
-    let receiver = req
-        .receiver
-        .map(|address| format!("0x{address:x}"))
-        .unwrap_or_else(|| sess.wallet_address.clone());
-    let token_out = format!("0x{:x}", req.token_out);
     let router = format!("0x{:x}", route.tx.to);
-    let protocols = route.protocols();
-    let verified_policy = crate::policy::load_venue_config(host, wallet)?;
-    sess.policy_checks = crate::policy::evaluate(
-        &verified_policy,
-        &crate::policy::RoutePolicyContext {
-            source_chain: &sess.chain,
-            destination_chain,
-            cross_chain,
-            receiver: &receiver,
-            token_out: &token_out,
-            receiver_class,
-            router: &router,
-            protocols: &protocols.0,
-            protocols_unknown: protocols.1,
-            native_value_wei: route.tx.value,
-            slippage_bps: req.slippage_bps,
-            route_verified: true,
-            receiver_verified: false,
-            min_out_enforced: false,
-            needs_approve,
-        },
-    );
+    sess.policy_checks = route_policy_checks(host, wallet, &sess, &req, &route, needs_approve)?;
     if let Some(reason) = crate::policy::deny_reason(&sess.policy_checks) {
         sess.last_error = Some(reason.clone());
         save(host, &sess)?;
@@ -953,6 +920,29 @@ fn confirm_locked<H: Host>(
         save(host, &sess)?;
     }
 
+    // Bloom refuses an Enso quote older than five minutes on every confirm,
+    // including the one after the owner's approval ceremony. Replace an aged
+    // quote now so that window starts at staging, within the reviewed bounds.
+    let route = if crate::quote::needs_refresh(&route, now) {
+        match refresh_route_quote(host, wallet, &sess, &req, &route, needs_approve, now) {
+            Ok((refreshed, fresh)) => {
+                sess = refreshed;
+                save(host, &sess)?;
+                fresh
+            }
+            Err(reason) => {
+                let reason =
+                    format!("{reason}; abandon this intent and create a new one for a fresh route");
+                sess.last_error = Some(reason.clone());
+                save(host, &sess)?;
+                return Err(reason);
+            }
+        }
+    } else {
+        route
+    };
+    let intents = sess.intents.clone();
+
     // Re-simulate with current chain state immediately before staging the
     // executable route.
     let simulation = crate::simulation::simulate_route_response(host, &sess.chain, &route);
@@ -1007,9 +997,101 @@ fn confirm_locked<H: Host>(
         sess.staged_ids.push(staged.outbox_id);
     }
 
+    sess.last_error = None;
     sess.transition(now, "staged", "route staged into outbox");
     save(host, &sess)?;
     Ok(())
+}
+
+/// Evaluate the wallet's Enso venue preferences for one route.
+fn route_policy_checks<H: Host>(
+    host: &mut H,
+    wallet: &str,
+    sess: &Session,
+    req: &RouteRequest,
+    route: &RouteResponse,
+    needs_approve: bool,
+) -> Result<serde_json::Value, String> {
+    let cross_chain = sess
+        .destination_chain
+        .as_deref()
+        .map(|d| !d.eq_ignore_ascii_case(&sess.chain))
+        .unwrap_or(false);
+    let destination_chain = sess.destination_chain.as_deref().unwrap_or(&sess.chain);
+    let receiver_class = sess.receiver_class.as_deref().unwrap_or("unknown");
+    let receiver = req
+        .receiver
+        .map(|address| format!("0x{address:x}"))
+        .unwrap_or_else(|| sess.wallet_address.clone());
+    let token_out = format!("0x{:x}", req.token_out);
+    let router = format!("0x{:x}", route.tx.to);
+    let protocols = route.protocols();
+    let verified_policy = crate::policy::load_venue_config(host, wallet)?;
+    Ok(crate::policy::evaluate(
+        &verified_policy,
+        &crate::policy::RoutePolicyContext {
+            source_chain: &sess.chain,
+            destination_chain,
+            cross_chain,
+            receiver: &receiver,
+            token_out: &token_out,
+            receiver_class,
+            router: &router,
+            protocols: &protocols.0,
+            protocols_unknown: protocols.1,
+            native_value_wei: route.tx.value,
+            slippage_bps: req.slippage_bps,
+            route_verified: true,
+            receiver_verified: false,
+            min_out_enforced: false,
+            needs_approve,
+        },
+    ))
+}
+
+/// Fetch a fresh Enso quote for the stored request and return the session
+/// rewritten to it. The fresh route must stay within the reviewed bounds
+/// (request, router, native value, minimum output) and pass the venue
+/// preferences again; otherwise nothing changes.
+fn refresh_route_quote<H: Host>(
+    host: &mut H,
+    wallet: &str,
+    sess: &Session,
+    req: &RouteRequest,
+    reviewed: &RouteResponse,
+    needs_approve: bool,
+    now: u64,
+) -> Result<(Session, RouteResponse), String> {
+    let api_key = resolve_api_key(host)?;
+    let fresh = api::route(host, &api_key, req)
+        .map_err(|error| format!("cannot refresh the Enso quote before staging: {error}"))?;
+    crate::quote::verify_refreshed(reviewed, &fresh, req)?;
+    let policy_checks = route_policy_checks(host, wallet, sess, req, &fresh, needs_approve)?;
+    if let Some(reason) = crate::policy::deny_reason(&policy_checks) {
+        return Err(format!(
+            "the refreshed Enso route fails venue policy: {reason}"
+        ));
+    }
+    let mut refreshed = sess.clone();
+    let route_intent = refreshed
+        .intents
+        .last_mut()
+        .filter(|intent| intent.label == "route")
+        .ok_or("session route intent is missing or out of order")?;
+    route_intent.data_hex = format!("0x{}", hex::encode(&fresh.tx.data));
+    refreshed.route = Some(fresh.clone());
+    refreshed.policy_checks = policy_checks;
+    verify_prepared_intents(&refreshed, req, &fresh)?;
+    let state = refreshed.state.clone();
+    refreshed.transition(
+        now,
+        &state,
+        &format!(
+            "Enso quote refreshed before staging: quoted output {} (reviewed {})",
+            fresh.amount_out, reviewed.amount_out
+        ),
+    );
+    Ok((refreshed, fresh))
 }
 
 // ---------------------------------------------------------------------------

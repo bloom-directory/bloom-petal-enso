@@ -37,6 +37,10 @@ struct MockHost {
     stage_count: usize,
     /// Counter for random() to produce unique session IDs.
     rand_counter: u8,
+    /// Number of Enso route requests served.
+    enso_calls: usize,
+    /// Calldata of every staged transaction, in staging order.
+    staged_data: Vec<String>,
 }
 
 impl MockHost {
@@ -101,6 +105,8 @@ require_calldata_verification = false
             stage_fail_after: None,
             stage_count: 0,
             rand_counter: 0,
+            enso_calls: 0,
+            staged_data: Vec::new(),
         }
     }
 
@@ -186,6 +192,7 @@ impl Host for MockHost {
         if req.url.contains("api.enso.finance")
             && let Some(ref body) = self.enso_response
         {
+            self.enso_calls += 1;
             return Ok(HttpResponse {
                 status: self.enso_status,
                 headers: vec![],
@@ -268,6 +275,7 @@ impl Host for MockHost {
             return Err("simulated staging failure".into());
         }
         self.tx_counter += 1;
+        self.staged_data.push(tx.data_hex.clone());
         let id = format!("outbox-{}", self.tx_counter);
         let staged = StagedTransaction {
             outbox_id: id.clone(),
@@ -1772,4 +1780,158 @@ fn malformed_saved_venue_configuration_does_not_use_enabled_defaults() {
         b"invalid toml".to_vec(),
     );
     assert!(crate::policy::load_venue_config(&mut host, "test-wallet").is_err());
+}
+
+// ===========================================================================
+// TEST: quote freshness at staging
+// ===========================================================================
+
+const DEFAULT_ROUTER: &str = "0x1234567890abcdef1234567890abcdef12345678";
+
+/// A native 1 ETH route whose Router V2 action bytes carry Enso's quote
+/// metadata, as live Enso calldata does.
+fn build_enso_response_native_quoted(
+    quoted_at_secs: u64,
+    amount_out: &str,
+    router: &str,
+) -> Vec<u8> {
+    use alloy::primitives::U256;
+    use alloy::sol_types::{SolCall, SolValue};
+
+    let amount_in = U256::from(1_000_000_000_000_000_000u128);
+    let token = crate::api_types::IEnsoRouter::Token {
+        tokenType: 0,
+        data: (amount_in,).abi_encode_params().into(),
+    };
+    let metadata = format!(
+        r#"{{"Source":"Enso-test","AmountOut":"{amount_out}","Timestamp":{quoted_at_secs}}}"#
+    );
+    let route_data = crate::api_types::IEnsoRouter::routeSingleCall {
+        tokenIn: token,
+        data: metadata.into_bytes().into(),
+    }
+    .abi_encode();
+    let body = serde_json::json!({
+        "tx": {
+            "to": router,
+            "data": format!("0x{}", hex::encode(&route_data)),
+            "value": "1000000000000000000",
+            "from": "0x742d35cc6634c0532925a3b844bc9e7595f0beb1",
+        },
+        "amountOut": amount_out,
+        "gas": "120000",
+        "route": [{"protocol": "uniswap-v3"}],
+        "priceImpact": 0.3
+    });
+    serde_json::to_vec(&body).unwrap()
+}
+
+fn load_session(host: &mut MockHost, id: &str) -> crate::session::Session {
+    let raw = host
+        .get(&crate::session::key("test-wallet", id), 2 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    serde_json::from_slice(&raw).unwrap()
+}
+
+/// Create a native swap quoted at t=1000s, then let `delay_ms` pass.
+fn quoted_session(delay_ms: u64) -> (MockHost, String) {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_native_quoted(
+        1_000,
+        "3000000000",
+        DEFAULT_ROUTER,
+    ));
+    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 1.0 eth to usdc")
+        .expect("create should succeed");
+    host.now += delay_ms;
+    (host, id)
+}
+
+#[test]
+fn fresh_quote_is_staged_without_requoting() {
+    let (mut host, id) = quoted_session(10_000);
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    assert_eq!(host.enso_calls, 1);
+    let sess = load_session(&mut host, &id);
+    assert_eq!(sess.state, "staged");
+    assert_eq!(
+        crate::quote::quoted_at_secs(
+            &hex::decode(host.staged_data[0].trim_start_matches("0x")).unwrap()
+        ),
+        Some(1_000)
+    );
+}
+
+#[test]
+fn aged_quote_is_refreshed_before_staging_within_reviewed_bounds() {
+    // Quoted at 1000s, staged two minutes later: a policy ceremony in between
+    // would otherwise leave Bloom less than three minutes for the approval.
+    let (mut host, id) = quoted_session(120_000);
+    // A slightly lower fresh quote is still inside the 0.5% slippage the
+    // owner reviewed (minimum 2,985,000,000).
+    host.enso_response = Some(build_enso_response_native_quoted(
+        1_120,
+        "2990000000",
+        DEFAULT_ROUTER,
+    ));
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    assert_eq!(host.enso_calls, 2);
+
+    let sess = load_session(&mut host, &id);
+    assert_eq!(sess.state, "staged");
+    assert_eq!(sess.last_error, None);
+    assert_eq!(sess.route.as_ref().unwrap().amount_out, "2990000000");
+    assert!(
+        sess.history
+            .iter()
+            .any(|entry| entry.reason.contains("Enso quote refreshed before staging"))
+    );
+    assert_eq!(
+        crate::quote::quoted_at_secs(
+            &hex::decode(host.staged_data[0].trim_start_matches("0x")).unwrap()
+        ),
+        Some(1_120),
+        "the staged transaction must carry the fresh quote"
+    );
+    let view = crate::quote::status_view(sess.route.as_ref().unwrap(), 1_120_000).unwrap();
+    assert_eq!(view["expires_at_ms"], 1_420_000);
+    assert_eq!(view["expired"], false);
+}
+
+#[test]
+fn refreshed_quote_outside_reviewed_bounds_is_refused_and_reported() {
+    for (fresh, expected) in [
+        (
+            build_enso_response_native_quoted(1_120, "2984999999", DEFAULT_ROUTER),
+            "below the reviewed minimum output",
+        ),
+        (
+            build_enso_response_native_quoted(
+                1_120,
+                "3000000000",
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            ),
+            "instead of the reviewed",
+        ),
+    ] {
+        let (mut host, id) = quoted_session(120_000);
+        host.enso_response = Some(fresh);
+        let error =
+            crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+        assert!(error.contains(expected), "{error}");
+        assert!(error.contains("create a new one"), "{error}");
+        assert!(host.staged.is_empty(), "nothing may be staged");
+
+        let sess = load_session(&mut host, &id);
+        assert_eq!(sess.state, "prepared");
+        assert_eq!(sess.last_error.as_deref(), Some(error.as_str()));
+        assert_eq!(sess.route.as_ref().unwrap().amount_out, "3000000000");
+    }
+}
+
+#[test]
+fn expired_staged_quote_error_names_the_outbox_entry_and_next_step() {
+    let message = crate::quote::expired_staged_error("0002-63206");
+    assert!(message.contains("0002-63206"));
+    assert!(message.contains("create a new intent"));
 }
