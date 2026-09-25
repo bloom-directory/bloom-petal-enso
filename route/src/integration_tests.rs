@@ -1061,7 +1061,7 @@ fn simulation_failure_rejects_session() {
     let body = br#"swap 100.0 usdc to eth on ethereum"#;
     let error = crate::workflow::create(&mut host, "test-wallet", body)
         .expect_err("create must reject a failed simulation");
-    assert!(error.contains("simulation failed"), "{error}");
+    assert!(error.message().contains("simulation failed"), "{error}");
     assert!(
         !host.store.keys().any(|key| key.ends_with("/session.json")),
         "failed simulations must not leave a stage-eligible session"
@@ -1187,7 +1187,7 @@ fn create_rejects_route_with_mismatched_token() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
-        err.contains("does not match"),
+        err.message().contains("does not match"),
         "should reject mismatched token: {err}"
     );
 }
@@ -1204,7 +1204,7 @@ fn create_rejects_route_with_mismatched_amount() {
     let result = crate::workflow::create(&mut host, "test-wallet", body);
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("does not match"));
+    assert!(result.unwrap_err().message().contains("does not match"));
 }
 
 // ===========================================================================
@@ -1219,7 +1219,7 @@ fn create_rejects_native_route_with_wrong_value() {
     let result = crate::workflow::create(&mut host, "test-wallet", body);
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("does not match"));
+    assert!(result.unwrap_err().message().contains("does not match"));
 }
 
 // ===========================================================================
@@ -1235,7 +1235,7 @@ fn enso_api_error_propagates() {
     let result = crate::workflow::create(&mut host, "test-wallet", body);
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("status 500"));
+    assert!(result.unwrap_err().message().contains("status 500"));
 }
 
 // ===========================================================================
@@ -1445,7 +1445,9 @@ fn slippage_above_venue_configuration_is_rejected() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
     let body = br#"{"intent":"swap 100.0 usdc to eth","chain":"ethereum","slippage_bps":200}"#;
-    let error = crate::workflow::create(&mut host, "test-wallet", body).unwrap_err();
+    let error = crate::workflow::create(&mut host, "test-wallet", body)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("max_slippage"), "{error}");
 }
 
@@ -1465,7 +1467,9 @@ fn omitted_mev_section_keeps_the_default_slippage_ceiling() {
     );
 
     let body = br#"{"intent":"swap 100.0 usdc to eth","chain":"ethereum","slippage_bps":200}"#;
-    let error = crate::workflow::create(&mut host, "test-wallet", body).unwrap_err();
+    let error = crate::workflow::create(&mut host, "test-wallet", body)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("max_slippage"), "{error}");
 }
 
@@ -1578,7 +1582,9 @@ fn invalid_wallet_name_rejected() {
 fn oversized_intent_body_is_rejected_before_external_work() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
     let body = vec![b'a'; crate::input::MAX_NEW_BODY_BYTES + 1];
-    let error = crate::workflow::create(&mut host, "test-wallet", &body).unwrap_err();
+    let error = crate::workflow::create(&mut host, "test-wallet", &body)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("intent body"), "{error}");
     assert_eq!(host.stage_count, 0);
 }
@@ -1681,7 +1687,9 @@ fn create_rejects_mismatched_destination_metadata() {
         "chain":"ethereum",
         "destination_chain":"base"
     }"#;
-    let error = crate::workflow::create(&mut host, "test-wallet", body).unwrap_err();
+    let error = crate::workflow::create(&mut host, "test-wallet", body)
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("destination chain"), "{error}");
 }
 
@@ -1778,7 +1786,7 @@ fn unknown_token_symbol_rejected() {
         b"swap 100.0 nonexistenttoken to eth on ethereum",
     );
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("could not resolve"));
+    assert!(result.unwrap_err().message().contains("could not resolve"));
 }
 
 #[test]
@@ -1811,7 +1819,8 @@ fn default_venue_rejects_noncanonical_router() {
         "test-wallet",
         b"swap 100 usdc to eth on ethereum",
     )
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("router"), "{error}");
     assert_eq!(host.stage_count, 0);
 }
@@ -1998,4 +2007,49 @@ fn expired_staged_quote_error_names_the_outbox_entry_and_next_step() {
     let message = crate::quote::expired_staged_error("0002-63206");
     assert!(message.contains("0002-63206"));
     assert!(message.contains("create a new intent"));
+}
+
+// ===========================================================================
+// TEST: create separates input mistakes from backend failures
+// ===========================================================================
+
+#[test]
+fn create_reports_input_mistakes_as_invalid_input() {
+    use crate::workflow::CreateError;
+
+    for (body, expected) in [
+        (&b"swap 1.0 eth to usdc"[..], "name the source chain"),
+        (
+            &br#"{"intent":"swap 1.0 eth to usdc"}"#[..],
+            "name the source chain",
+        ),
+        (
+            &b"swap usdc to eth on ethereum"[..],
+            "could not parse intent",
+        ),
+        (
+            &b"swap 1.0 notatoken to usdc on ethereum"[..],
+            "could not resolve token symbol",
+        ),
+    ] {
+        let mut host = MockHost::new().with_enso_response(build_enso_response_native());
+        match crate::workflow::create(&mut host, "test-wallet", body) {
+            Err(CreateError::InvalidInput(message)) => {
+                assert!(message.contains(expected), "{message}");
+            }
+            other => panic!(
+                "{:?} must be invalid input, got {other:?}",
+                String::from_utf8_lossy(body)
+            ),
+        }
+        assert_eq!(host.enso_calls, 0, "input mistakes must not reach Enso");
+    }
+
+    // A well-formed intent that fails downstream is a backend failure.
+    let mut host = MockHost::new().with_enso_response(build_enso_response_native());
+    host.eth_call_success = false;
+    assert!(matches!(
+        crate::workflow::create(&mut host, "test-wallet", b"swap 1.0 eth to usdc on ethereum"),
+        Err(CreateError::Failed(message)) if message.contains("simulation failed")
+    ));
 }

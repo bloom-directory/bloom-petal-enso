@@ -378,29 +378,67 @@ fn render_plan_md(view: PlanView<'_>) -> String {
 // create — route discovery + session creation
 // ---------------------------------------------------------------------------
 
-pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String, String> {
+/// Why `new` refused an intent. Input mistakes surface as invalid input
+/// (EINVAL on the mount); everything else, such as Enso, RPC, simulation or
+/// policy failures, surfaces as a backend failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateError {
+    InvalidInput(String),
+    Failed(String),
+}
+
+impl CreateError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::InvalidInput(message) | Self::Failed(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for CreateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl From<String> for CreateError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for CreateError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_owned())
+    }
+}
+
+pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String, CreateError> {
     let now = host.now_ms();
-    let parsed = input::parse_new_body(body)?;
+    let parsed = input::parse_new_body(body).map_err(CreateError::InvalidInput)?;
     let address = wallet_address(host, wallet)?;
     let api_key = resolve_api_key(host)?;
 
     // Determine source chain. It must be named: a guessed chain would quote
     // the swap on a network the caller never chose.
     let nat = input::parse_natural_intent(&parsed.intent).ok_or_else(|| {
-        format!(
+        CreateError::InvalidInput(format!(
             "could not parse intent '{}' (expected `swap <amount> <tok> to <tok> on <chain>`)",
             parsed.intent
-        )
+        ))
     })?;
     let chain_name = parsed
         .chain
         .as_deref()
         .or(nat.chain.as_deref())
-        .ok_or(
-            "name the source chain: add \"chain\" to the JSON body \
-             (for example {\"intent\":\"swap 0.003 ETH to USDC\",\"chain\":\"base\"}) \
-             or end the intent with `on <chain>`",
-        )?
+        .ok_or_else(|| {
+            CreateError::InvalidInput(
+                "name the source chain: add \"chain\" to the JSON body \
+                 (for example {\"intent\":\"swap 0.003 ETH to USDC\",\"chain\":\"base\"}) \
+                 or end the intent with `on <chain>`"
+                    .into(),
+            )
+        })?
         .to_ascii_lowercase();
 
     // Resolve the configured RPC and prove that it is the requested chain.
@@ -409,8 +447,9 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
         .map_err(|e| format!("cannot verify source chain {chain_name}: {e}"))?;
 
     // Resolve token_in on source chain.
-    let token_in = input::resolve_token_symbol(chain_id, &nat.token_in)
-        .ok_or_else(|| format!("could not resolve token symbol: {}", nat.token_in))?;
+    let token_in = input::resolve_token_symbol(chain_id, &nat.token_in).ok_or_else(|| {
+        CreateError::InvalidInput(format!("could not resolve token symbol: {}", nat.token_in))
+    })?;
 
     // Determine destination chain.
     let destination_chain = parsed
@@ -430,8 +469,9 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
     // Resolve token_out — on destination chain if cross-chain, else source.
     let token_out = {
         let resolve_chain_id = dest_chain_id.unwrap_or(chain_id);
-        input::resolve_token_symbol(resolve_chain_id, &nat.token_out)
-            .ok_or_else(|| format!("could not resolve token symbol: {}", nat.token_out))?
+        input::resolve_token_symbol(resolve_chain_id, &nat.token_out).ok_or_else(|| {
+            CreateError::InvalidInput(format!("could not resolve token symbol: {}", nat.token_out))
+        })?
     };
 
     // Resolve decimals for token_in.
@@ -446,7 +486,7 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
     };
 
     // Parse amount with correct decimals.
-    let amount_raw = parse_amount(&nat.amount, decimals)?;
+    let amount_raw = parse_amount(&nat.amount, decimals).map_err(CreateError::InvalidInput)?;
 
     let from_address: Address = address
         .parse()
@@ -474,7 +514,7 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
     if let Some(ref recv) = parsed.receiver {
         let addr = recv
             .parse::<Address>()
-            .map_err(|_| format!("invalid receiver address: {recv}"))?;
+            .map_err(|_| CreateError::InvalidInput(format!("invalid receiver address: {recv}")))?;
         route_req.receiver = Some(addr);
     }
 
@@ -571,7 +611,7 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
         },
     );
     if let Some(reason) = crate::policy::deny_reason(&policy_checks) {
-        return Err(reason);
+        return Err(reason.into());
     }
 
     // A route that already has allowance must simulate successfully. When an
@@ -589,10 +629,10 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
             .and_then(|value| value.as_bool())
             .unwrap_or(false)
         {
-            return Err(format!(
+            return Err(CreateError::Failed(format!(
                 "route simulation failed: {}",
                 crate::simulation::failure_message(&result)
-            ));
+            )));
         }
         result
     };
