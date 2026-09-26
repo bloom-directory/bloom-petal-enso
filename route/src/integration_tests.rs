@@ -423,10 +423,15 @@ fn build_enso_response_erc20() -> Vec<u8> {
 
 /// Build a valid Enso route response for native ETH swap.
 fn build_enso_response_native() -> Vec<u8> {
+    build_enso_response_native_amount(1_000_000_000_000_000_000u128) // 1.0 ETH
+}
+
+/// Build a native-ETH route response spending `wei`.
+fn build_enso_response_native_amount(wei: u128) -> Vec<u8> {
     use alloy::primitives::{Address, U256};
     use alloy::sol_types::{SolCall, SolValue};
 
-    let amount_in = U256::from(1_000_000_000_000_000_000u128); // 1.0 ETH
+    let amount_in = U256::from(wei);
 
     let token_data = (amount_in,).abi_encode_params();
     let token = crate::api_types::IEnsoRouter::Token {
@@ -451,7 +456,7 @@ fn build_enso_response_native() -> Vec<u8> {
         "tx": {
             "to": format!("0x{:x}", router),
             "data": format!("0x{}", hex::encode(&route_data)),
-            "value": "1000000000000000000",
+            "value": wei.to_string(),
             "from": format!("0x{:x}", from),
         },
         "amountOut": "3000000000",
@@ -934,6 +939,39 @@ fn native_eth_swap_has_correct_value() {
     let route_intent = &sess.intents[0];
     assert_eq!(route_intent.label, "route");
     assert_eq!(route_intent.value_wei, "1000000000000000000");
+}
+
+// ===========================================================================
+// TEST: native ETH → cbBTC on Base resolves through the static registry
+// ===========================================================================
+
+#[test]
+fn native_eth_to_cbbtc_on_base_resolves() {
+    let mut host = MockHost::new()
+        .with_enso_response(build_enso_response_native_amount(1_000_000_000_000_000));
+
+    let body = br#"swap 0.001 ETH to cbBTC on base"#;
+    let id = crate::workflow::create(&mut host, "test-wallet", body)
+        .expect("cbBTC on base should resolve");
+
+    let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(sess.chain, "base");
+    let req = sess.route_request.as_ref().unwrap();
+    assert_eq!(req.chain_id, 8453);
+    assert_eq!(
+        req.token_in,
+        crate::api_types::NATIVE_TOKEN
+            .parse::<alloy::primitives::Address>()
+            .unwrap()
+    );
+    assert_eq!(
+        req.token_out,
+        "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"
+            .parse::<alloy::primitives::Address>()
+            .unwrap()
+    );
+    assert_eq!(req.amount_in.to_string(), "1000000000000000");
+    assert_eq!(sess.intents[0].value_wei, "1000000000000000");
 }
 
 // ===========================================================================

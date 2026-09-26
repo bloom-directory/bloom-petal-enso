@@ -482,7 +482,9 @@ pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String
         host.erc20_decimals(&chain_name, &token_in_hex)
             .map_err(|e| format!("cannot read token decimals: {e}"))?
     } else {
-        input::decimals_for_symbol(chain_id, &nat.token_in)
+        input::decimals_for_symbol(chain_id, &nat.token_in).ok_or_else(|| {
+            CreateError::InvalidInput(format!("unknown decimals for token: {}", nat.token_in))
+        })?
     };
 
     // Parse amount with correct decimals.
