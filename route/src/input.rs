@@ -2,9 +2,9 @@
 //!
 //! This module owns the static token symbol table for the enso petal. In the
 //! original bloom monorepo this registry came from `bloom_proto::tokens`; here
-//! we keep a curated, hand-verified table covering the major tokens across the
-//! seven supported chains. Addresses are checksum-agnostic — `alloy` accepts
-//! lowercase hex and normalizes on parse.
+//! we keep a curated, hand-verified table covering the most traded tokens on
+//! each of Bloom's default EVM chains except Arc. Addresses are
+//! checksum-agnostic — `alloy` accepts lowercase hex and normalizes on parse.
 
 use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
@@ -115,14 +115,22 @@ pub fn parse_natural_intent(input: &str) -> Option<NaturalIntent> {
 /// token on Polygon but to the bridged MATIC ERC-20 on Ethereum.
 fn is_native_alias(chain_id: u64, upper: &str) -> bool {
     match chain_id {
-        // Ethereum and the EVM-equivalent L2s use ETH as gas.
-        1 | 8453 | 10 | 42161 => matches!(upper, "ETH" | "ETHER" | "NATIVE"),
+        // Ethereum and the L2s that use ETH as gas: Base, Optimism, Arbitrum,
+        // Linea and Robinhood Chain.
+        1 | 8453 | 10 | 42161 | 59144 | 4663 => matches!(upper, "ETH" | "ETHER" | "NATIVE"),
         // Polygon.
         137 => matches!(upper, "MATIC" | "POL" | "NATIVE"),
         // BNB Chain.
         56 => matches!(upper, "BNB" | "NATIVE"),
         // Avalanche.
         43114 => matches!(upper, "AVAX" | "NATIVE"),
+        // Gnosis.
+        100 => matches!(upper, "XDAI" | "NATIVE"),
+        // HyperEVM.
+        999 => matches!(upper, "HYPE" | "NATIVE"),
+        // Tempo (4217) has no native gas token: fees are paid in TIP-20
+        // stablecoins and `eth_getBalance` returns a 0x4242… placeholder, so no
+        // symbol aliases the native token there.
         _ => matches!(upper, "NATIVE"),
     }
 }
@@ -252,6 +260,9 @@ const TOKENS: &[TokenEntry] = &[
     tok(56, "WETH", "0x2170ed0880ac9a755fd29b2688956bd959f933f8", 18),
     tok(56, "CAKE", "0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82", 18),
     tok(56, "BUSD", "0xe9e7cea3dedca5984780bafc599bd69add087d56", 18),
+    tok(56, "WBNB", "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", 18),
+    // BTCB is Binance-Peg BTC and reports 18 decimals, not 8.
+    tok(56, "BTCB", "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c", 18),
     // ── Avalanche (chain 43114) ───────────────────────────────────────────
     tok(43114, "USDC", "0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e", 6),
     tok(43114, "USDT", "0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7", 6),
@@ -261,6 +272,56 @@ const TOKENS: &[TokenEntry] = &[
     tok(43114, "WAVAX", "0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7", 18),
     tok(43114, "WETH", "0x49d5c2bdffac6ce2bfdb6640f4f80f226bc10bab", 18),
     tok(43114, "LINK", "0x5947bb275c521040051d82396192181b413227a3", 18),
+    // ── Gnosis (chain 100) ────────────────────────────────────────────────
+    tok(100, "WXDAI", "0xe91d153e0b41518a2ce8dd3d7944fa863463a97d", 18),
+    // USDC is USDC.e, Circle's Bridged USDC Standard token that the Gnosis
+    // Bridge mints by default. The legacy Omnibridge USDC is not listed.
+    tok(100, "USDC", "0x2a22f9c3b484c3629090feed35f17ff8f88f76f0", 6),
+    // USDT, WETH and wstETH are the Omnibridge tokens from Ethereum.
+    tok(100, "USDT", "0x4ecaba5870353805a9f068101a40e0f32ed605c6", 6),
+    tok(100, "WETH", "0x6a023ccd1ff6f2045c3309768ead9e68f978f6e1", 18),
+    tok(100, "WSTETH", "0x6c76971f98945ae98dd7d4dfca8711ebea946ea6", 18),
+    tok(100, "GNO", "0x9c58bacc331c9aa871afd802db6379a98e80cedb", 18),
+    tok(100, "SDAI", "0xaf204776c7245bf4147c2612bf6e5972ee483701", 18),
+    tok(100, "EURE", "0x420ca0f9b9b604ce0fd9c18ef134c705e5fa3430", 18),
+    // ── Linea (chain 59144) ───────────────────────────────────────────────
+    tok(59144, "WETH", "0xe5d7c2a44ffddf6b295a15c148167daaaf5cf34f", 18),
+    tok(59144, "USDC", "0x176211869ca2b568f2a7d4ee941e073a821ee1ff", 6),
+    // USDT, WBTC and DAI are Linea canonical-bridge tokens from Ethereum.
+    tok(59144, "USDT", "0xa219439258ca9da29e9cc4ce5596924745e12b93", 6),
+    tok(59144, "WBTC", "0x3aab2285ddcddad8edf438c1bab47e1a9d05a9b4", 8),
+    tok(59144, "DAI", "0x4af15ec2a0bd43db75dd04e62faa3b8ef36b00d5", 18),
+    tok(59144, "WSTETH", "0xb5bedd42000b71fdde22d3ee8a79bd49a568fc8f", 18),
+    tok(59144, "LINEA", "0x1789e0043623282d5dcc7f213d703c6d8bafbb04", 18),
+    tok(59144, "MUSD", "0xaca92e438df0b2401ff60da7e4337b687a2435da", 6),
+    // ── HyperEVM (chain 999) ──────────────────────────────────────────────
+    tok(999, "WHYPE", "0x5555555555555555555555555555555555555555", 18),
+    tok(999, "USDC", "0xb88339cb7199b77e23db6e890353e22632ba630f", 6),
+    // USDT0 (on-chain symbol `USD₮0`) is the omnichain USDT deployment on
+    // HyperEVM; both symbols name it.
+    tok(999, "USDT0", "0xb8ce59fc3717ada4c02eadf9682a9e934f625ebb", 6),
+    tok(999, "USDT", "0xb8ce59fc3717ada4c02eadf9682a9e934f625ebb", 6),
+    // UBTC and UETH are Unit's bridged BTC and ETH.
+    tok(999, "UBTC", "0x9fdbda0a5e284c32744d2f17ee5c74b284993463", 8),
+    tok(999, "UETH", "0xbe6727b535545c67d5caa73dea54865b92cf7907", 18),
+    // ── Tempo (chain 4217) ────────────────────────────────────────────────
+    // TIP-20 stablecoins are all 6-decimal. USDC and EURC are the Stargate
+    // bridged USDC.e and EURC.e, the only USDC and EURC in Tempo's token list.
+    tok(4217, "PATHUSD", "0x20c0000000000000000000000000000000000000", 6),
+    tok(4217, "USDC", "0x20c000000000000000000000b9537d11c60e8b50", 6),
+    tok(4217, "USDT0", "0x20c00000000000000000000014f22ca97301eb73", 6),
+    tok(4217, "USDT", "0x20c00000000000000000000014f22ca97301eb73", 6),
+    tok(4217, "EURC", "0x20c0000000000000000000001621e21f71cf12fb", 6),
+    tok(4217, "CUSD", "0x20c0000000000000000000000520792dcccccccc", 6),
+    // ── Robinhood Chain (chain 4663) ──────────────────────────────────────
+    tok(4663, "WETH", "0x0bd7d308f8e1639fab988df18a8011f41eacad73", 18),
+    tok(4663, "USDG", "0x5fc5360d0400a0fd4f2af552add042d716f1d168", 6),
+    // Robinhood Stock Tokens: plain ERC-20s (not rebasing) whose offer and
+    // sale are restricted in some jurisdictions, including the United States.
+    tok(4663, "NVDA", "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec", 18),
+    tok(4663, "SPCX", "0x4a0e65a3eccec6dbe60ae065f2e7bb85fae35eea", 18),
+    tok(4663, "META", "0xc0d6457c16cc70d6790dd43521c899c87ce02f35", 18),
+    tok(4663, "SPY", "0x117cc2133c37b721f49de2a7a74833232b3b4c0c", 18),
 ];
 
 fn registry_entry(chain_id: u64, upper: &str) -> Option<&'static TokenEntry> {
@@ -271,10 +332,10 @@ fn registry_entry(chain_id: u64, upper: &str) -> Option<&'static TokenEntry> {
 
 /// Resolve a token symbol or address into a concrete [`Address`] for a chain.
 ///
-/// The static registry covers the major tokens across all seven supported
-/// chains (Ethereum, Polygon, Base, Optimism, Arbitrum, BNB Chain, Avalanche).
-/// A bare `0x` address is parsed directly. Native gas-token aliases (ETH, MATIC,
-/// BNB, AVAX) resolve to [`NATIVE_TOKEN`] on their home chain.
+/// The static registry covers the most traded tokens on Bloom's default EVM
+/// chains (all but Arc). A bare `0x` address is parsed directly. Native
+/// gas-token aliases (ETH, MATIC/POL, BNB, AVAX, XDAI, HYPE) resolve to
+/// [`NATIVE_TOKEN`] on their home chain.
 pub fn resolve_token_symbol(chain_id: u64, sym: &str) -> Option<Address> {
     let s = sym.trim();
     if s.starts_with("0x") || s.starts_with("0X") {
@@ -322,13 +383,18 @@ pub fn chain_to_id(name: &str) -> Option<u64> {
         "base" => Some(8453),
         "optimism" | "op" => Some(10),
         "arbitrum" | "arb" => Some(42161),
-        "bnb" | "bsc" => Some(56),
+        "bsc" | "bnb" => Some(56),
         "avalanche" | "avax" => Some(43114),
+        "gnosis" | "xdai" => Some(100),
+        "linea" => Some(59144),
+        "hyperliquid" | "hyperevm" => Some(999),
+        "tempo" => Some(4217),
+        "robinhood" => Some(4663),
         _ => None,
     }
 }
 
-/// Chain ID to the bloom chain name.
+/// Chain ID to the Bloom chain name (the key in Bloom's `[chains]` config).
 pub fn chain_id_to_name(id: u64) -> Option<&'static str> {
     match id {
         1 => Some("ethereum"),
@@ -336,8 +402,13 @@ pub fn chain_id_to_name(id: u64) -> Option<&'static str> {
         8453 => Some("base"),
         10 => Some("optimism"),
         42161 => Some("arbitrum"),
-        56 => Some("bnb"),
+        56 => Some("bsc"),
         43114 => Some("avalanche"),
+        100 => Some("gnosis"),
+        59144 => Some("linea"),
+        999 => Some("hyperliquid"),
+        4217 => Some("tempo"),
+        4663 => Some("robinhood"),
         _ => None,
     }
 }
@@ -719,6 +790,184 @@ mod tests {
             "0x5947BB275c521040051D82396192181b413227A3",
             18,
         ),
+        // Default-chain coverage: BNB Chain, Gnosis, Linea, HyperEVM, Tempo
+        // and Robinhood Chain.
+        (56, "WBNB", "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", 18),
+        (56, "BTCB", "0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c", 18),
+        (
+            100,
+            "WXDAI",
+            "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d",
+            18,
+        ),
+        (100, "USDC", "0x2a22f9c3b484c3629090FeED35F17Ff8F88f76F0", 6),
+        (100, "USDT", "0x4ECaBa5870353805a9F068101A40E0f32ed605C6", 6),
+        (
+            100,
+            "WETH",
+            "0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1",
+            18,
+        ),
+        (
+            100,
+            "wstETH",
+            "0x6C76971f98945AE98dD7d4DFcA8711ebea946eA6",
+            18,
+        ),
+        (100, "GNO", "0x9C58BAcC331c9aa871AFD802DB6379a98e80CEdb", 18),
+        (
+            100,
+            "sDAI",
+            "0xaf204776c7245bF4147c2612BF6e5972Ee483701",
+            18,
+        ),
+        (
+            100,
+            "EURe",
+            "0x420CA0f9B9b604cE0fd9C18EF134C705e5Fa3430",
+            18,
+        ),
+        (
+            59144,
+            "WETH",
+            "0xe5D7C2a44FfDDf6b295A15c148167daaAf5Cf34f",
+            18,
+        ),
+        (
+            59144,
+            "USDC",
+            "0x176211869cA2b568f2A7D4EE941E073a821EE1ff",
+            6,
+        ),
+        (
+            59144,
+            "USDT",
+            "0xA219439258ca9da29E9Cc4cE5596924745e12B93",
+            6,
+        ),
+        (
+            59144,
+            "WBTC",
+            "0x3aAB2285ddcDdaD8edf438C1bAB47e1a9D05a9b4",
+            8,
+        ),
+        (
+            59144,
+            "DAI",
+            "0x4AF15ec2A0BD43Db75dd04E62FAA3B8EF36b00d5",
+            18,
+        ),
+        (
+            59144,
+            "wstETH",
+            "0xB5beDd42000b71FddE22D3eE8a79Bd49A568fC8F",
+            18,
+        ),
+        (
+            59144,
+            "LINEA",
+            "0x1789e0043623282D5DCc7F213d703C6D8BAfBB04",
+            18,
+        ),
+        (
+            59144,
+            "mUSD",
+            "0xacA92E438df0B2401fF60dA7E4337B687a2435DA",
+            6,
+        ),
+        (
+            999,
+            "WHYPE",
+            "0x5555555555555555555555555555555555555555",
+            18,
+        ),
+        (999, "USDC", "0xb88339CB7199b77E23DB6E890353E22632Ba630f", 6),
+        (
+            999,
+            "USDT0",
+            "0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb",
+            6,
+        ),
+        (999, "USDT", "0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb", 6),
+        (999, "UBTC", "0x9FDBdA0A5e284c32744D2f17Ee5c74B284993463", 8),
+        (
+            999,
+            "UETH",
+            "0xBe6727B535545C67d5cAa73dEa54865B92CF7907",
+            18,
+        ),
+        (
+            4217,
+            "pathUSD",
+            "0x20C0000000000000000000000000000000000000",
+            6,
+        ),
+        (
+            4217,
+            "USDC",
+            "0x20C000000000000000000000b9537d11c60E8b50",
+            6,
+        ),
+        (
+            4217,
+            "USDT0",
+            "0x20C00000000000000000000014f22CA97301EB73",
+            6,
+        ),
+        (
+            4217,
+            "USDT",
+            "0x20C00000000000000000000014f22CA97301EB73",
+            6,
+        ),
+        (
+            4217,
+            "EURC",
+            "0x20c0000000000000000000001621e21F71CF12fb",
+            6,
+        ),
+        (
+            4217,
+            "cUSD",
+            "0x20C0000000000000000000000520792DcCccCccC",
+            6,
+        ),
+        (
+            4663,
+            "WETH",
+            "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+            18,
+        ),
+        (
+            4663,
+            "USDG",
+            "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+            6,
+        ),
+        (
+            4663,
+            "NVDA",
+            "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+            18,
+        ),
+        (
+            4663,
+            "SPCX",
+            "0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa",
+            18,
+        ),
+        (
+            4663,
+            "META",
+            "0xc0D6457C16Cc70d6790Dd43521C899C87ce02f35",
+            18,
+        ),
+        (
+            4663,
+            "SPY",
+            "0x117cc2133c37B721F49dE2A7a74833232B3B4C0C",
+            18,
+        ),
     ];
 
     #[test]
@@ -742,7 +991,7 @@ mod tests {
         for chain in [1u64, 8453, 42161] {
             assert!(resolve_token_symbol(chain, "cbBTC").is_some());
         }
-        for chain in [137u64, 10, 56, 43114] {
+        for chain in [137u64, 10, 56, 43114, 100, 59144, 999, 4663] {
             assert!(resolve_token_symbol(chain, "cbBTC").is_none());
         }
     }
@@ -805,9 +1054,104 @@ mod tests {
         assert!(resolve_token_on_chain("ethereum", "NOPE").is_none());
     }
 
+    /// Bloom's default EVM chains as `(bloom chain name, chain id)`, from
+    /// `bloom_proto::config::default_chains()`. Arc (5042) is excluded: its gas
+    /// token is USDC, which is also an ERC-20, and the registry does not model
+    /// a native token that shares a symbol with a registry row.
+    const BLOOM_DEFAULT_CHAINS: &[(&str, u64)] = &[
+        ("ethereum", 1),
+        ("base", 8453),
+        ("tempo", 4217),
+        ("robinhood", 4663),
+        ("arbitrum", 42161),
+        ("optimism", 10),
+        ("polygon", 137),
+        ("bsc", 56),
+        ("avalanche", 43114),
+        ("gnosis", 100),
+        ("linea", 59144),
+        ("hyperliquid", 999),
+    ];
+
+    /// Minimum distinct non-native tokens per default chain.
+    const MIN_TOKENS_PER_CHAIN: usize = 5;
+
+    #[test]
+    fn bloom_chain_names_resolve_to_their_ids() {
+        for &(name, id) in BLOOM_DEFAULT_CHAINS {
+            assert_eq!(chain_to_id(name), Some(id), "{name}");
+            assert_eq!(chain_id_to_name(id), Some(name), "{id}");
+        }
+        // Pre-existing aliases keep working.
+        assert_eq!(chain_to_id("bnb"), Some(56));
+        assert_eq!(chain_to_id("BSC"), Some(56));
+        assert_eq!(chain_to_id("xdai"), Some(100));
+        assert_eq!(chain_to_id("hyperevm"), Some(999));
+        assert_eq!(chain_to_id("arc"), None);
+    }
+
+    #[test]
+    fn every_default_chain_has_common_tokens() {
+        for &(name, id) in BLOOM_DEFAULT_CHAINS {
+            let distinct: std::collections::HashSet<_> = TOKENS
+                .iter()
+                .filter(|t| t.chain_id == id)
+                .map(|t| t.address)
+                .collect();
+            assert!(
+                distinct.len() >= MIN_TOKENS_PER_CHAIN,
+                "{name} ({id}) has {} tokens, want at least {MIN_TOKENS_PER_CHAIN}",
+                distinct.len()
+            );
+        }
+    }
+
+    #[test]
+    fn native_aliases_on_newer_chains() {
+        let native = NATIVE_TOKEN.parse::<Address>().unwrap();
+        for (chain, sym) in [
+            (100u64, "XDAI"),
+            (100, "xDAI"),
+            (999, "HYPE"),
+            (59144, "ETH"),
+            (4663, "ETH"),
+        ] {
+            assert_eq!(
+                resolve_token_symbol(chain, sym),
+                Some(native),
+                "{sym} on {chain}"
+            );
+            assert_eq!(
+                decimals_for_symbol(chain, sym),
+                Some(18),
+                "{sym} on {chain}"
+            );
+        }
+        // Tempo has no native gas token, so ETH does not resolve there.
+        assert_eq!(resolve_token_symbol(4217, "ETH"), None);
+        assert_eq!(decimals_for_symbol(4217, "ETH"), None);
+        // Native aliases stay on their home chain.
+        assert_eq!(resolve_token_symbol(1, "HYPE"), None);
+        assert_eq!(resolve_token_symbol(1, "XDAI"), None);
+    }
+
+    #[test]
+    fn swap_xdai_to_usdc_on_gnosis_resolves() {
+        let nat = parse_natural_intent("swap 10 xDAI to USDC on gnosis").unwrap();
+        let chain_id = chain_to_id(nat.chain.as_deref().unwrap()).unwrap();
+        assert_eq!(chain_id, 100);
+        assert_eq!(
+            resolve_token_symbol(chain_id, &nat.token_in).unwrap(),
+            NATIVE_TOKEN.parse::<Address>().unwrap()
+        );
+        assert_eq!(decimals_for_symbol(chain_id, &nat.token_out), Some(6));
+    }
+
     #[test]
     fn chain_helpers_roundtrip() {
-        for id in [1u64, 137, 8453, 10, 42161, 56, 43114] {
+        for id in [
+            1u64, 137, 8453, 10, 42161, 56, 43114, 100, 59144, 999, 4217, 4663,
+        ] {
             let name = chain_id_to_name(id).unwrap();
             assert_eq!(chain_to_id(name), Some(id));
         }
@@ -816,6 +1160,6 @@ mod tests {
         assert!(chain_to_id("matic").is_some());
         assert!(chain_to_id("bsc").is_some());
         assert!(chain_to_id("nope").is_none());
-        assert!(chain_id_to_name(999).is_none());
+        assert!(chain_id_to_name(5042).is_none());
     }
 }
