@@ -52,6 +52,10 @@ pub struct RouteRequest {
     pub slippage_bps: u16,
     pub routing_strategy: Option<RoutingStrategy>,
     pub receiver: Option<Address>,
+    /// An explicit output floor in wei. When set, Enso is asked for this
+    /// minimum instead of `slippage` (the API accepts only one of them).
+    #[serde(default)]
+    pub min_amount_out: Option<U256>,
 }
 
 impl RouteRequest {
@@ -72,6 +76,7 @@ impl RouteRequest {
             slippage_bps: 50,
             routing_strategy: Some(RoutingStrategy::Router),
             receiver: None,
+            min_amount_out: None,
         }
     }
 
@@ -83,8 +88,11 @@ impl RouteRequest {
             ("tokenIn", format!("0x{:x}", self.token_in)),
             ("tokenOut", format!("0x{:x}", self.token_out)),
             ("amountIn", self.amount_in.to_string()),
-            ("slippage", self.slippage_bps.to_string()),
         ];
+        match self.min_amount_out {
+            Some(minimum) => q.push(("minAmountOut", minimum.to_string())),
+            None => q.push(("slippage", self.slippage_bps.to_string())),
+        }
         if let Some(s) = self.routing_strategy {
             q.push(("routingStrategy", s.as_str().to_string()));
         }
@@ -125,6 +133,10 @@ pub struct RouteResponse {
     /// Destination chain id extracted from the first bridging hop.
     #[serde(default)]
     pub destination_chain_id: Option<u64>,
+    /// Enso's "minimum allowable amount out after slippage": a decimal
+    /// string, or a one-element array of them.
+    #[serde(default)]
+    pub min_amount_out: Option<serde_json::Value>,
 }
 
 impl RouteResponse {

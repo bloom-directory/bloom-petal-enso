@@ -41,16 +41,33 @@ pub fn needs_refresh(route: &RouteResponse, now_ms: u64) -> bool {
 
 /// The smallest output the owner accepted when reviewing the plan: the
 /// reviewed quote less the reviewed slippage tolerance.
-fn reviewed_minimum_output(reviewed: &RouteResponse, req: &RouteRequest) -> Result<U256, String> {
+pub fn reviewed_minimum_output(
+    reviewed: &RouteResponse,
+    req: &RouteRequest,
+) -> Result<U256, String> {
     let quoted = U256::from_str_radix(reviewed.amount_out.trim(), 10)
         .map_err(|_| "reviewed route has an invalid quoted output amount".to_string())?;
     let kept = U256::from(10_000u64.saturating_sub(u64::from(req.slippage_bps)));
     Ok(quoted * kept / U256::from(10_000u64))
 }
 
+/// The minimum output Enso reports for a route, when it reports exactly one.
+fn reported_minimum_output(route: &RouteResponse) -> Option<U256> {
+    let value = match route.min_amount_out.as_ref()? {
+        serde_json::Value::Array(items) if items.len() == 1 => &items[0],
+        other => other,
+    };
+    U256::from_str_radix(value.as_str()?.trim(), 10).ok()
+}
+
 /// Accept a fresh quote only within the reviewed bounds: the same request,
-/// router and native value, and an output no lower than the reviewed quote
-/// less its slippage tolerance.
+/// router and native value, and a transaction whose own minimum output is
+/// no lower than the reviewed quote less its slippage tolerance.
+///
+/// The refresh asks Enso for exactly that floor (`minAmountOut`), so the
+/// minimum Enso reports must reach it. Without a reported minimum, the fresh
+/// quote less the reviewed slippage must reach it instead, which is the
+/// floor a slippage-based route would set.
 pub fn verify_refreshed(
     reviewed: &RouteResponse,
     fresh: &RouteResponse,
@@ -74,6 +91,18 @@ pub fn verify_refreshed(
     if fresh_output.is_zero() || fresh_output < minimum {
         return Err(format!(
             "the refreshed Enso quote ({fresh_output}) is below the reviewed minimum output ({minimum})"
+        ));
+    }
+    let fresh_minimum = match reported_minimum_output(fresh) {
+        Some(reported) => reported,
+        None => {
+            let kept = U256::from(10_000u64.saturating_sub(u64::from(req.slippage_bps)));
+            fresh_output * kept / U256::from(10_000u64)
+        }
+    };
+    if fresh_minimum < minimum {
+        return Err(format!(
+            "the refreshed Enso route's minimum output ({fresh_minimum}) is below the reviewed minimum output ({minimum})"
         ));
     }
     Ok(())

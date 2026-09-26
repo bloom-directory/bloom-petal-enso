@@ -973,9 +973,15 @@ fn confirm_locked<H: Host>(
                 save(host, &sess)?;
                 fresh
             }
-            Err(reason) => {
-                let reason =
-                    format!("{reason}; abandon this intent and create a new one for a fresh route");
+            Err(error) => {
+                let reason = match error {
+                    RefreshError::Unavailable(reason) => {
+                        format!("{reason}; nothing was staged, write `confirm` again to retry")
+                    }
+                    RefreshError::OutOfBounds(reason) => format!(
+                        "{reason}; abandon this intent and create a new one for a fresh route"
+                    ),
+                };
                 sess.last_error = Some(reason.clone());
                 save(host, &sess)?;
                 return Err(reason);
@@ -1092,10 +1098,18 @@ fn route_policy_checks<H: Host>(
     ))
 }
 
+/// Why a quote refresh did not stage. A temporary failure to reach Enso or
+/// the host is worth retrying; a route outside the reviewed bounds is not.
+enum RefreshError {
+    Unavailable(String),
+    OutOfBounds(String),
+}
+
 /// Fetch a fresh Enso quote for the stored request and return the session
-/// rewritten to it. The fresh route must stay within the reviewed bounds
-/// (request, router, native value, minimum output) and pass the venue
-/// preferences again; otherwise nothing changes.
+/// rewritten to it. Enso is asked for the reviewed minimum output directly,
+/// and the fresh route must stay within the reviewed bounds (request, router,
+/// native value, minimum output) and pass the venue preferences again;
+/// otherwise nothing changes.
 fn refresh_route_quote<H: Host>(
     host: &mut H,
     wallet: &str,
@@ -1104,27 +1118,37 @@ fn refresh_route_quote<H: Host>(
     reviewed: &RouteResponse,
     needs_approve: bool,
     now: u64,
-) -> Result<(Session, RouteResponse), String> {
-    let api_key = resolve_api_key(host)?;
-    let fresh = api::route(host, &api_key, req)
-        .map_err(|error| format!("cannot refresh the Enso quote before staging: {error}"))?;
-    crate::quote::verify_refreshed(reviewed, &fresh, req)?;
-    let policy_checks = route_policy_checks(host, wallet, sess, req, &fresh, needs_approve)?;
+) -> Result<(Session, RouteResponse), RefreshError> {
+    let api_key = resolve_api_key(host).map_err(RefreshError::Unavailable)?;
+    let mut refresh_request = req.clone();
+    refresh_request.min_amount_out = Some(
+        crate::quote::reviewed_minimum_output(reviewed, req).map_err(RefreshError::OutOfBounds)?,
+    );
+    let fresh = api::route(host, &api_key, &refresh_request).map_err(|error| {
+        RefreshError::Unavailable(format!(
+            "cannot refresh the Enso quote before staging: {error}"
+        ))
+    })?;
+    crate::quote::verify_refreshed(reviewed, &fresh, req).map_err(RefreshError::OutOfBounds)?;
+    let policy_checks = route_policy_checks(host, wallet, sess, req, &fresh, needs_approve)
+        .map_err(RefreshError::Unavailable)?;
     if let Some(reason) = crate::policy::deny_reason(&policy_checks) {
-        return Err(format!(
+        return Err(RefreshError::OutOfBounds(format!(
             "the refreshed Enso route fails venue policy: {reason}"
-        ));
+        )));
     }
     let mut refreshed = sess.clone();
     let route_intent = refreshed
         .intents
         .last_mut()
         .filter(|intent| intent.label == "route")
-        .ok_or("session route intent is missing or out of order")?;
+        .ok_or_else(|| {
+            RefreshError::OutOfBounds("session route intent is missing or out of order".into())
+        })?;
     route_intent.data_hex = format!("0x{}", hex::encode(&fresh.tx.data));
     refreshed.route = Some(fresh.clone());
     refreshed.policy_checks = policy_checks;
-    verify_prepared_intents(&refreshed, req, &fresh)?;
+    verify_prepared_intents(&refreshed, req, &fresh).map_err(RefreshError::OutOfBounds)?;
     let state = refreshed.state.clone();
     refreshed.transition(
         now,

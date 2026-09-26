@@ -39,6 +39,8 @@ struct MockHost {
     rand_counter: u8,
     /// Number of Enso route requests served.
     enso_calls: usize,
+    /// URLs of every Enso route request, in order.
+    enso_urls: Vec<String>,
     /// Calldata of every staged transaction, in staging order.
     staged_data: Vec<String>,
 }
@@ -106,6 +108,7 @@ require_calldata_verification = false
             stage_count: 0,
             rand_counter: 0,
             enso_calls: 0,
+            enso_urls: Vec::new(),
             staged_data: Vec::new(),
         }
     }
@@ -193,6 +196,7 @@ impl Host for MockHost {
             && let Some(ref body) = self.enso_response
         {
             self.enso_calls += 1;
+            self.enso_urls.push(req.url.clone());
             return Ok(HttpResponse {
                 status: self.enso_status,
                 headers: vec![],
@@ -1933,6 +1937,23 @@ fn build_enso_response_native_quoted(
     serde_json::to_vec(&body).unwrap()
 }
 
+/// [`build_enso_response_native_quoted`] with Enso's reported `minAmountOut`.
+fn build_enso_response_native_quoted_with_minimum(
+    quoted_at_secs: u64,
+    amount_out: &str,
+    router: &str,
+    min_amount_out: serde_json::Value,
+) -> Vec<u8> {
+    let mut body: serde_json::Value = serde_json::from_slice(&build_enso_response_native_quoted(
+        quoted_at_secs,
+        amount_out,
+        router,
+    ))
+    .unwrap();
+    body["minAmountOut"] = min_amount_out;
+    serde_json::to_vec(&body).unwrap()
+}
+
 fn load_session(host: &mut MockHost, id: &str) -> crate::session::Session {
     let raw = host
         .get(&crate::session::key("test-wallet", id), 2 * 1024 * 1024)
@@ -1979,14 +2000,28 @@ fn aged_quote_is_refreshed_before_staging_within_reviewed_bounds() {
     // would otherwise leave Bloom less than three minutes for the approval.
     let (mut host, id) = quoted_session(120_000);
     // A slightly lower fresh quote is still inside the 0.5% slippage the
-    // owner reviewed (minimum 2,985,000,000).
-    host.enso_response = Some(build_enso_response_native_quoted(
+    // owner reviewed (minimum 2,985,000,000), and Enso holds the staged
+    // transaction to exactly that floor.
+    host.enso_response = Some(build_enso_response_native_quoted_with_minimum(
         1_120,
         "2990000000",
         DEFAULT_ROUTER,
+        serde_json::json!(["2985000000"]),
     ));
     crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
     assert_eq!(host.enso_calls, 2);
+    // The refresh asked for the reviewed floor, not the reviewed slippage.
+    let refresh_url = &host.enso_urls[1];
+    assert!(
+        refresh_url.contains("minAmountOut=2985000000"),
+        "{refresh_url}"
+    );
+    assert!(!refresh_url.contains("slippage="), "{refresh_url}");
+    assert!(
+        host.enso_urls[0].contains("slippage=50"),
+        "{}",
+        host.enso_urls[0]
+    );
 
     let sess = load_session(&mut host, &id);
     assert_eq!(sess.state, "staged");
@@ -2016,6 +2051,23 @@ fn refreshed_quote_outside_reviewed_bounds_is_refused_and_reported() {
             build_enso_response_native_quoted(1_120, "2984999999", DEFAULT_ROUTER),
             "below the reviewed minimum output",
         ),
+        // The quote clears the floor, but the transaction's own minimum does
+        // not: it could fill below what the owner reviewed.
+        (
+            build_enso_response_native_quoted_with_minimum(
+                1_120,
+                "2990000000",
+                DEFAULT_ROUTER,
+                serde_json::json!("2984999999"),
+            ),
+            "route's minimum output (2984999999)",
+        ),
+        // Without a reported minimum, a slippage-based floor is assumed:
+        // 2,990,000,000 less 0.5% is 2,975,050,000, below 2,985,000,000.
+        (
+            build_enso_response_native_quoted(1_120, "2990000000", DEFAULT_ROUTER),
+            "route's minimum output (2975050000)",
+        ),
         (
             build_enso_response_native_quoted(
                 1_120,
@@ -2038,6 +2090,29 @@ fn refreshed_quote_outside_reviewed_bounds_is_refused_and_reported() {
         assert_eq!(sess.last_error.as_deref(), Some(error.as_str()));
         assert_eq!(sess.route.as_ref().unwrap().amount_out, "3000000000");
     }
+}
+
+#[test]
+fn temporary_refresh_failure_says_to_retry_not_abandon() {
+    let (mut host, id) = quoted_session(120_000);
+    host.enso_status = 503;
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    assert!(error.contains("write `confirm` again"), "{error}");
+    assert!(!error.contains("abandon"), "{error}");
+    assert!(host.staged.is_empty());
+    let sess = load_session(&mut host, &id);
+    assert_eq!(sess.state, "prepared");
+
+    // Once Enso answers again, the same session stages.
+    host.enso_status = 200;
+    host.enso_response = Some(build_enso_response_native_quoted_with_minimum(
+        1_120,
+        "3000000000",
+        DEFAULT_ROUTER,
+        serde_json::json!("2985000000"),
+    ));
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    assert_eq!(load_session(&mut host, &id).state, "staged");
 }
 
 #[test]

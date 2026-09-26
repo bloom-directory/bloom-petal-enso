@@ -41,10 +41,15 @@ pending approval.
 Enso embeds its quote time in the route calldata, and Bloom's outbox refuses
 an Enso quote older than five minutes on every confirm, including the one that
 follows the owner's approval ceremony. Staging therefore refreshes a quote
-older than 30 seconds. The fresh route must match the stored request, keep the
-reviewed router and native value, quote at least the reviewed output less its
-slippage tolerance, and pass the venue preferences again; otherwise nothing is
-staged and `status.json` `last_error` explains the refusal. `status.json`
+older than 30 seconds. The refresh asks Enso for the reviewed minimum output
+(the reviewed quote less its slippage tolerance) as `minAmountOut`, so the
+swap can never fill below what the owner reviewed. The fresh route must match
+the stored request, keep the reviewed router and native value, report a
+minimum output at least that floor (without a reported minimum, its quote
+less the slippage must reach it), and pass the venue preferences again;
+otherwise nothing is staged and `status.json` `last_error` explains the
+refusal. A route outside those bounds means abandoning the intent; a
+temporary Enso or network failure only needs another `confirm`. `status.json`
 reports `quote.quoted_at_ms`, `quote.expires_at_ms` and `quote.expired`. When
 a staged route's quote expires while its outbox entry is still pending,
 `last_error` tells the agent to cancel that entry and create a new intent,
