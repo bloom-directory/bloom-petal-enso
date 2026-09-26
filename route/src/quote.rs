@@ -1,42 +1,55 @@
 //! Enso quote freshness.
 //!
-//! Enso embeds its quote time in the route calldata. Bloom's outbox refuses an
-//! Enso transaction whose quote is older than [`BLOOM_QUOTE_MAX_AGE_SECS`] on
-//! every confirm, including the one that follows the owner's approval
-//! ceremony. A route quoted at `new` and staged minutes later (for example
-//! after a policy ceremony) is therefore unconfirmable. Staging refreshes an
-//! aged quote so that window starts at staging, and never accepts a refreshed
-//! route outside the bounds the owner reviewed.
+//! A quote's lifetime comes from Enso's route response: `validUntil` (Unix
+//! seconds) when Enso sends it. Every route also records when this Petal
+//! fetched it, and a quote without `validUntil` is treated as valid for
+//! [`DEFAULT_QUOTE_LIFETIME_SECS`] after that. Nothing here reads venue data
+//! inside the transaction calldata.
+//!
+//! Approval can take minutes after staging, so staging refreshes a quote
+//! older than [`REFRESH_AFTER_SECS`] and never accepts a refreshed route
+//! outside the bounds the owner reviewed.
 
 use crate::api_types::{RouteRequest, RouteResponse};
 use alloy::primitives::U256;
 
-/// Bloom's outbox limit for an Enso quote's age at confirm time.
-pub const BLOOM_QUOTE_MAX_AGE_SECS: u64 = 300;
+/// Lifetime assumed for a quote whose response has no `validUntil`.
+pub const DEFAULT_QUOTE_LIFETIME_SECS: u64 = 300;
 
 /// Staging keeps a quote this fresh and refreshes anything older.
 pub const REFRESH_AFTER_SECS: u64 = 30;
 
-const MARKER: &[u8] = b"{\"Source\":\"Enso";
-
-/// Quote time in Unix seconds, read from the Enso metadata in the calldata
-/// the same way Bloom's outbox reads it. `None` when the calldata carries no
-/// Enso quote metadata.
-pub fn quoted_at_secs(calldata: &[u8]) -> Option<u64> {
-    let start = calldata
-        .windows(MARKER.len())
-        .position(|window| window == MARKER)?;
-    let value: serde_json::Value = serde_json::Deserializer::from_slice(&calldata[start..])
-        .into_iter()
-        .next()?
-        .ok()?;
-    value.get("Timestamp")?.as_u64()
+/// Enso's `validUntil` in Unix seconds, when the response carries one.
+fn valid_until_secs(route: &RouteResponse) -> Option<u64> {
+    let value = route.valid_until.as_ref()?;
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
 }
 
-/// Whether staging should replace this route's quote before staging it.
+/// When the quote expires, in Unix milliseconds, and where that came from:
+/// Enso's `validUntil`, or the fetch time plus the default lifetime. `None`
+/// for a route with neither (stored before fetch times were recorded).
+pub fn expires_at_ms(route: &RouteResponse) -> Option<(u64, &'static str)> {
+    if let Some(valid_until) = valid_until_secs(route) {
+        return Some((valid_until.saturating_mul(1000), "enso_valid_until"));
+    }
+    route.fetched_at_ms.map(|fetched| {
+        (
+            fetched.saturating_add(DEFAULT_QUOTE_LIFETIME_SECS * 1000),
+            "fetch_time",
+        )
+    })
+}
+
+/// Whether staging should replace this route's quote before staging it:
+/// it is older than the refresh threshold, or already expired.
 pub fn needs_refresh(route: &RouteResponse, now_ms: u64) -> bool {
-    quoted_at_secs(&route.tx.data)
-        .is_some_and(|quoted| (now_ms / 1000).saturating_sub(quoted) > REFRESH_AFTER_SECS)
+    let aged = route
+        .fetched_at_ms
+        .is_some_and(|fetched| now_ms.saturating_sub(fetched) > REFRESH_AFTER_SECS * 1000);
+    let expired = expires_at_ms(route).is_some_and(|(expires, _)| now_ms >= expires);
+    aged || expired
 }
 
 /// The smallest output the owner accepted when reviewing the plan: the
@@ -108,23 +121,22 @@ pub fn verify_refreshed(
     Ok(())
 }
 
-/// Quote timing for `status.json`, or `None` without Enso quote metadata.
+/// Quote timing for `status.json`, or `None` when the route has no timing.
 pub fn status_view(route: &RouteResponse, now_ms: u64) -> Option<serde_json::Value> {
-    let quoted_at_ms = quoted_at_secs(&route.tx.data)?.saturating_mul(1000);
-    let expires_at_ms = quoted_at_ms.saturating_add(BLOOM_QUOTE_MAX_AGE_SECS * 1000);
+    let (expires_at_ms, source) = expires_at_ms(route)?;
     Some(serde_json::json!({
-        "quoted_at_ms": quoted_at_ms,
+        "fetched_at_ms": route.fetched_at_ms,
         "expires_at_ms": expires_at_ms,
+        "expires_from": source,
         "expired": now_ms >= expires_at_ms,
     }))
 }
 
 /// What an agent must do when a staged, unbroadcast route's quote expired.
-/// Bloom refuses to confirm it, so retrying cannot help.
 pub fn expired_staged_error(outbox_id: &str) -> String {
     format!(
-        "the Enso quote in outbox {outbox_id} expired; while that entry is pending, Bloom \
-         refuses to confirm it, so cancel it and create a new intent for a fresh quote"
+        "the Enso quote in outbox {outbox_id} expired; confirming that pending entry can \
+         revert or be refused, so cancel it and create a new intent for a fresh quote"
     )
 }
 
@@ -132,51 +144,55 @@ pub fn expired_staged_error(outbox_id: &str) -> String {
 mod tests {
     use super::*;
 
-    fn calldata(timestamp: u64) -> Vec<u8> {
-        let mut data = vec![0xb9, 0x4c, 0x36, 0x09, 0, 0, 0];
-        data.extend_from_slice(
-            format!(r#"{{"Source":"Enso-ef06c8a82128","AmountOut":"1","Timestamp":{timestamp}}}"#)
-                .as_bytes(),
-        );
-        data.extend_from_slice(&[0; 16]);
-        data
-    }
-
-    #[test]
-    fn reads_the_enso_quote_time_embedded_in_calldata() {
-        assert_eq!(
-            quoted_at_secs(&calldata(1_790_343_031)),
-            Some(1_790_343_031)
-        );
-        assert_eq!(quoted_at_secs(b"no enso metadata"), None);
-        assert_eq!(
-            quoted_at_secs(br#"{"Source":"Enso","Timestamp":"x"}"#),
-            None
-        );
-    }
-
-    #[test]
-    fn status_marks_a_quote_expired_after_bloom_limit() {
-        let mut route: RouteResponse = serde_json::from_value(serde_json::json!({
+    fn route(valid_until: Option<serde_json::Value>, fetched_at_ms: Option<u64>) -> RouteResponse {
+        let mut body = serde_json::json!({
             "tx": {
                 "to": "0x1234567890abcdef1234567890abcdef12345678",
-                "data": format!("0x{}", hex::encode(calldata(1_000))),
+                "data": "0x00",
                 "value": "0",
                 "from": "0x742d35cc6634c0532925a3b844bc9e7595f0beb1",
             },
             "amountOut": "1",
             "route": [],
-        }))
-        .unwrap();
-        let view = status_view(&route, 1_299_999).unwrap();
-        assert_eq!(view["quoted_at_ms"], 1_000_000);
-        assert_eq!(view["expires_at_ms"], 1_300_000);
-        assert_eq!(view["expired"], false);
-        assert_eq!(status_view(&route, 1_300_000).unwrap()["expired"], true);
-        assert!(!needs_refresh(&route, 1_030_000));
-        assert!(needs_refresh(&route, 1_031_000));
-        route.tx.data = b"no metadata".to_vec().into();
-        assert!(status_view(&route, 1_300_000).is_none());
-        assert!(!needs_refresh(&route, 9_999_999));
+        });
+        if let Some(valid_until) = valid_until {
+            body["validUntil"] = valid_until;
+        }
+        let mut route: RouteResponse = serde_json::from_value(body).unwrap();
+        route.fetched_at_ms = fetched_at_ms;
+        route
+    }
+
+    #[test]
+    fn enso_valid_until_sets_the_expiry() {
+        for valid_until in [serde_json::json!(1_200), serde_json::json!("1200")] {
+            let quoted = route(Some(valid_until), Some(1_000_000));
+            assert_eq!(
+                expires_at_ms(&quoted),
+                Some((1_200_000, "enso_valid_until"))
+            );
+            let view = status_view(&quoted, 1_199_999).unwrap();
+            assert_eq!(view["expires_from"], "enso_valid_until");
+            assert_eq!(view["expired"], false);
+            assert_eq!(status_view(&quoted, 1_200_000).unwrap()["expired"], true);
+        }
+    }
+
+    #[test]
+    fn fetch_time_sets_the_expiry_without_valid_until() {
+        let quoted = route(None, Some(1_000_000));
+        assert_eq!(expires_at_ms(&quoted), Some((1_300_000, "fetch_time")));
+        assert!(!needs_refresh(&quoted, 1_030_000));
+        assert!(needs_refresh(&quoted, 1_030_001));
+        assert!(status_view(&route(None, None), 9_999_999).is_none());
+        assert!(!needs_refresh(&route(None, None), 9_999_999));
+    }
+
+    #[test]
+    fn an_expired_quote_is_refreshed_even_when_young() {
+        // Enso may grant less than the refresh threshold.
+        let quoted = route(Some(serde_json::json!(1_010)), Some(1_000_000));
+        assert!(!needs_refresh(&quoted, 1_009_999));
+        assert!(needs_refresh(&quoted, 1_010_000));
     }
 }

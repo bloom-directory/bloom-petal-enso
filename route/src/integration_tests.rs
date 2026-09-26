@@ -1954,6 +1954,18 @@ fn build_enso_response_native_quoted_with_minimum(
     serde_json::to_vec(&body).unwrap()
 }
 
+/// The `Timestamp` the test builder embeds in each quote's calldata, used
+/// only to tell which quote was staged. Production code never reads it.
+fn quote_marker(calldata: &[u8]) -> Option<u64> {
+    let marker = b"{\"Source\":\"Enso";
+    let start = calldata.windows(marker.len()).position(|w| w == marker)?;
+    let value: serde_json::Value = serde_json::Deserializer::from_slice(&calldata[start..])
+        .into_iter()
+        .next()?
+        .ok()?;
+    value.get("Timestamp")?.as_u64()
+}
+
 fn load_session(host: &mut MockHost, id: &str) -> crate::session::Session {
     let raw = host
         .get(&crate::session::key("test-wallet", id), 2 * 1024 * 1024)
@@ -1987,9 +1999,7 @@ fn fresh_quote_is_staged_without_requoting() {
     let sess = load_session(&mut host, &id);
     assert_eq!(sess.state, "staged");
     assert_eq!(
-        crate::quote::quoted_at_secs(
-            &hex::decode(host.staged_data[0].trim_start_matches("0x")).unwrap()
-        ),
+        quote_marker(&hex::decode(host.staged_data[0].trim_start_matches("0x")).unwrap()),
         Some(1_000)
     );
 }
@@ -2033,14 +2043,17 @@ fn aged_quote_is_refreshed_before_staging_within_reviewed_bounds() {
             .any(|entry| entry.reason.contains("Enso quote refreshed before staging"))
     );
     assert_eq!(
-        crate::quote::quoted_at_secs(
-            &hex::decode(host.staged_data[0].trim_start_matches("0x")).unwrap()
-        ),
+        quote_marker(&hex::decode(host.staged_data[0].trim_start_matches("0x")).unwrap()),
         Some(1_120),
         "the staged transaction must carry the fresh quote"
     );
-    let view = crate::quote::status_view(sess.route.as_ref().unwrap(), 1_120_000).unwrap();
-    assert_eq!(view["expires_at_ms"], 1_420_000);
+    // The refreshed quote is dated from when this Petal fetched it.
+    let fresh = sess.route.as_ref().unwrap();
+    let fetched = fresh.fetched_at_ms.expect("refresh records its fetch time");
+    assert!(fetched > 1_120_000, "{fetched}");
+    let view = crate::quote::status_view(fresh, fetched).unwrap();
+    assert_eq!(view["expires_at_ms"], fetched + 300_000);
+    assert_eq!(view["expires_from"], "fetch_time");
     assert_eq!(view["expired"], false);
 }
 

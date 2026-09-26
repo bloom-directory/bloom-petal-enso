@@ -137,6 +137,14 @@ pub struct RouteResponse {
     /// string, or a one-element array of them.
     #[serde(default)]
     pub min_amount_out: Option<serde_json::Value>,
+    /// Enso's `validUntil`: Unix seconds after which the quote expires and
+    /// the transaction may revert. Optional in Enso's API.
+    #[serde(default)]
+    pub valid_until: Option<serde_json::Value>,
+    /// When this Petal received the route, in Unix milliseconds. Not an
+    /// Enso field; set by [`crate::api::route`] so every quote has an age.
+    #[serde(default)]
+    pub fetched_at_ms: Option<u64>,
 }
 
 impl RouteResponse {

@@ -42,9 +42,9 @@ disables swaps. Existing saved restrictions take precedence over defaults.
  body: confirm
 ```
 
-Bloom refuses an Enso quote older than five minutes on every outbox
-confirm, including the one after the owner's approval. When the stored
-quote is older than 30 seconds, this confirm fetches a fresh one, asking
+A quote expires at Enso's `validUntil`, or five minutes after the Petal
+fetched it when Enso sends none. When the stored quote is older than 30
+seconds or has expired, this confirm fetches a fresh one, asking
 Enso for the reviewed minimum output (reviewed quote less slippage), and
 stages it only if it keeps the reviewed router and native value and its
 minimum output reaches that floor. Otherwise nothing is staged and
