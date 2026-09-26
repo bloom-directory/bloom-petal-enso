@@ -2091,3 +2091,40 @@ fn create_reports_input_mistakes_as_invalid_input() {
         Err(CreateError::Failed(message)) if message.contains("simulation failed")
     ));
 }
+
+// ===========================================================================
+// TEST: routes declare the host capabilities their workflows use
+// ===========================================================================
+
+/// The mock host does not enforce capabilities, but Bloom does: a workflow
+/// call the route never declared is denied at runtime (`confirm` refreshing
+/// an aged quote once failed live with "denied"). Pin each declaration.
+#[test]
+fn routes_declare_capabilities_their_workflows_need() {
+    let confirm = include_str!("../files/intents/[wallet]/[id]/confirm.rs");
+    for cap in [
+        "bloom:http",
+        "bloom:store",
+        "bloom:tx.outbox",
+        "bloom:chain",
+    ] {
+        assert!(
+            confirm.contains(&format!("\"{cap}\"")),
+            "confirm must declare {cap}"
+        );
+    }
+    let create = include_str!("../files/intents/[wallet]/new.rs");
+    for cap in ["bloom:http", "bloom:store", "bloom:chain"] {
+        assert!(
+            create.contains(&format!("\"{cap}\"")),
+            "new must declare {cap}"
+        );
+    }
+    let status = include_str!("../files/intents/[wallet]/[id]/status.json.rs");
+    for cap in ["bloom:store", "bloom:tx.outbox"] {
+        assert!(
+            status.contains(&format!("\"{cap}\"")),
+            "status.json must declare {cap}"
+        );
+    }
+}

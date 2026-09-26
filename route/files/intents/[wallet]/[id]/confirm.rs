@@ -1,5 +1,7 @@
 petal::route_file!(
+    // `bloom:http` lets staging refresh an aged Enso quote (see quote.rs).
     spec: petal::write_spec().caps(&[
+        "bloom:http",
         "bloom:store",
         "bloom:tx.outbox",
         "bloom:chain",
