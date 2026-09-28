@@ -77,6 +77,8 @@ pub fn route<H: Host>(
     let mut v: RouteResponse = serde_json::from_slice(&resp.body)
         .map_err(|e| format!("failed to parse Enso route response: {e}"))?;
 
+    v.fetched_at_ms = Some(host.now_ms());
+
     // Extract destination_chain_id from the first bridging hop.
     if let Some(hops) = v.route.as_array() {
         v.destination_chain_id = hops

@@ -10,8 +10,10 @@ simulation, and swap execution through the Bloom transaction pipeline.
 ```
 write: /petals/enso/intents/<wallet>/<index>/new
 body:  {"intent":"swap 100 usdc to eth","chain":"ethereum"}
-  or:  swap 100 usdc to eth
+  or:  swap 100 usdc to eth on ethereum
 ```
+
+The source chain is required: set `"chain"` or end the text with `on <chain>`.
 
 ### 2. Inspect the plan
 
@@ -35,6 +37,24 @@ only an exact-amount approval. Broadcast it and wait for a successful receipt,
 then write `confirm` to the Petal again. Only then is the swap simulated and
 staged. The route transaction is never placed in the outbox alongside a
 pending approval.
+
+Each quote's lifetime comes from Enso's route response: `validUntil` (Unix
+seconds) when Enso sends it, otherwise five minutes after the Petal fetched the
+route. The owner's approval can take minutes after staging, so staging
+refreshes a quote older than 30 seconds, or one that has expired. The refresh asks Enso for the reviewed minimum output
+(the reviewed quote less its slippage tolerance) as `minAmountOut`, so the
+swap can never fill below what the owner reviewed. The fresh route must match
+the stored request, keep the reviewed router and native value, report a
+minimum output at least that floor (without a reported minimum, its quote
+less the slippage must reach it), and pass the venue preferences again;
+otherwise nothing is staged and `status.json` `last_error` explains the
+refusal. A route outside those bounds means abandoning the intent; a
+temporary Enso or network failure only needs another `confirm`. `status.json`
+reports `quote.fetched_at_ms`, `quote.expires_at_ms`, `quote.expires_from`
+(`enso_valid_until` or `fetch_time`) and `quote.expired`. When
+a staged route's quote expires while its outbox entry is still pending,
+`last_error` tells the agent to cancel that entry and create a new intent,
+because confirming an expired route can revert or be refused.
 
 ## Configuration
 

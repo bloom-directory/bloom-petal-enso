@@ -378,7 +378,42 @@ fn render_plan_md(view: PlanView<'_>) -> String {
 // create — route discovery + session creation
 // ---------------------------------------------------------------------------
 
-pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String, String> {
+/// Why `new` refused an intent. Input mistakes surface as invalid input
+/// (EINVAL on the mount); everything else, such as Enso, RPC, simulation or
+/// policy failures, surfaces as a backend failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateError {
+    InvalidInput(String),
+    Failed(String),
+}
+
+impl CreateError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::InvalidInput(message) | Self::Failed(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for CreateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl From<String> for CreateError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for CreateError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_owned())
+    }
+}
+
+pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String, CreateError> {
     create_for_account(host, wallet, 0, body)
 }
 
@@ -388,20 +423,32 @@ pub fn create_for_account<H: Host>(
     wallet: &str,
     account: u32,
     body: &[u8],
-) -> Result<String, String> {
+) -> Result<String, CreateError> {
     let now = host.now_ms();
-    let parsed = input::parse_new_body(body)?;
+    let parsed = input::parse_new_body(body).map_err(CreateError::InvalidInput)?;
     let address = wallet_address(host, wallet, account)?;
     let api_key = resolve_api_key(host)?;
 
-    // Determine source chain.
-    let nat_opt = input::parse_natural_intent(&parsed.intent);
-    let nat_chain = nat_opt.as_ref().and_then(|n| n.chain.clone());
+    // Determine source chain. It must be named: a guessed chain would quote
+    // the swap on a network the caller never chose.
+    let nat = input::parse_natural_intent(&parsed.intent).ok_or_else(|| {
+        CreateError::InvalidInput(format!(
+            "could not parse intent '{}' (expected `swap <amount> <tok> to <tok> on <chain>`)",
+            parsed.intent
+        ))
+    })?;
     let chain_name = parsed
         .chain
         .as_deref()
-        .or(nat_chain.as_deref())
-        .unwrap_or("ethereum")
+        .or(nat.chain.as_deref())
+        .ok_or_else(|| {
+            CreateError::InvalidInput(
+                "name the source chain: add \"chain\" to the JSON body \
+                 (for example {\"intent\":\"swap 0.003 ETH to USDC\",\"chain\":\"base\"}) \
+                 or end the intent with `on <chain>`"
+                    .into(),
+            )
+        })?
         .to_ascii_lowercase();
 
     // Resolve the configured RPC and prove that it is the requested chain.
@@ -409,17 +456,10 @@ pub fn create_for_account<H: Host>(
         .chain_id(&chain_name)
         .map_err(|e| format!("cannot verify source chain {chain_name}: {e}"))?;
 
-    // Parse the natural intent.
-    let nat = nat_opt.ok_or_else(|| {
-        format!(
-            "could not parse intent '{}' (expected `swap <amount> <tok> to <tok>`)",
-            parsed.intent
-        )
-    })?;
-
     // Resolve token_in on source chain.
-    let token_in = input::resolve_token_symbol(chain_id, &nat.token_in)
-        .ok_or_else(|| format!("could not resolve token symbol: {}", nat.token_in))?;
+    let token_in = input::resolve_token_symbol(chain_id, &nat.token_in).ok_or_else(|| {
+        CreateError::InvalidInput(format!("could not resolve token symbol: {}", nat.token_in))
+    })?;
 
     // Determine destination chain.
     let destination_chain = parsed
@@ -439,8 +479,9 @@ pub fn create_for_account<H: Host>(
     // Resolve token_out — on destination chain if cross-chain, else source.
     let token_out = {
         let resolve_chain_id = dest_chain_id.unwrap_or(chain_id);
-        input::resolve_token_symbol(resolve_chain_id, &nat.token_out)
-            .ok_or_else(|| format!("could not resolve token symbol: {}", nat.token_out))?
+        input::resolve_token_symbol(resolve_chain_id, &nat.token_out).ok_or_else(|| {
+            CreateError::InvalidInput(format!("could not resolve token symbol: {}", nat.token_out))
+        })?
     };
 
     // Resolve decimals for token_in.
@@ -451,11 +492,13 @@ pub fn create_for_account<H: Host>(
         host.erc20_decimals(&chain_name, &token_in_hex)
             .map_err(|e| format!("cannot read token decimals: {e}"))?
     } else {
-        input::decimals_for_symbol(chain_id, &nat.token_in)
+        input::decimals_for_symbol(chain_id, &nat.token_in).ok_or_else(|| {
+            CreateError::InvalidInput(format!("unknown decimals for token: {}", nat.token_in))
+        })?
     };
 
     // Parse amount with correct decimals.
-    let amount_raw = parse_amount(&nat.amount, decimals)?;
+    let amount_raw = parse_amount(&nat.amount, decimals).map_err(CreateError::InvalidInput)?;
 
     let from_address: Address = address
         .parse()
@@ -483,7 +526,7 @@ pub fn create_for_account<H: Host>(
     if let Some(ref recv) = parsed.receiver {
         let addr = recv
             .parse::<Address>()
-            .map_err(|_| format!("invalid receiver address: {recv}"))?;
+            .map_err(|_| CreateError::InvalidInput(format!("invalid receiver address: {recv}")))?;
         route_req.receiver = Some(addr);
     }
 
@@ -580,7 +623,7 @@ pub fn create_for_account<H: Host>(
         },
     );
     if let Some(reason) = crate::policy::deny_reason(&policy_checks) {
-        return Err(reason);
+        return Err(reason.into());
     }
 
     // A route that already has allowance must simulate successfully. When an
@@ -598,10 +641,10 @@ pub fn create_for_account<H: Host>(
             .and_then(|value| value.as_bool())
             .unwrap_or(false)
         {
-            return Err(format!(
+            return Err(CreateError::Failed(format!(
                 "route simulation failed: {}",
                 crate::simulation::failure_message(&result)
-            ));
+            )));
         }
         result
     };
@@ -824,41 +867,8 @@ fn confirm_locked<H: Host>(
     // Re-read the current Enso venue preferences at the last possible moment.
     // The outbox host independently enforces authoritative wallet policy.
     let needs_approve = sess.intents.iter().any(|i| i.label == "approve");
-    let cross_chain = sess
-        .destination_chain
-        .as_deref()
-        .map(|d| !d.eq_ignore_ascii_case(&sess.chain))
-        .unwrap_or(false);
-    let destination_chain = sess.destination_chain.as_deref().unwrap_or(&sess.chain);
-    let receiver_class = sess.receiver_class.as_deref().unwrap_or("unknown");
-    let receiver = req
-        .receiver
-        .map(|address| format!("0x{address:x}"))
-        .unwrap_or_else(|| sess.wallet_address.clone());
-    let token_out = format!("0x{:x}", req.token_out);
     let router = format!("0x{:x}", route.tx.to);
-    let protocols = route.protocols();
-    let verified_policy = crate::policy::load_venue_config(host, wallet)?;
-    sess.policy_checks = crate::policy::evaluate(
-        &verified_policy,
-        &crate::policy::RoutePolicyContext {
-            source_chain: &sess.chain,
-            destination_chain,
-            cross_chain,
-            receiver: &receiver,
-            token_out: &token_out,
-            receiver_class,
-            router: &router,
-            protocols: &protocols.0,
-            protocols_unknown: protocols.1,
-            native_value_wei: route.tx.value,
-            slippage_bps: req.slippage_bps,
-            route_verified: true,
-            receiver_verified: false,
-            min_out_enforced: false,
-            needs_approve,
-        },
-    );
+    sess.policy_checks = route_policy_checks(host, wallet, &sess, &req, &route, needs_approve)?;
     if let Some(reason) = crate::policy::deny_reason(&sess.policy_checks) {
         sess.last_error = Some(reason.clone());
         save(host, &sess)?;
@@ -963,6 +973,35 @@ fn confirm_locked<H: Host>(
         save(host, &sess)?;
     }
 
+    // Bloom refuses an Enso quote older than five minutes on every confirm,
+    // including the one after the owner's approval ceremony. Replace an aged
+    // quote now so that window starts at staging, within the reviewed bounds.
+    let route = if crate::quote::needs_refresh(&route, now) {
+        match refresh_route_quote(host, wallet, &sess, &req, &route, needs_approve, now) {
+            Ok((refreshed, fresh)) => {
+                sess = refreshed;
+                save(host, &sess)?;
+                fresh
+            }
+            Err(error) => {
+                let reason = match error {
+                    RefreshError::Unavailable(reason) => {
+                        format!("{reason}; nothing was staged, write `confirm` again to retry")
+                    }
+                    RefreshError::OutOfBounds(reason) => format!(
+                        "{reason}; abandon this intent and create a new one for a fresh route"
+                    ),
+                };
+                sess.last_error = Some(reason.clone());
+                save(host, &sess)?;
+                return Err(reason);
+            }
+        }
+    } else {
+        route
+    };
+    let intents = sess.intents.clone();
+
     // Re-simulate with current chain state immediately before staging the
     // executable route.
     let simulation = crate::simulation::simulate_route_response(host, &sess.chain, &route);
@@ -1017,9 +1056,119 @@ fn confirm_locked<H: Host>(
         sess.staged_ids.push(staged.outbox_id);
     }
 
+    sess.last_error = None;
     sess.transition(now, "staged", "route staged into outbox");
     save(host, &sess)?;
     Ok(())
+}
+
+/// Evaluate the wallet's Enso venue preferences for one route.
+fn route_policy_checks<H: Host>(
+    host: &mut H,
+    wallet: &str,
+    sess: &Session,
+    req: &RouteRequest,
+    route: &RouteResponse,
+    needs_approve: bool,
+) -> Result<serde_json::Value, String> {
+    let cross_chain = sess
+        .destination_chain
+        .as_deref()
+        .map(|d| !d.eq_ignore_ascii_case(&sess.chain))
+        .unwrap_or(false);
+    let destination_chain = sess.destination_chain.as_deref().unwrap_or(&sess.chain);
+    let receiver_class = sess.receiver_class.as_deref().unwrap_or("unknown");
+    let receiver = req
+        .receiver
+        .map(|address| format!("0x{address:x}"))
+        .unwrap_or_else(|| sess.wallet_address.clone());
+    let token_out = format!("0x{:x}", req.token_out);
+    let router = format!("0x{:x}", route.tx.to);
+    let protocols = route.protocols();
+    let verified_policy = crate::policy::load_venue_config(host, wallet)?;
+    Ok(crate::policy::evaluate(
+        &verified_policy,
+        &crate::policy::RoutePolicyContext {
+            source_chain: &sess.chain,
+            destination_chain,
+            cross_chain,
+            receiver: &receiver,
+            token_out: &token_out,
+            receiver_class,
+            router: &router,
+            protocols: &protocols.0,
+            protocols_unknown: protocols.1,
+            native_value_wei: route.tx.value,
+            slippage_bps: req.slippage_bps,
+            route_verified: true,
+            receiver_verified: false,
+            min_out_enforced: false,
+            needs_approve,
+        },
+    ))
+}
+
+/// Why a quote refresh did not stage. A temporary failure to reach Enso or
+/// the host is worth retrying; a route outside the reviewed bounds is not.
+enum RefreshError {
+    Unavailable(String),
+    OutOfBounds(String),
+}
+
+/// Fetch a fresh Enso quote for the stored request and return the session
+/// rewritten to it. Enso is asked for the reviewed minimum output directly,
+/// and the fresh route must stay within the reviewed bounds (request, router,
+/// native value, minimum output) and pass the venue preferences again;
+/// otherwise nothing changes.
+fn refresh_route_quote<H: Host>(
+    host: &mut H,
+    wallet: &str,
+    sess: &Session,
+    req: &RouteRequest,
+    reviewed: &RouteResponse,
+    needs_approve: bool,
+    now: u64,
+) -> Result<(Session, RouteResponse), RefreshError> {
+    let api_key = resolve_api_key(host).map_err(RefreshError::Unavailable)?;
+    let mut refresh_request = req.clone();
+    refresh_request.min_amount_out = Some(
+        crate::quote::reviewed_minimum_output(reviewed, req).map_err(RefreshError::OutOfBounds)?,
+    );
+    let fresh = api::route(host, &api_key, &refresh_request).map_err(|error| {
+        RefreshError::Unavailable(format!(
+            "cannot refresh the Enso quote before staging: {error}"
+        ))
+    })?;
+    crate::quote::verify_refreshed(reviewed, &fresh, req).map_err(RefreshError::OutOfBounds)?;
+    let policy_checks = route_policy_checks(host, wallet, sess, req, &fresh, needs_approve)
+        .map_err(RefreshError::Unavailable)?;
+    if let Some(reason) = crate::policy::deny_reason(&policy_checks) {
+        return Err(RefreshError::OutOfBounds(format!(
+            "the refreshed Enso route fails venue policy: {reason}"
+        )));
+    }
+    let mut refreshed = sess.clone();
+    let route_intent = refreshed
+        .intents
+        .last_mut()
+        .filter(|intent| intent.label == "route")
+        .ok_or_else(|| {
+            RefreshError::OutOfBounds("session route intent is missing or out of order".into())
+        })?;
+    route_intent.data_hex = format!("0x{}", hex::encode(&fresh.tx.data));
+    refreshed.route = Some(fresh.clone());
+    refreshed.policy_checks = policy_checks;
+    verify_prepared_intents(&refreshed, req, &fresh).map_err(RefreshError::OutOfBounds)?;
+    let state = refreshed.state.clone();
+    refreshed.transition(
+        now,
+        &state,
+        &format!(
+            "Enso quote refreshed before staging: quoted output {} (reviewed {})",
+            fresh.amount_out, reviewed.amount_out
+        ),
+    );
+    Ok((refreshed, fresh))
 }
 
 // ---------------------------------------------------------------------------

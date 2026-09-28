@@ -2,6 +2,7 @@ pub mod api;
 pub mod api_types;
 pub mod input;
 pub mod policy;
+pub mod quote;
 pub mod redaction;
 pub mod runtime;
 pub mod session;

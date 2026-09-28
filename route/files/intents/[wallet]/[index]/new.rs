@@ -17,7 +17,12 @@ petal::route_file!(
         let mut host = crate::workflow::BloomHost;
         match crate::workflow::create_for_account(&mut host, wallet, account, body) {
             Ok(_) => petal::DispatchResponse::Write,
-            Err(error) => petal::error(-4, crate::redaction::sanitize_message(&error)),
+            Err(crate::workflow::CreateError::InvalidInput(message)) => {
+                petal::error(-3, crate::redaction::sanitize_message(&message))
+            }
+            Err(crate::workflow::CreateError::Failed(message)) => {
+                petal::error(-4, crate::redaction::sanitize_message(&message))
+            }
         }
     }
 );
