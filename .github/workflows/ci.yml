@@ -43,7 +43,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: bloom-directory/bloom
-          ref: master
+          ref: b751087b4d7bb65a0f2796a00cf49237e20d9cda
           path: bloom
           persist-credentials: false
       - name: Build key-free debug Bloom CLI for install smoke tests
