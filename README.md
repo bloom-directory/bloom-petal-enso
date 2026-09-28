@@ -8,7 +8,7 @@ simulation, and swap execution through the Bloom transaction pipeline.
 ### 1. Create an intent
 
 ```
-write: /petals/enso/wallets/<wallet>/<account>/intents/new
+write: /petals/enso/intents/<wallet>/<index>/new
 body:  {"intent":"swap 100 usdc to eth","chain":"ethereum"}
   or:  swap 100 usdc to eth
 ```
@@ -16,18 +16,18 @@ body:  {"intent":"swap 100 usdc to eth","chain":"ethereum"}
 ### 2. Inspect the plan
 
 ```
-read: /petals/enso/wallets/<wallet>/<account>/intents/<session>/plan.md
-read: /petals/enso/wallets/<wallet>/<account>/intents/<session>/route.json
-read: /petals/enso/wallets/<wallet>/<account>/intents/<session>/tx.json
-read: /petals/enso/wallets/<wallet>/<account>/intents/<session>/simulation.json
+read: /petals/enso/intents/<wallet>/<index>/<session>/plan.md
+read: /petals/enso/intents/<wallet>/<index>/<session>/route.json
+read: /petals/enso/intents/<wallet>/<index>/<session>/tx.json
+read: /petals/enso/intents/<wallet>/<index>/<session>/simulation.json
 ```
 
 ### 3. Confirm
 
 ```
-write: /petals/enso/wallets/<wallet>/<account>/intents/<session>/confirm
+write: /petals/enso/intents/<wallet>/<index>/<session>/confirm
 body:  confirm
-write: /wallets/<wallet>/chains/<chain>/outbox/pending/<id>/confirm  # Broadcast
+write: /wallets/<wallet>/<index>/chains/<chain>/outbox/pending/<id>/confirm  # Broadcast
 ```
 
 For an ERC-20 route that needs approval, the first Petal confirmation stages
@@ -41,16 +41,16 @@ pending approval.
 Set the Enso API key:
 
 ```
-write: /petals/enso/wallets/<wallet>/<account>/settings/api-key
+write: /petals/enso/settings/<wallet>/<index>/api-key
 body:  your-enso-api-key-here
 ```
 
 Release builds can embed the repository secret `ENSO_API_KEY`. A key written to
-`settings/api-key` takes precedence over that embedded release credential. The
+`settings/<wallet>/<index>/api-key` takes precedence over that embedded release credential. The
 runtime setting `enso-api-key` remains a compatibility fallback, and
-`settings/status.json` reports the selected source without exposing the key.
+`settings/<wallet>/<index>/status.json` reports the selected source without exposing the key.
 
-Per-wallet Enso venue preferences live at `settings/wallets/venue.toml` in
+Per-wallet Enso venue preferences live at `settings/wallets/<wallet>/<index>/venue.toml` in
 the Petal's own state. No setup write is needed: an unconfigured wallet reads
 and uses the bundled defaults. Swaps are enabled on all 13 chains supported by Bloom and Enso
 (Ethereum, Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart
@@ -104,20 +104,21 @@ transactions, not unattended autonomous value movement.
 
 | Route | Kind | Description |
 | --- | --- | --- |
-| `intents/` | dir | Lists wallets with sessions |
-| `intents/<wallet>/` | dir | `new` + session ids |
-| `intents/<wallet>/new` | writable | Create a new swap intent |
-| `intents/<wallet>/<id>/intent.txt` | file | Original intent text |
-| `intents/<wallet>/<id>/route.json` | file | Full Enso route response |
-| `intents/<wallet>/<id>/plan.md` | file | Human-readable transaction plan |
-| `intents/<wallet>/<id>/tx.json` | file | Prepared EVM transaction |
-| `intents/<wallet>/<id>/simulation.json` | file | Simulation result |
-| `intents/<wallet>/<id>/settlement.json` | file | Settlement status |
-| `intents/<wallet>/<id>/status.json` | file | Session status |
-| `intents/<wallet>/<id>/confirm` | writable | Stage into outbox |
-| `settings/status.json` | file | API key credential status |
-| `settings/api-key` | writable | Write Enso API key |
-| `settings/wallets/venue.toml` | writable | Configure Enso-owned advisory venue preferences |
+| `intents/` | dir | Lists authenticated wallets |
+| `intents/<wallet>/` | dir | Lists canonical numbered accounts |
+| `intents/<wallet>/<index>/` | dir | `new` + session ids |
+| `intents/<wallet>/<index>/new` | writable | Create a new swap intent |
+| `intents/<wallet>/<index>/<id>/intent.txt` | file | Original intent text |
+| `intents/<wallet>/<index>/<id>/route.json` | file | Full Enso route response |
+| `intents/<wallet>/<index>/<id>/plan.md` | file | Human-readable transaction plan |
+| `intents/<wallet>/<index>/<id>/tx.json` | file | Prepared EVM transaction |
+| `intents/<wallet>/<index>/<id>/simulation.json` | file | Simulation result |
+| `intents/<wallet>/<index>/<id>/settlement.json` | file | Settlement status |
+| `intents/<wallet>/<index>/<id>/status.json` | file | Session status |
+| `intents/<wallet>/<index>/<id>/confirm` | writable | Stage into outbox |
+| `settings/<wallet>/<index>/status.json` | file | API key credential status |
+| `settings/<wallet>/<index>/api-key` | writable | Write Enso API key |
+| `settings/wallets/<wallet>/<index>/venue.toml` | writable | Configure Enso-owned advisory venue preferences |
 
 ## Development
 
@@ -130,4 +131,10 @@ petal check --root .
 
 ## Account-scoped routes
 
-Select a wallet and numbered account under `/petals/enso/wallets/<wallet>/<account>/`. Petal operations and settings live below that directory. Account 0 keeps its existing private records; other accounts have separate stores. The core wallet tree remains `/wallets/<wallet>/<account>/`.
+Operations use `/petals/enso/intents/<wallet>/<index>/`; credentials use `/petals/enso/settings/<wallet>/<index>/`. Bloom resolves the explicit adjacent wallet and canonical numbered index from its live authenticated account projection, then supplies trusted `bloom.wallet` and `bloom.account`. Every index, including 0, has a uniform private store. Public metadata and documentation remain unscoped. Old packages and custom packages require a separate update; no legacy account-0 storage or old-host fallback is supported. The core wallet tree remains `/wallets/<wallet>/<index>/`.
+
+Existing installed state must be retained through the storage cutover. Pending
+sessions contain exact outbox and settlement correlation data needed for manual
+reconciliation. This package does not migrate or remove that state. Inspect
+pending sessions before replacing an installation; automatic recovery across
+the old storage layout is unsupported.

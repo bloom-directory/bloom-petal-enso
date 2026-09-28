@@ -127,8 +127,8 @@ The petal has **solid API-type parity** (all Enso route/quote/simulate/validate 
 | B1.1 | `defi/` (list, line 1606) | Lists `[README.md, intents]` | `$index.rs` → `[intents, meta, settings]` | **PARTIAL** — No README.md; adds meta/settings dirs (fine). | nice-to-have |
 | B1.2 | `defi/README.md` (read, line 1510) | Agent quick-start guide | — | **NO** — No README served. | nice-to-have |
 | B1.3 | `defi/intents/` (list, line 1607) | Lists wallets with sessions | `intents/$index.rs` | **YES** ✅ | — |
-| B1.4 | `defi/intents/<wallet>/` (list, line 1612) | Lists `new` + session dirs | `intents/[wallet]/$index.rs` | **YES** ✅ | — |
-| B1.5 | `defi/intents/<wallet>/new` (write, line 1566) | Create session | `intents/[wallet]/new.rs` | **YES** ✅ | — |
+| B1.4 | `defi/intents/<wallet>/<index>/` (list, line 1612) | Lists `new` + session dirs | `intents/[wallet]/[index]/$index.rs` | **YES** ✅ | — |
+| B1.5 | `defi/intents/<wallet>/<index>/new` (write, line 1566) | Create session | `intents/[wallet]/[index]/new.rs` | **YES** ✅ | — |
 | B1.6 | `.../<session>/intent.txt` (read, line 1520) | Original intent text | `intent.txt.rs` | **YES** ✅ | — |
 | B1.7 | `.../<session>/route.json` (read, line 1521) | Full Enso route response | `route.json.rs` | **YES** ✅ | — |
 | B1.8 | `.../<session>/plan.md` (read, line 1528) | Human-readable plan | `plan.md.rs` | **YES** ✅ | — |

@@ -44,4 +44,4 @@ Key differences from the monorepo:
 
 ## Account-scoped routes
 
-Select a wallet and numbered account under `/petals/enso/wallets/<wallet>/<account>/`. Petal operations and settings live below that directory. Account 0 keeps its existing private records; other accounts have separate stores. The core wallet tree remains `/wallets/<wallet>/<account>/`.
+Operations use `/petals/enso/intents/<wallet>/<index>/`; credentials use `/petals/enso/settings/<wallet>/<index>/`. Bloom resolves the explicit adjacent wallet and canonical numbered index from its live authenticated account projection, then supplies trusted `bloom.wallet` and `bloom.account`. Every index, including 0, has a uniform private store. Public metadata and documentation remain unscoped. Old packages and custom packages require a separate update; no legacy account-0 storage or old-host fallback is supported. The core wallet tree remains `/wallets/<wallet>/<index>/`.

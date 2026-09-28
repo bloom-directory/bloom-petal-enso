@@ -14,12 +14,12 @@ concurrency:
 
 jobs:
   release:
-    uses: bloom-directory/petal/.github/workflows/release-petal.yml@1af3ba971e8b494b58bb85d0c0fcf2ad15cd3b4c
+    uses: bloom-directory/petal/.github/workflows/release-petal.yml@2beed2ff344ce2b0c112e07096027e1ae0404007
     with:
       petal-name: enso
-      petal-tooling-ref: "1af3ba971e8b494b58bb85d0c0fcf2ad15cd3b4c"
+      petal-tooling-ref: "2beed2ff344ce2b0c112e07096027e1ae0404007"
       build-command: scripts/build.sh
       package-root: .
-      expected-route-count: 30
+      expected-route-count: 34
     secrets:
       compile-time-secret: ${{ secrets.ENSO_API_KEY }}

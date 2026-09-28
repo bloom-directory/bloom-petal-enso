@@ -1,4 +1,12 @@
 petal::route_file!(
-    spec: petal::static_dir_spec(),
-    list: vec![petal::writable("api-key"), petal::file("status.json"), petal::dir("wallets")]
+    spec: petal::static_dir_spec().caps(&["bloom:vfs.read"]),
+    ctx_list: |_ctx: &petal::Ctx| {
+        let names = petal::sdk::vfs_list("wallets", 1024 * 1024)
+            .map_err(|error| petal::error(-4, error.message()))?;
+        let mut children = vec![petal::dir("wallets")];
+        children.extend(names.into_iter()
+            .filter(|name| name != "registrations" && petal::validate_wallet_id(name).is_ok())
+            .map(petal::dir));
+        Ok(children)
+    }
 );

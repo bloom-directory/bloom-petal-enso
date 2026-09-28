@@ -24,6 +24,3 @@ paths = ["/api/v1/shortcuts/route"]
 [store]
 namespaces = ["state"]
 secret_namespaces = ["secrets"]
-
-[account]
-aware = true

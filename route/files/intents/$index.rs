@@ -1,22 +1,10 @@
 petal::route_file!(
-    spec: petal::store_dir_spec().caps(&["bloom:store"]),
+    spec: petal::static_dir_spec().caps(&["bloom:vfs.read"]),
     ctx_list: |_ctx: &petal::Ctx| {
-        use crate::workflow::Host;
-
-        let prefix = "intents/".to_string();
-        let mut host = crate::workflow::BloomHost;
-        let keys = host
-            .list(&prefix, 1024 * 1024)
-            .map_err(|error| petal::error(-4, error))?;
-        let mut wallets = std::collections::BTreeSet::new();
-        for key in keys {
-            if let Some(rest) = key.strip_prefix(&prefix)
-                && let Some((wallet, _)) = rest.split_once('/')
-                && crate::wallet::validate_id(wallet).is_ok()
-            {
-                wallets.insert(wallet.to_string());
-            }
-        }
-        Ok(wallets.into_iter().map(petal::dir).collect())
+        let names = petal::sdk::vfs_list("wallets", 1024 * 1024)
+            .map_err(|error| petal::error(-4, error.message()))?;
+        Ok(names.into_iter()
+            .filter(|name| name != "registrations" && petal::validate_wallet_id(name).is_ok())
+            .map(petal::dir).collect())
     }
 );
