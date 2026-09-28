@@ -38,19 +38,19 @@ pending approval.
 
 ## Configuration
 
-Set the Enso API key:
+Set the package-wide Enso API key once for all accounts:
 
 ```
-write: /petals/enso/settings/<wallet>/<index>/api-key
+write: /petals/enso/settings/api-key
 body:  your-enso-api-key-here
 ```
 
 Release builds can embed the repository secret `ENSO_API_KEY`. A key written to
-`settings/<wallet>/<index>/api-key` takes precedence over that embedded release credential. The
+`settings/api-key` takes precedence over that embedded release credential. The
 runtime setting `enso-api-key` remains a compatibility fallback, and
-`settings/<wallet>/<index>/status.json` reports the selected source without exposing the key.
+`settings/status.json` reports the selected source without exposing the key.
 
-Per-wallet Enso venue preferences live at `settings/<wallet>/<index>/venue.toml` in
+Per-account Enso venue preferences live at `settings/<wallet>/<index>/venue.toml` in
 the Petal's own state. No setup write is needed: an unconfigured wallet reads
 and uses the bundled defaults. Swaps are enabled on all 13 chains supported by Bloom and Enso
 (Ethereum, Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart
@@ -116,8 +116,8 @@ transactions, not unattended autonomous value movement.
 | `intents/<wallet>/<index>/<id>/settlement.json` | file | Settlement status |
 | `intents/<wallet>/<index>/<id>/status.json` | file | Session status |
 | `intents/<wallet>/<index>/<id>/confirm` | writable | Stage into outbox |
-| `settings/<wallet>/<index>/status.json` | file | API key credential status |
-| `settings/<wallet>/<index>/api-key` | writable | Write Enso API key |
+| `settings/status.json` | file | API key credential status |
+| `settings/api-key` | writable | Write Enso API key |
 | `settings/<wallet>/<index>/venue.toml` | writable | Configure Enso-owned advisory venue preferences |
 
 ## Development
@@ -131,7 +131,7 @@ petal check --root .
 
 ## Account-scoped routes
 
-Operations use `/petals/enso/intents/<wallet>/<index>/`; credentials use `/petals/enso/settings/<wallet>/<index>/`. Bloom resolves the explicit adjacent wallet and canonical numbered index from its live authenticated account projection, then supplies trusted `bloom.wallet` and `bloom.account`. Every index, including 0, has a uniform private store. Public metadata and documentation remain unscoped. Old packages and custom packages require a separate update; no legacy account-0 storage or old-host fallback is supported. The core wallet tree remains `/wallets/<wallet>/<index>/`.
+Operations use `/petals/enso/intents/<wallet>/<index>/`; service credentials use the global `/petals/enso/settings/` routes. Bloom resolves the explicit adjacent wallet and canonical numbered index from its live authenticated account projection, then supplies trusted `bloom.wallet` and `bloom.account`. Every index, including 0, has a uniform private store for account state. The manifest shares only the exact service credential keys through the package-global store. Public metadata and documentation remain unscoped. Old packages and custom packages require a separate update; no legacy account-0 storage or old-host fallback is supported. The core wallet tree remains `/wallets/<wallet>/<index>/`.
 
 Existing installed state must be retained through the storage cutover. Pending
 sessions contain exact outbox and settlement correlation data needed for manual

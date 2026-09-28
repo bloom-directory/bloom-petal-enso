@@ -57,3 +57,6 @@ mod account_context_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod global_settings_tests;
