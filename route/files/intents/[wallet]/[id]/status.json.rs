@@ -1,5 +1,5 @@
 petal::route_file!(
-    spec: petal::store_read_spec().caps(&["bloom:store"]),
+    spec: petal::store_read_spec().caps(&["bloom:store", "bloom:tx.outbox"]),
     read: |ctx: &petal::Ctx| {
         use crate::workflow::Host;
 
@@ -38,6 +38,32 @@ petal::route_file!(
                     .rev()
                     .find(|s| s.outbox_id.is_some());
 
+                // Bloom refuses a staged route once its Enso quote expires, and
+                // that refusal never reaches this Petal. Say so here instead of
+                // leaving a staged intent that looks confirmable.
+                let now = host.now_ms();
+                let quote = session
+                    .route
+                    .as_ref()
+                    .and_then(|route| crate::quote::status_view(route, now));
+                let quote_expired = quote
+                    .as_ref()
+                    .and_then(|view| view.get("expired"))
+                    .and_then(|expired| expired.as_bool())
+                    .unwrap_or(false);
+                let last_error = session.last_error.clone().or_else(|| {
+                    let outbox_id = primary
+                        .filter(|state| {
+                            session.state == "staged" && quote_expired && state.tx_hash.is_none()
+                        })
+                        .and_then(|state| state.outbox_id.clone())?;
+                    // Only while the outbox has not moved it past pending.
+                    let unsent = host
+                        .tx_inspect(&session.wallet, &session.chain, &outbox_id)
+                        .map_or(true, |inspection| inspection.state == "pending");
+                    unsent.then(|| crate::quote::expired_staged_error(&outbox_id))
+                });
+
                 petal::read_json_value(&serde_json::json!({
                     "id": session.id,
                     "wallet": session.wallet,
@@ -50,7 +76,8 @@ petal::route_file!(
                     "primary_outbox_id": primary.and_then(|s| s.outbox_id.clone()),
                     "primary_tx_hash": primary.and_then(|s| s.tx_hash.clone()),
                     "policy_checks": session.policy_checks,
-                    "last_error": session.last_error,
+                    "quote": quote,
+                    "last_error": last_error,
                     "history": session.history,
                 }))
             }

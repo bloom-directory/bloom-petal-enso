@@ -23,7 +23,8 @@ disables swaps. Existing saved restrictions take precedence over defaults.
 ```json
  write: /petals/enso/intents/<wallet>/new
  example: {"intent":"swap 100 usdc to eth","chain":"ethereum"}
- or just NL text: swap 100 usdc to eth
+ or just NL text: swap 100 usdc to eth on ethereum
+ The source chain is required: set "chain" or end the text with `on <chain>`.
 ```
 
 ### 2. Inspect the plan
@@ -41,6 +42,19 @@ disables swaps. Existing saved restrictions take precedence over defaults.
  body: confirm
 ```
 
+A quote expires at Enso's `validUntil`, or five minutes after the Petal
+fetched it when Enso sends none. When the stored quote is older than 30
+seconds or has expired, this confirm fetches a fresh one, asking
+Enso for the reviewed minimum output (reviewed quote less slippage), and
+stages it only if it keeps the reviewed router and native value and its
+minimum output reaches that floor. Otherwise nothing is staged and
+`status.json` `last_error` says why: for a route outside the reviewed bounds,
+abandon the intent and create a new one; for a temporary Enso or network
+failure, write `confirm` again.
+Confirm the outbox entry promptly after staging. `status.json` `quote` gives
+`expires_at_ms`; once a staged, unsent quote expires, `last_error` says to
+cancel that outbox entry and create a new intent. Retrying cannot help.
+
 ### 4. Verify settlement
 ```json
  read: /petals/enso/intents/<wallet>/<session>/settlement.json
@@ -53,6 +67,7 @@ disables swaps. Existing saved restrictions take precedence over defaults.
 - Enso-owned venue preferences are enforced at create and confirm
 - Bloom wallet policy and approval limits remain host-enforced
 - Simulation must pass before the route transaction is staged
+- An aged quote is refreshed at staging only within the reviewed bounds
 - ERC-20 approval is exact-amount and must succeed before a second confirm
 - Same-chain ERC-20 settlement requires an attributable receipt Transfer
 - Native and cross-chain balance changes are reported as unattributed
