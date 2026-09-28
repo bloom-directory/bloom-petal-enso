@@ -6,7 +6,7 @@ petal::route_file!(spec: petal::static_read_spec(), read: |_ctx: &petal::Ctx| {
 ### Default venue settings
 
 No configuration write is needed. Read and override preferences at:
-`/petals/enso/settings/wallets/<wallet>/<index>/venue.toml`.
+`/petals/enso/settings/<wallet>/<index>/venue.toml`.
 Defaults enable swaps on all 13 Bloom/Enso chains: Ethereum, Base, Tempo,
 Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche,
 Gnosis, Linea, HyperEVM, and Arc. Use `hyperliquid` for HyperEVM and

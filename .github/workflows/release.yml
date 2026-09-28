@@ -20,6 +20,6 @@ jobs:
       petal-tooling-ref: "2beed2ff344ce2b0c112e07096027e1ae0404007"
       build-command: scripts/build.sh
       package-root: .
-      expected-route-count: 34
+      expected-route-count: 31
     secrets:
       compile-time-secret: ${{ secrets.ENSO_API_KEY }}

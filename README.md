@@ -50,7 +50,7 @@ Release builds can embed the repository secret `ENSO_API_KEY`. A key written to
 runtime setting `enso-api-key` remains a compatibility fallback, and
 `settings/<wallet>/<index>/status.json` reports the selected source without exposing the key.
 
-Per-wallet Enso venue preferences live at `settings/wallets/<wallet>/<index>/venue.toml` in
+Per-wallet Enso venue preferences live at `settings/<wallet>/<index>/venue.toml` in
 the Petal's own state. No setup write is needed: an unconfigured wallet reads
 and uses the bundled defaults. Swaps are enabled on all 13 chains supported by Bloom and Enso
 (Ethereum, Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart
@@ -118,7 +118,7 @@ transactions, not unattended autonomous value movement.
 | `intents/<wallet>/<index>/<id>/confirm` | writable | Stage into outbox |
 | `settings/<wallet>/<index>/status.json` | file | API key credential status |
 | `settings/<wallet>/<index>/api-key` | writable | Write Enso API key |
-| `settings/wallets/<wallet>/<index>/venue.toml` | writable | Configure Enso-owned advisory venue preferences |
+| `settings/<wallet>/<index>/venue.toml` | writable | Configure Enso-owned advisory venue preferences |
 
 ## Development
 
