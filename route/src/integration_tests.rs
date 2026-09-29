@@ -1893,6 +1893,26 @@ fn malformed_saved_venue_configuration_does_not_use_enabled_defaults() {
     assert!(crate::policy::load_venue_config(&mut host, "test-wallet").is_err());
 }
 
+#[test]
+fn create_on_account_one_reads_only_its_numbered_address() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let address = host
+        .vfs
+        .remove("wallets/test-wallet/0/address.evm")
+        .unwrap();
+    host.vfs
+        .insert("wallets/test-wallet/1/address.evm".into(), address);
+    let id = crate::workflow::create_for_account(
+        &mut host,
+        "test-wallet",
+        1,
+        b"swap 100.0 usdc to eth on ethereum",
+    )
+    .expect("account one has the selected EVM address");
+    let session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(session.wallet, "test-wallet");
+}
+
 // ===========================================================================
 // TEST: quote freshness at staging
 // ===========================================================================
@@ -2189,7 +2209,7 @@ fn create_reports_input_mistakes_as_invalid_input() {
 /// an aged quote once failed live with "denied"). Pin each declaration.
 #[test]
 fn routes_declare_capabilities_their_workflows_need() {
-    let confirm = include_str!("../files/intents/[wallet]/[id]/confirm.rs");
+    let confirm = include_str!("../files/intents/[wallet]/[index]/[id]/confirm.rs");
     for cap in [
         "bloom:http",
         "bloom:store",
@@ -2201,14 +2221,14 @@ fn routes_declare_capabilities_their_workflows_need() {
             "confirm must declare {cap}"
         );
     }
-    let create = include_str!("../files/intents/[wallet]/new.rs");
+    let create = include_str!("../files/intents/[wallet]/[index]/new.rs");
     for cap in ["bloom:http", "bloom:store", "bloom:chain"] {
         assert!(
             create.contains(&format!("\"{cap}\"")),
             "new must declare {cap}"
         );
     }
-    let status = include_str!("../files/intents/[wallet]/[id]/status.json.rs");
+    let status = include_str!("../files/intents/[wallet]/[index]/[id]/status.json.rs");
     for cap in ["bloom:store", "bloom:tx.outbox"] {
         assert!(
             status.contains(&format!("\"{cap}\"")),

@@ -2,7 +2,7 @@ petal::route_file!(
     spec: petal::write_spec().caps(&["bloom:store"]),
     read: |_ctx: &petal::Ctx| {
         petal::DispatchResponse::Read(
-            b"write your Enso API key here (plain text or JSON {\"api_key\":\"...\"})\n".to_vec(),
+            b"write the global Enso API key for all accounts here (plain text or JSON {\"api_key\":\"...\"})\n".to_vec(),
         )
     },
     write: |_ctx: &petal::Ctx, body: &[u8]| {

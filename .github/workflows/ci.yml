@@ -34,7 +34,7 @@ jobs:
       - name: Install wasm-tools
         run: cargo install wasm-tools --version 1.254.0 --locked
       - name: Install canonical Petal toolchain
-        run: cargo install --git https://github.com/bloom-directory/petal --rev 1af3ba971e8b494b58bb85d0c0fcf2ad15cd3b4c --locked bloom-petal-cli
+        run: cargo install --git https://github.com/bloom-directory/petal --rev 2beed2ff344ce2b0c112e07096027e1ae0404007 --locked bloom-petal-cli
       - name: Build and validate route components
         run: |
           scripts/build.sh
@@ -43,7 +43,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: bloom-directory/bloom
-          ref: master
+          ref: b751087b4d7bb65a0f2796a00cf49237e20d9cda
           path: bloom
           persist-credentials: false
       - name: Build key-free debug Bloom CLI for install smoke tests
@@ -85,4 +85,4 @@ jobs:
           "$bloom_bin" --home "$home" petals build .
           "$bloom_bin" --home "$home" petal install .
           "$bloom_bin" --home "$home" vfs cat /petals/enso/meta/route-contract.json | grep -Fq '"name": "enso"'
-          "$bloom_bin" --home "$home" vfs cat /petals/enso/README.md | grep -Fq '/petals/enso/intents/'
+          "$bloom_bin" --home "$home" vfs cat /petals/enso/README.md | grep -Fq '/petals/enso/intents/<wallet>/<index>/'

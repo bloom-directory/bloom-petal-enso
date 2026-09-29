@@ -30,7 +30,7 @@ pub struct NewIntentBody {
     pub slippage_bps: Option<u16>,
 }
 
-/// Parse the write body for `intents/<wallet>/new`.
+/// Parse the write body for `intents/<wallet>/<index>/new`.
 /// Accepts JSON `{intent, chain, ...}` or bare NL text.
 pub fn parse_new_body(body: &[u8]) -> Result<NewIntentBody, String> {
     if body.is_empty() || body.len() > MAX_NEW_BODY_BYTES {

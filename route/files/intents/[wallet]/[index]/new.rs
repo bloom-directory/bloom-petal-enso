@@ -10,8 +10,14 @@ petal::route_file!(
             Ok(value) => value,
             Err(response) => return response,
         };
+        let account = match petal::route_param(ctx, "bloom.account")
+            .and_then(|value| value.parse::<u32>().ok())
+        {
+            Some(value) => value,
+            None => return petal::error(-2, "trusted account context is required"),
+        };
         let mut host = crate::workflow::BloomHost;
-        match crate::workflow::create(&mut host, wallet, body) {
+        match crate::workflow::create_for_account(&mut host, wallet, account, body) {
             Ok(_) => petal::DispatchResponse::Write,
             Err(crate::workflow::CreateError::InvalidInput(message)) => {
                 petal::error(-3, crate::redaction::sanitize_message(&message))

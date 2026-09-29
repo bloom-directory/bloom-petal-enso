@@ -19,3 +19,6 @@ pub mod prelude {
     pub use crate::workflow::*;
     pub use petal::*;
 }
+
+#[cfg(test)]
+mod global_settings_tests;
