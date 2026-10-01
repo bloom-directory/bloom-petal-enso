@@ -773,6 +773,9 @@ fn acquire_confirm_lock<H: Host>(
 pub fn confirm<H: Host>(host: &mut H, wallet: &str, id: &str, body: &[u8]) -> Result<(), String> {
     let (lock_key, lock_value) = acquire_confirm_lock(host, wallet, id)?;
     let result = confirm_locked(host, wallet, id, body);
+    if let Err(error) = &result {
+        record_confirm_error(host, wallet, id, error);
+    }
     let unlock = host.delete_if(&lock_key, &lock_value);
     match (result, unlock) {
         (Err(error), _) => Err(error),
@@ -781,6 +784,25 @@ pub fn confirm<H: Host>(host: &mut H, wallet: &str, id: &str, body: &[u8]) -> Re
             "transaction was staged but confirmation lock cleanup failed: {error}"
         )),
     }
+}
+
+/// A refused confirmation reaches a mounted filesystem only as an I/O error,
+/// so keep its reason in the session's `status.json` (`last_error`) where the
+/// caller can read it. Best effort: the refusal itself is what matters, and a
+/// terminal session keeps the reason it ended with.
+fn record_confirm_error<H: Host>(host: &mut H, wallet: &str, id: &str, error: &str) {
+    let Ok(mut sess) = load(host, wallet, id) else {
+        return;
+    };
+    let reason = crate::redaction::sanitize_message(error);
+    if sess.wallet != wallet
+        || sess.terminal()
+        || sess.last_error.as_deref() == Some(reason.as_str())
+    {
+        return;
+    }
+    sess.last_error = Some(reason);
+    let _ = save(host, &sess);
 }
 
 fn confirm_locked<H: Host>(

@@ -55,6 +55,11 @@ Confirm the outbox entry promptly after staging. `status.json` `quote` gives
 `expires_at_ms`; once a staged, unsent quote expires, `last_error` says to
 cancel that outbox entry and create a new intent. Retrying cannot help.
 
+A failed write to `confirm` shows only as an I/O error on the mount. Read
+`status.json`: `last_error` gives the reason. For an ERC-20 route, the first
+confirm stages only the exact-amount approval; broadcast it through the
+wallet outbox and wait for its receipt before confirming again.
+
 ### 4. Verify settlement
 ```json
  read: /petals/enso/intents/<wallet>/<index>/<session>/settlement.json
