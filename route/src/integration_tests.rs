@@ -1153,6 +1153,18 @@ fn refused_confirmation_is_recorded_in_the_session_and_cleared_on_success() {
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     assert_eq!(sess.state, "staged");
     assert_eq!(sess.last_error, None);
+
+    // An idempotent retry is also a successful confirmation: a malformed
+    // write after staging must not leave an error after a valid retry.
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"yes").unwrap_err();
+    let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(sess.last_error.as_deref(), Some(error.as_str()));
+    let staged_ids = sess.staged_ids.clone();
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(sess.state, "staged");
+    assert_eq!(sess.last_error, None);
+    assert_eq!(sess.staged_ids, staged_ids, "retry must not stage again");
 }
 
 // ===========================================================================
