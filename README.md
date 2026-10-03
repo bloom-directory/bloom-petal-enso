@@ -38,6 +38,12 @@ then write `confirm` to the Petal again. Only then is the swap simulated and
 staged. The route transaction is never placed in the outbox alongside a
 pending approval.
 
+A refused confirmation reaches a mounted filesystem only as an I/O error
+(`EIO`). Its reason is recorded in the session's `status.json` as
+`last_error` (for example, an approval that has not yet been broadcast and
+received); read it after any failed write to `confirm`. A successful
+confirmation clears it.
+
 Each quote's lifetime comes from Enso's route response: `validUntil` (Unix
 seconds) when Enso sends it, otherwise five minutes after the Petal fetched the
 route. The owner's approval can take minutes after staging, so staging

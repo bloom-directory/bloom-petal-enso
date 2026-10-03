@@ -1111,6 +1111,63 @@ fn simulation_failure_rejects_session() {
 }
 
 // ===========================================================================
+// TEST: a refused confirmation is readable from status.json
+// ===========================================================================
+
+#[test]
+fn refused_confirmation_is_recorded_in_the_session_and_cleared_on_success() {
+    let mut host = MockHost::new()
+        .with_enso_response(build_enso_response_erc20())
+        .with_allowance("0");
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        br#"swap 100.0 usdc to eth on ethereum"#,
+    )
+    .expect("create should succeed");
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm")
+        .expect("first confirmation stages the approval");
+
+    // Confirming again before the approval lands is refused; over a mount the
+    // caller sees only EIO, so the reason must be in the session.
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    assert!(
+        error.contains("broadcast it and wait for a successful receipt"),
+        "{error}"
+    );
+    let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(sess.state, "awaiting_approval");
+    assert_eq!(sess.last_error.as_deref(), Some(error.as_str()));
+    assert_eq!(sess.staged_ids.len(), 1, "nothing new may be staged");
+
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"yes").unwrap_err();
+    let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(sess.last_error.as_deref(), Some(error.as_str()));
+
+    let approval_id = sess.intent_states[0].outbox_id.clone().unwrap();
+    host.mark_outbox_success(&approval_id);
+    host.allowance =
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935".into();
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm")
+        .expect("route confirmation should succeed");
+    let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(sess.state, "staged");
+    assert_eq!(sess.last_error, None);
+
+    // An idempotent retry is also a successful confirmation: a malformed
+    // write after staging must not leave an error after a valid retry.
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"yes").unwrap_err();
+    let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(sess.last_error.as_deref(), Some(error.as_str()));
+    let staged_ids = sess.staged_ids.clone();
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(sess.state, "staged");
+    assert_eq!(sess.last_error, None);
+    assert_eq!(sess.staged_ids, staged_ids, "retry must not stage again");
+}
+
+// ===========================================================================
 // TEST: create → confirm → confirm with approve (2 intents, both staged)
 // ===========================================================================
 
