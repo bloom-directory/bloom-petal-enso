@@ -42,22 +42,10 @@ fn resolve_api_key<H: Host>(host: &mut H) -> Result<String, String> {
     Ok(resolved.key.expose().to_string())
 }
 
-fn wallet_address<H: Host>(host: &mut H, wallet: &str, account: u32) -> Result<String, String> {
-    crate::wallet::validate_id(wallet)?;
-    let address =
-        String::from_utf8(host.vfs_read(&format!("wallets/{wallet}/{account}/address.evm"), 128)?)
-            .map_err(|_| "wallet EVM address is not UTF-8")?
-            .trim()
-            .to_string();
-    validate_address(&address)?;
-    Ok(address)
-}
-
-fn validate_address(addr: &str) -> Result<(), String> {
-    if !addr.starts_with("0x") || addr.len() != 42 {
-        return Err("wallet address must be a 0x-prefixed 20-byte hex string".into());
-    }
-    Ok(())
+fn wallet_address<H: Host>(host: &mut H, account: &petal::WalletAccount) -> Result<String, String> {
+    let path = account.address_evm_path();
+    let raw = host.vfs_read(&path, petal::ADDRESS_MAX_BYTES)?;
+    petal::parse_evm_address(&raw).map_err(|reason| format!("{path}: {reason}"))
 }
 
 fn validate_session_id(id: &str) -> Result<(), String> {
@@ -413,20 +401,16 @@ impl From<&str> for CreateError {
     }
 }
 
-pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String, CreateError> {
-    create_for_account(host, wallet, 0, body)
-}
-
 /// Create for Bloom's trusted selected account.
 pub fn create_for_account<H: Host>(
     host: &mut H,
-    wallet: &str,
-    account: u32,
+    account: &petal::WalletAccount,
     body: &[u8],
 ) -> Result<String, CreateError> {
+    let wallet = account.wallet();
     let now = host.now_ms();
     let parsed = input::parse_new_body(body).map_err(CreateError::InvalidInput)?;
-    let address = wallet_address(host, wallet, account)?;
+    let address = wallet_address(host, account)?;
     let api_key = resolve_api_key(host)?;
 
     // Determine source chain. It must be named: a guessed chain would quote
