@@ -14,10 +14,10 @@ concurrency:
 
 jobs:
   release:
-    uses: bloom-directory/petal/.github/workflows/release-petal.yml@47cd4abbaa51aac57014ac1795e2749e32332f2c
+    uses: bloom-directory/petal/.github/workflows/release-petal.yml@222557410bf4d45b0fc30feefe779d4234c04097
     with:
       petal-name: enso
-      petal-tooling-ref: "47cd4abbaa51aac57014ac1795e2749e32332f2c"
+      petal-tooling-ref: "222557410bf4d45b0fc30feefe779d4234c04097"
       build-command: scripts/build.sh
       package-root: .
       expected-route-count: 31

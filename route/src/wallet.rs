@@ -1,6 +1,9 @@
 //! Bloom wallet-id validation compatible with the wallet surface.
 
 /// Validate the wallet names accepted by Bloom itself.
+///
+/// The grammar is the SDK's; an on-chain address gets its own message because
+/// it is the mistake an agent most often makes here.
 pub fn validate_id(value: &str) -> Result<&str, String> {
     if value.len() == 42
         && value.starts_with("0x")
@@ -11,18 +14,7 @@ pub fn validate_id(value: &str) -> Result<&str, String> {
                 .into(),
         );
     }
-    if value.is_empty()
-        || value.len() > 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err(
-            "wallet must be a Bloom wallet id containing 1-64 ASCII alphanumeric, '-' or '_' characters"
-                .into(),
-        );
-    }
-    Ok(value)
+    petal::validate_wallet_segment(value)
 }
 
 /// Read and validate the generated `[wallet]` route parameter.
@@ -66,8 +58,9 @@ mod tests {
     #[test]
     fn the_create_route_refuses_a_wallet_bloom_would_never_select() {
         // Each is refused at the boundary, before any read or request, by the
-        // SDK (empty, `..`) or by enso's grammar on top of it (space, dot).
-        for wallet in ["", "..", "test wallet", "wallet.name"] {
+        // SDK (empty, `..`) or by the wallet-name grammar on top of it. Broker
+        // wallet ids are lowercase tokens, so Bloom never selects `Alice`.
+        for wallet in ["", "..", "test wallet", "wallet.name", "Alice"] {
             assert!(
                 matches!(
                     selected(wallet, 0),
@@ -76,16 +69,24 @@ mod tests {
                 "{wallet:?}"
             );
         }
-        let alice = selected("Alice", 1).expect("a Bloom wallet name");
-        assert_eq!((alice.wallet(), alice.number()), ("Alice", 1));
+        let alice = selected("alice", 1).expect("a Bloom wallet name");
+        assert_eq!((alice.wallet(), alice.number()), ("alice", 1));
     }
 
     #[test]
     fn matches_bloom_wallet_name_grammar() {
-        for valid in ["a", "Alice", "release-test", "release_test", "A1"] {
+        for valid in ["a", "alice", "release-test", "release_test", "a1"] {
             assert_eq!(validate_id(valid), Ok(valid));
         }
-        for invalid in ["", "../etc", "test wallet", "wallet.name"] {
+        for invalid in [
+            "",
+            "../etc",
+            "test wallet",
+            "wallet.name",
+            "Alice",
+            "A1",
+            "1a",
+        ] {
             assert!(validate_id(invalid).is_err(), "{invalid}");
         }
     }

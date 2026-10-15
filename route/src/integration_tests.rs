@@ -764,7 +764,7 @@ fn missing_venue_configuration_allows_canonical_route() {
 #[test]
 fn venue_settings_use_namespaced_keys_and_preserve_custom_configuration() {
     let mut host = MockHost::new();
-    for wallet in ["api-key", "StatusJson", "wallets"] {
+    for wallet in ["api-key", "status_json", "wallets"] {
         crate::policy::write_venue_config(&mut host, wallet, b"[defi]\nenabled = false\n").unwrap();
         assert!(
             host.store
@@ -1700,35 +1700,6 @@ fn multiple_sessions_same_wallet_are_independent() {
 // ===========================================================================
 // TEST: invalid wallet name is rejected
 // ===========================================================================
-
-#[test]
-fn mixed_case_bloom_wallet_name_is_supported() {
-    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
-    let venue = host
-        .store
-        .get("settings/test-wallet/venue.toml")
-        .cloned()
-        .unwrap();
-    host.store
-        .insert("settings/wallets/Alice/venue.toml".to_string(), venue);
-    host.vfs.insert(
-        "wallets/Alice/0/address.evm".to_string(),
-        b"0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1".to_vec(),
-    );
-
-    let id = crate::workflow::create_for_account(
-        &mut host,
-        &petal::testing::wallet_account("Alice", 0),
-        b"swap 100.0 usdc to eth on ethereum",
-    )
-    .expect("mixed-case Bloom wallet names must remain usable");
-    let session = crate::workflow::load(&mut host, "Alice", &id).unwrap();
-    assert_eq!(session.wallet, "Alice");
-    assert!(
-        host.store
-            .contains_key(&format!("intents/Alice/{id}/session.json"))
-    );
-}
 
 #[test]
 fn oversized_intent_body_is_rejected_before_external_work() {

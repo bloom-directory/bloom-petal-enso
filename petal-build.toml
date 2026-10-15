@@ -11,7 +11,7 @@ alias = "enso_route"
 [sdk]
 package = "bloom-petal-sdk"
 git = "https://github.com/bloom-directory/petal"
-rev = "47cd4abbaa51aac57014ac1795e2749e32332f2c"
+rev = "222557410bf4d45b0fc30feefe779d4234c04097"
 
 [dependencies]
 alloy = { version = "2", default-features = false, features = ["dyn-abi", "sol-types", "std"] }
