@@ -1,5 +1,5 @@
 petal::route_file!(
-    spec: petal::store_read_spec().caps(&["bloom:store", "bloom:tx.outbox", "bloom:chain"]),
+    spec: petal::store_read_spec().caps(&["bloom:store", "bloom:tx.outbox", "bloom:chain", "bloom:http"]),
     read: |ctx: &petal::Ctx| {
         use crate::workflow::Host;
 
@@ -17,7 +17,7 @@ petal::route_file!(
             Err(error) => return petal::error(-1, error),
         };
 
-        // Get balance-based settlement status.
+        // Read attributable settlement evidence and bridge progress.
         let settlement = crate::settlement::settlement_status(&mut host, &session);
 
         // Inspect outbox for each staged intent.

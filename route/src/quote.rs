@@ -106,6 +106,18 @@ pub fn verify_refreshed(
             "the refreshed Enso quote ({fresh_output}) is below the reviewed minimum output ({minimum})"
         ));
     }
+    if req
+        .destination_chain_id
+        .is_some_and(|id| id != req.chain_id)
+    {
+        // A source-chain safeRoute check cannot constrain destination funds.
+        // Preserve the exact reviewed bridge program rather than silently
+        // replacing its unverified destination effects during quote refresh.
+        if fresh.tx.data != reviewed.tx.data {
+            return Err("the refreshed cross-chain shortcut changed; create a new intent to review its destination effects".into());
+        }
+        return Ok(());
+    }
     let fresh_minimum = crate::calldata::output_minimum(fresh, req)
         .ok_or("the refreshed Enso route has no decoded destination output constraint")?;
     if fresh_minimum < minimum {

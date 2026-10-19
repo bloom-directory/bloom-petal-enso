@@ -43,6 +43,10 @@ struct MockHost {
     enso_urls: Vec<String>,
     /// Calldata of every staged transaction, in staging order.
     staged_data: Vec<String>,
+    bridge_response: Option<serde_json::Value>,
+    destination_receipt: Option<serde_json::Value>,
+    destination_transaction: Option<serde_json::Value>,
+    bridge_calls: usize,
 }
 
 impl MockHost {
@@ -110,6 +114,10 @@ require_calldata_verification = false
             enso_calls: 0,
             enso_urls: Vec::new(),
             staged_data: Vec::new(),
+            bridge_response: None,
+            destination_receipt: None,
+            destination_transaction: None,
+            bridge_calls: 0,
         }
     }
 
@@ -192,6 +200,16 @@ impl Host for MockHost {
     }
 
     fn http(&mut self, req: HttpRequest, _max: usize) -> Result<HttpResponse, String> {
+        if req.url.contains("/bridge/check?") {
+            self.bridge_calls += 1;
+            assert_eq!(req.method, "GET");
+            assert!(req.url.starts_with("https://api.enso.finance/api/v1/"));
+            return Ok(HttpResponse {
+                status: self.enso_status,
+                headers: vec![],
+                body: serde_json::to_vec(&self.bridge_response).unwrap(),
+            });
+        }
         if req.url.contains("api.enso.finance")
             && let Some(ref body) = self.enso_response
         {
@@ -256,6 +274,13 @@ impl Host for MockHost {
 
     fn chain_read(&mut self, chain: &str, method: &str, _params: &str) -> Result<String, String> {
         match method {
+            "eth_getCode" => Ok("\"0x\"".into()),
+            "eth_getTransactionReceipt" => {
+                Ok(serde_json::to_string(&self.destination_receipt).unwrap())
+            }
+            "eth_getTransactionByHash" => {
+                Ok(serde_json::to_string(&self.destination_transaction).unwrap())
+            }
             "eth_call" => {
                 if self.eth_call_success {
                     Ok("\"0x\"".to_string())
@@ -2341,4 +2366,159 @@ fn routes_declare_capabilities_their_workflows_need() {
             "status.json must declare {cap}"
         );
     }
+}
+
+#[test]
+fn bridge_delivery_execution_receipt_and_cache_are_distinct() {
+    use serde_json::json;
+    let source = format!("0x{}", "11".repeat(32));
+    let delivery = format!("0x{}", "22".repeat(32));
+    let execution = format!("0x{}", "33".repeat(32));
+    let receiver = "0x742d35cc6634c0532925a3b844bc9e7595f0beb1";
+    let token = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    let mut host = MockHost::new();
+    host.bridge_response = Some(
+        json!({"sourceChainId":1,"sourceTxHash":source,"destinationChainId":8453,"status":"delivered","destinationTxHash":delivery,"intent":{"phase":"awaiting_funds"}}),
+    );
+    let read = |host: &mut MockHost| {
+        crate::bridge::settlement(
+            host,
+            1,
+            &source,
+            crate::bridge::Destination {
+                chain: "base",
+                chain_id: 8453,
+                receiver,
+                token,
+                minimum: "100",
+            },
+        )
+    };
+    assert_eq!(
+        read(&mut host)["status"],
+        "bridge_delivered_execution_pending"
+    );
+    assert_eq!(host.bridge_calls, 5);
+    assert_eq!(
+        read(&mut host)["status"],
+        "bridge_delivered_execution_pending"
+    );
+    assert_eq!(host.bridge_calls, 5);
+    host.now += 10001;
+    host.bridge_response.as_mut().unwrap()["intent"] =
+        json!({"phase":"executed","executionTxHash":execution,"executionChainId":8453});
+    host.destination_receipt = Some(
+        json!({"transactionHash":execution,"status":"0x1","logs":[{"address":token,"topics":["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",format!("0x{}", "00".repeat(32)),format!("0x000000000000000000000000{}", &receiver[2..])],"data":format!("0x{:064x}",100)}]}),
+    );
+    let result = read(&mut host);
+    assert_eq!(result["status"], "destination_received_provider_linked");
+    assert_eq!(result["destination_execution_tx_hash"], execution);
+    assert_eq!(result["linkage_assurance"], "provider_asserted");
+    assert_eq!(host.bridge_calls, 10);
+    host.destination_receipt.as_mut().unwrap()["transactionHash"] = json!(delivery);
+    assert_eq!(read(&mut host)["status"], "destination_receipt_pending");
+    host.destination_receipt.as_mut().unwrap()["transactionHash"] = json!(execution);
+    host.destination_receipt.as_mut().unwrap()["logs"][0]["address"] = json!(receiver);
+    assert_eq!(read(&mut host)["status"], "destination_below_minimum");
+    host.destination_receipt.as_mut().unwrap()["status"] = json!("0x0");
+    assert_eq!(read(&mut host)["status"], "destination_execution_failed");
+    host.chain_ids.insert("base".into(), 1);
+    assert_eq!(read(&mut host)["status"], "destination_network_mismatch");
+}
+
+#[test]
+fn bridge_native_requires_mined_direct_value_and_provider_failures_stay_explicit() {
+    use serde_json::json;
+    let source = format!("0x{}", "11".repeat(32));
+    let execution = format!("0x{}", "33".repeat(32));
+    let block = format!("0x{}", "44".repeat(32));
+    let receiver = "0x742d35cc6634c0532925a3b844bc9e7595f0beb1";
+    let mut host = MockHost::new();
+    host.bridge_response = Some(
+        json!({"sourceChainId":1,"sourceTxHash":source,"destinationChainId":8453,"status":"delivered","destinationTxHash":execution}),
+    );
+    host.destination_receipt =
+        Some(json!({"transactionHash":execution,"blockHash":block,"status":"0x1"}));
+    let read = |host: &mut MockHost| {
+        crate::bridge::settlement(
+            host,
+            1,
+            &source,
+            crate::bridge::Destination {
+                chain: "base",
+                chain_id: 8453,
+                receiver,
+                token: crate::api_types::NATIVE_TOKEN,
+                minimum: "100",
+            },
+        )
+    };
+    assert_eq!(
+        read(&mut host)["status"],
+        "destination_native_amount_unverified"
+    );
+    host.destination_transaction = Some(
+        json!({"hash":execution,"blockHash":block,"to":receiver,"from":"0x1111111111111111111111111111111111111111","value":"0x64"}),
+    );
+    assert_eq!(
+        read(&mut host)["status"],
+        "destination_received_provider_linked"
+    );
+    host.destination_transaction.as_mut().unwrap()["blockHash"] = json!(source);
+    assert_eq!(
+        read(&mut host)["status"],
+        "destination_native_amount_unverified"
+    );
+    for (patch, expected) in [
+        (
+            json!({"status":"ready_for_manual_execution"}),
+            "bridge_manual_execution_required",
+        ),
+        (json!({"status":"failed"}), "destination_execution_failed"),
+        (json!({"isMultiBridge":true}), "multi_bridge_unverified"),
+        (
+            json!({"intent":{"phase":"refunded"}}),
+            "bridge_refund_reported",
+        ),
+    ] {
+        host.now += 10001;
+        let mut response = json!({"sourceChainId":1,"sourceTxHash":source,"destinationChainId":8453,"status":"pending"});
+        for (key, value) in patch.as_object().unwrap() {
+            response[key] = value.clone();
+        }
+        host.bridge_response = Some(response);
+        assert_eq!(read(&mut host)["status"], expected);
+    }
+    host.now += 10001;
+    host.enso_status = 429;
+    assert_eq!(read(&mut host)["status"], "bridge_pending");
+    assert!(crate::bridge::observe(&mut host, 1, "0xinvalid").is_err());
+}
+
+#[test]
+fn cross_chain_quote_refresh_requires_the_same_reviewed_shortcut() {
+    let mut response: serde_json::Value =
+        serde_json::from_slice(&build_enso_response_erc20()).unwrap();
+    response["route"][0]["destinationChainId"] = serde_json::json!(8453);
+    let mut host = MockHost::new().with_enso_response(serde_json::to_vec(&response).unwrap());
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        br#"{"intent":"swap 100.0 usdc to eth","chain":"ethereum","destination_chain":"base"}"#,
+    )
+    .unwrap();
+    let session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    let reviewed = session.route.as_ref().unwrap();
+    let request = session.route_request.as_ref().unwrap();
+    assert!(crate::quote::verify_refreshed(reviewed, reviewed, request).is_ok());
+    let mut changed = reviewed.clone();
+    use alloy::sol_types::SolCall;
+    let mut call = crate::api_types::IEnsoRouter::routeSingleCall::abi_decode(&changed.tx.data).unwrap();
+    call.data = vec![1].into();
+    changed.tx.data = call.abi_encode().into();
+    assert!(
+        crate::quote::verify_refreshed(reviewed, &changed, request)
+            .unwrap_err()
+            .contains("cross-chain shortcut changed")
+    );
 }

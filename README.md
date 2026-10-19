@@ -117,15 +117,26 @@ are never interpreted by this Petal.
 - Same-chain ERC-20 settlement requires a successful source receipt containing
   an attributable `Transfer` to the receiver for at least the calldata minimum;
   older unverified routes use the quote and label its source
-- Cross-chain and native-output balance increases are reported as observed but
-  unattributed; they are never presented as confirmed settlement
+- Cross-chain tracking queries the five documented bridge providers, caches
+  responses for ten seconds, and distinguishes delivery from keeper execution,
+  refunds and manual recovery. Sequential hops must link every chain and hash
+- Destination ERC-20 completion requires a matching successful receipt and net
+  incoming token logs meeting the reviewed quote floor. Direct native receipts
+  require a mined value transfer to an undelegated EOA at the same canonical
+  block. Provider linkage is explicitly labelled `provider_asserted`
+- Internal native transfers without trace evidence and incomplete bridge hops
+  remain unverified. A balance increase alone never establishes settlement
 
-Nested shortcut code, intermediate protocol calls, runtime bytecode and fees
-are not independently verified. The output check constrains a successful
+Broker reads nested Weiroll command structure and catalog-supported calls
+whose inputs are constant. Return-dependent arguments remain symbolic;
+runtime bytecode, intermediate effects and fees are not independently verified.
+The output check constrains a successful
 execution; it does not prove execution happened. Cross-chain destination
 settlement cannot be constrained by a source-chain balance check and retains
 explicit warnings and the existing venue preference gate. No additional
 owner ceremony is added.
+Cross-chain quote refresh preserves the exact reviewed shortcut; changed
+destination programs require a new intent and review.
 
 ## Route Surface
 

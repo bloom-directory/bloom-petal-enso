@@ -85,6 +85,33 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
         });
     }
 
+    if !dest_chain.eq_ignore_ascii_case(&sess.chain) {
+        let Some(source_hash) = inspection.tx_hash.as_deref() else {
+            return serde_json::json!({"status":"source_hash_unavailable"});
+        };
+        let Some(destination_id) = req.destination_chain_id else {
+            return serde_json::json!({"status":"destination_network_unverified"});
+        };
+        let minimum = sess
+            .route
+            .as_ref()
+            .and_then(|route| crate::quote::reviewed_minimum_output(route, req).ok());
+        let Some(minimum) = minimum else {
+            return serde_json::json!({"status":"destination_minimum_unverified"});
+        };
+        return crate::bridge::settlement(
+            host,
+            req.chain_id,
+            source_hash,
+            crate::bridge::Destination {
+                chain: dest_chain,
+                chain_id: destination_id,
+                receiver: &receiver,
+                token: &token_out_hex,
+                minimum: &minimum.to_string(),
+            },
+        );
+    }
     let current = match read_balance(host, dest_chain, &token_out_hex, &receiver) {
         Ok(value) => value,
         Err(error) => {
@@ -162,7 +189,11 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
     })
 }
 
-fn transfer_amount_to_receiver(receipt: &str, token: &str, receiver: &str) -> Option<String> {
+pub(crate) fn transfer_amount_to_receiver(
+    receipt: &str,
+    token: &str,
+    receiver: &str,
+) -> Option<String> {
     let receipt: serde_json::Value = serde_json::from_str(receipt).ok()?;
     let logs = receipt.get("logs")?.as_array()?;
     let receiver = receiver
@@ -170,8 +201,12 @@ fn transfer_amount_to_receiver(receipt: &str, token: &str, receiver: &str) -> Op
         .unwrap_or(receiver)
         .to_ascii_lowercase();
     let mut total = U256::ZERO;
+    let mut spent = U256::ZERO;
     let mut matched = false;
     for log in logs {
+        if log.get("removed").and_then(serde_json::Value::as_bool) == Some(true) {
+            continue;
+        }
         let Some(address) = log.get("address").and_then(|value| value.as_str()) else {
             continue;
         };
@@ -181,7 +216,7 @@ fn transfer_amount_to_receiver(receipt: &str, token: &str, receiver: &str) -> Op
         let Some(topics) = log.get("topics").and_then(|value| value.as_array()) else {
             continue;
         };
-        if topics.len() < 3 {
+        if topics.len() != 3 {
             continue;
         }
         let (Some(event_topic), Some(recipient_topic)) = (topics[0].as_str(), topics[2].as_str())
@@ -189,9 +224,20 @@ fn transfer_amount_to_receiver(receipt: &str, token: &str, receiver: &str) -> Op
             continue;
         };
         let recipient_topic = recipient_topic.trim_start_matches("0x");
-        if !event_topic.eq_ignore_ascii_case(TRANSFER_TOPIC)
-            || recipient_topic.len() != 64
-            || !recipient_topic[24..].eq_ignore_ascii_case(&receiver)
+        let Some(sender_topic) = topics[1].as_str().and_then(|s| s.strip_prefix("0x")) else {
+            continue;
+        };
+        if !event_topic.eq_ignore_ascii_case(TRANSFER_TOPIC) {
+            continue;
+        }
+        if recipient_topic.len() != 64
+            || sender_topic.len() != 64
+            || !recipient_topic
+                .bytes()
+                .chain(sender_topic.bytes())
+                .all(|b| b.is_ascii_hexdigit())
+            || &recipient_topic[..24] != "000000000000000000000000"
+            || &sender_topic[..24] != "000000000000000000000000"
         {
             continue;
         }
@@ -205,10 +251,15 @@ fn transfer_amount_to_receiver(receipt: &str, token: &str, receiver: &str) -> Op
         let Ok(amount) = U256::from_str_radix(data, 16) else {
             continue;
         };
-        total = total.checked_add(amount)?;
-        matched = true;
+        if recipient_topic[24..].eq_ignore_ascii_case(&receiver) {
+            total = total.checked_add(amount)?;
+            matched = true;
+        }
+        if sender_topic[24..].eq_ignore_ascii_case(&receiver) {
+            spent = spent.checked_add(amount)?;
+        }
     }
-    matched.then(|| total.to_string())
+    matched.then(|| total.saturating_sub(spent).to_string())
 }
 
 /// Observe the pre-stage balance of the output token for the receiver.
@@ -253,7 +304,7 @@ fn normalize_decimal(value: &str) -> String {
     }
 }
 
-fn lt_decimal(a: &str, b: &str) -> bool {
+pub(crate) fn lt_decimal(a: &str, b: &str) -> bool {
     let a = normalize_decimal(a);
     let b = normalize_decimal(b);
     if a.len() != b.len() {
@@ -360,6 +411,27 @@ mod tests {
         assert_eq!(
             transfer_amount_to_receiver(&receipt.to_string(), token, receiver).as_deref(),
             Some("123")
+        );
+    }
+
+    #[test]
+    fn outgoing_tokens_and_removed_logs_do_not_inflate_received_amount() {
+        let token = "0x6b175474e89094c44da98b954eedeac495271d0f";
+        let receiver = "0x742d35cc6634c0532925a3b844bc9e7595f0beb1";
+        let account = format!("0x000000000000000000000000{}", &receiver[2..]);
+        let other = format!("0x{}", "00".repeat(32));
+        let mut receipt = serde_json::json!({"logs":[
+            {"address":token,"topics":[TRANSFER_TOPIC,other,account],"data":format!("0x{:064x}",100)},
+            {"address":token,"topics":[TRANSFER_TOPIC,account,other],"data":format!("0x{:064x}",99)},
+            {"removed":true,"address":token,"topics":[TRANSFER_TOPIC,other,account],"data":format!("0x{:064x}",200)}]});
+        assert_eq!(
+            transfer_amount_to_receiver(&receipt.to_string(), token, receiver).as_deref(),
+            Some("1")
+        );
+        receipt["logs"][1]["data"] = serde_json::json!(format!("0x{:064x}", 101));
+        assert_eq!(
+            transfer_amount_to_receiver(&receipt.to_string(), token, receiver).as_deref(),
+            Some("0")
         );
     }
 
