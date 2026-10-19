@@ -2166,6 +2166,9 @@ fn aged_quote_is_refreshed_before_staging_within_reviewed_bounds() {
     assert_eq!(sess.state, "staged");
     assert_eq!(sess.last_error, None);
     assert_eq!(sess.route.as_ref().unwrap().amount_out, "2990000000");
+    assert!(sess.plan_md.contains("Expected output: 2990000000"));
+    assert!(sess.plan_md.contains("Calldata minimum output: 2985000000"));
+    assert!(!sess.plan_md.contains("Expected output: 3000000000"));
     assert!(
         sess.history
             .iter()

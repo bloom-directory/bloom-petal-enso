@@ -381,6 +381,30 @@ fn render_plan_md(view: PlanView<'_>) -> String {
     out
 }
 
+/// Keep the readable plan tied to the currently prepared transaction after
+/// refresh/simulation, rather than retaining the original quote's bytes.
+fn update_plan(sess: &mut Session) -> Result<(), String> {
+    let req = sess
+        .route_request
+        .as_ref()
+        .ok_or("session has no route request")?;
+    let route = sess.route.as_ref().ok_or("session has no route")?;
+    sess.plan_md = render_plan_md(PlanView {
+        intent_text: &sess.intent_text,
+        chain_name: &sess.chain,
+        destination_chain: sess.destination_chain.as_deref(),
+        req,
+        route,
+        intents: &sess.intents,
+        route_verified: route.input_matches_request(req),
+        receiver_class: sess.receiver_class.as_deref().unwrap_or("unknown"),
+        observed_before: sess.observed_before.as_deref(),
+        policy_checks: &sess.policy_checks,
+        simulation: sess.simulation.as_ref(),
+    });
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // create — route discovery + session creation
 // ---------------------------------------------------------------------------
@@ -1023,11 +1047,13 @@ fn confirm_locked<H: Host>(
             crate::simulation::failure_message(&simulation)
         );
         sess.simulation = Some(simulation);
+        update_plan(&mut sess)?;
         sess.last_error = Some(reason.clone());
         save(host, &sess)?;
         return Err(reason);
     }
     sess.simulation = Some(simulation);
+    update_plan(&mut sess)?;
 
     let route_index = intents.len() - 1;
     if sess
@@ -1171,6 +1197,8 @@ fn refresh_route_quote<H: Host>(
     route_intent.data_hex = format!("0x{}", hex::encode(&fresh.tx.data));
     refreshed.route = Some(fresh.clone());
     refreshed.policy_checks = policy_checks;
+    refreshed.simulation = None;
+    update_plan(&mut refreshed).map_err(RefreshError::OutOfBounds)?;
     verify_prepared_intents(&refreshed, req, &fresh).map_err(RefreshError::OutOfBounds)?;
     let state = refreshed.state.clone();
     refreshed.transition(
