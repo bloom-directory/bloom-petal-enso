@@ -2513,7 +2513,8 @@ fn cross_chain_quote_refresh_requires_the_same_reviewed_shortcut() {
     assert!(crate::quote::verify_refreshed(reviewed, reviewed, request).is_ok());
     let mut changed = reviewed.clone();
     use alloy::sol_types::SolCall;
-    let mut call = crate::api_types::IEnsoRouter::routeSingleCall::abi_decode(&changed.tx.data).unwrap();
+    let mut call =
+        crate::api_types::IEnsoRouter::routeSingleCall::abi_decode(&changed.tx.data).unwrap();
     call.data = vec![1].into();
     changed.tx.data = call.abi_encode().into();
     assert!(
