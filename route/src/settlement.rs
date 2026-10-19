@@ -107,8 +107,16 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
     };
 
     let delta = sub_decimal(&current, &before);
-    let minimum = match sess.route.as_ref().map(|route| route.amount_out.trim()) {
-        Some(value) if is_decimal(value) => value,
+    let (minimum, minimum_source) = match sess.route.as_ref() {
+        Some(route) => match crate::calldata::output_minimum(route, req) {
+            Some(value) => (value.to_string(), "router_calldata"),
+            None if is_decimal(route.amount_out.trim()) => {
+                (route.amount_out.trim().to_string(), "enso_quote_unverified")
+            }
+            None => {
+                return serde_json::json!({"status": "error", "error": "Enso route has no valid output floor"});
+            }
+        },
         _ => {
             return serde_json::json!({
                 "status": "error",
@@ -116,7 +124,7 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
             });
         }
     };
-    let balance_reached_quote = !lt_decimal(&delta, minimum);
+    let balance_reached_quote = !lt_decimal(&delta, &minimum);
     let same_chain = dest_chain.eq_ignore_ascii_case(&sess.chain);
     let receipt_transfer = if same_chain && !token_out_hex.eq_ignore_ascii_case(NATIVE_TOKEN) {
         inspection
@@ -128,13 +136,13 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
     };
     let receipt_reached_quote = receipt_transfer
         .as_deref()
-        .is_some_and(|amount| !lt_decimal(amount, minimum));
+        .is_some_and(|amount| !lt_decimal(amount, &minimum));
     let status = if receipt_reached_quote {
         "destination_received"
     } else if balance_reached_quote {
         "destination_observed_unattributed"
     } else {
-        "destination_below_quote"
+        "destination_below_minimum"
     };
 
     serde_json::json!({
@@ -147,6 +155,7 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
         "delta": delta,
         "receipt_transfer_amount": receipt_transfer,
         "minimum_expected": minimum,
+        "minimum_source": minimum_source,
         "destination_chain": dest_chain,
         "receiver": receiver,
         "token_out": token_out_hex,

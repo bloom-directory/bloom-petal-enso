@@ -258,7 +258,7 @@ fn render_plan_md(view: PlanView<'_>) -> String {
 
     let mut out = format!(
         "# Enso Shortcuts Swap\n\n\
-         The following is Bloom's authoritative transaction plan.\n\n\
+         Prepared transaction and Enso quote. Nested shortcut effects are not independently verified.\n\n\
          - Intent: `{intent_text}`\n\
          - Source chain: `{chain_name}` (chain ID {})\n\
          - Destination chain: `{dest}`\n\
@@ -284,6 +284,13 @@ fn render_plan_md(view: PlanView<'_>) -> String {
             .map(|v| format!("{v}"))
             .unwrap_or_else(|| "not reported".into()),
     );
+
+    match crate::calldata::output_minimum(route, req) {
+        Some(minimum) => out.push_str(&format!(
+            "- Calldata minimum output: {minimum} raw units of `{token_out_hex}` to `{receiver_addr}`. The Router V2 call checks this balance increase atomically; it is not a receipt or a guarantee of future execution.\n\n"
+        )),
+        None => out.push_str("- Destination output is not constrained by a decoded same-chain router check.\n\n"),
+    }
 
     // Simulation summary.
     if let Some(sim) = simulation {
@@ -531,7 +538,7 @@ pub fn create_for_account<H: Host>(
     }
 
     // Call Enso route API.
-    let route_resp = api::route(host, &api_key, &route_req)?;
+    let mut route_resp = api::route(host, &api_key, &route_req)?;
 
     // SECURITY: verify route input matches request — reject if not.
     let route_verified = route_resp.input_matches_request(&route_req);
@@ -550,6 +557,7 @@ pub fn create_for_account<H: Host>(
     if !valid_positive_decimal(route_resp.amount_out.trim()) {
         return Err("Enso route returned an invalid quoted output amount — refusing".into());
     }
+    crate::calldata::bind_output_checks(&mut route_resp, &route_req)?;
 
     let router_addr = format!("0x{:x}", route_resp.tx.to);
 
@@ -601,6 +609,7 @@ pub fn create_for_account<H: Host>(
     // authoritative wallet policy independently when staging.
     let protocols = route_resp.protocols();
     let verified_policy = crate::policy::load_venue_config(host, wallet)?;
+    let output_verified = crate::calldata::verify_output_checks(&route_resp, &route_req)?;
     let policy_checks = crate::policy::evaluate(
         &verified_policy,
         &crate::policy::RoutePolicyContext {
@@ -616,9 +625,8 @@ pub fn create_for_account<H: Host>(
             native_value_wei: route_resp.tx.value,
             slippage_bps: route_req.slippage_bps,
             route_verified,
-            // Enso Router V2's opaque action bytes are not decoded here.
-            receiver_verified: false,
-            min_out_enforced: false,
+            receiver_verified: output_verified,
+            min_out_enforced: output_verified,
             needs_approve,
         },
     );
@@ -1086,6 +1094,7 @@ fn route_policy_checks<H: Host>(
     let router = format!("0x{:x}", route.tx.to);
     let protocols = route.protocols();
     let verified_policy = crate::policy::load_venue_config(host, wallet)?;
+    let output_verified = crate::calldata::verify_output_checks(route, req)?;
     Ok(crate::policy::evaluate(
         &verified_policy,
         &crate::policy::RoutePolicyContext {
@@ -1101,8 +1110,8 @@ fn route_policy_checks<H: Host>(
             native_value_wei: route.tx.value,
             slippage_bps: req.slippage_bps,
             route_verified: true,
-            receiver_verified: false,
-            min_out_enforced: false,
+            receiver_verified: output_verified,
+            min_out_enforced: output_verified,
             needs_approve,
         },
     ))
@@ -1132,13 +1141,17 @@ fn refresh_route_quote<H: Host>(
     let api_key = resolve_api_key(host).map_err(RefreshError::Unavailable)?;
     let mut refresh_request = req.clone();
     refresh_request.min_amount_out = Some(
-        crate::quote::reviewed_minimum_output(reviewed, req).map_err(RefreshError::OutOfBounds)?,
+        crate::quote::reviewed_minimum_output(reviewed, req)
+            .map_err(RefreshError::OutOfBounds)?
+            .max(crate::calldata::output_minimum(reviewed, req).unwrap_or(U256::ZERO)),
     );
-    let fresh = api::route(host, &api_key, &refresh_request).map_err(|error| {
+    let mut fresh = api::route(host, &api_key, &refresh_request).map_err(|error| {
         RefreshError::Unavailable(format!(
             "cannot refresh the Enso quote before staging: {error}"
         ))
     })?;
+    crate::calldata::bind_output_checks(&mut fresh, &refresh_request)
+        .map_err(RefreshError::OutOfBounds)?;
     crate::quote::verify_refreshed(reviewed, &fresh, req).map_err(RefreshError::OutOfBounds)?;
     let policy_checks = route_policy_checks(host, wallet, sess, req, &fresh, needs_approve)
         .map_err(RefreshError::Unavailable)?;

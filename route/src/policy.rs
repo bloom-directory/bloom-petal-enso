@@ -523,9 +523,13 @@ mod tests {
         let mut ctx = context(&[]);
         ctx.protocols_unknown = true;
         for source in &policy.defi.allowed_source_chains {
+            assert!(
+                crate::input::chain_to_id(source).is_some(),
+                "advertised chain is not accepted: {source}"
+            );
             ctx.router = match source.as_str() {
                 "linea" => "0xa146d46823f3f594b785200102be5385cafce9b5",
-                "robinhood" | "arc" | "tempo" => "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7",
+                "robinhood" | "tempo" => "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7",
                 _ => "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
             };
             for destination in &policy.defi.allowed_destination_chains {

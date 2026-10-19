@@ -814,7 +814,6 @@ fn venue_defaults_cover_bloom_enso_intersection() {
         ("hyperliquid", common),
         ("linea", "0xa146d46823f3f594b785200102be5385cafce9b5"),
         ("robinhood", "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"),
-        ("arc", "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"),
         ("tempo", "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"),
     ] {
         assert!(policy.defi.allowed_source_chains.contains(chain), "{chain}");
@@ -829,8 +828,9 @@ fn venue_defaults_cover_bloom_enso_intersection() {
                 .contains(&format!("{chain}:{router}"))
         );
     }
-    assert_eq!(policy.defi.allowed_source_chains.len(), 13);
-    assert_eq!(policy.defi.allowed_destination_chains.len(), 13);
+    assert_eq!(policy.defi.allowed_source_chains.len(), 12);
+    assert_eq!(policy.defi.allowed_destination_chains.len(), 12);
+    assert!(!policy.defi.allowed_source_chains.contains("arc"));
     assert!(!policy.defi.allowed_source_chains.contains("unsupported"));
     assert!(
         !policy
@@ -990,9 +990,78 @@ fn policy_overall_aggregation() {
     let id = crate::workflow::create(&mut host, "test-wallet", body).unwrap();
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
 
-    // Minnow-style policy accepts quote-only receiver/min-output facts with
-    // explicit warnings, so the aggregate is warn rather than a silent pass.
-    assert_eq!(sess.policy_overall(), "warn");
+    // Same-chain receiver/minimum now come from the locally prepared safe call.
+    assert_eq!(sess.policy_overall(), "pass");
+}
+
+#[test]
+fn same_chain_routes_work_with_required_calldata_verification() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let policy = host
+        .store
+        .get_mut("settings/test-wallet/venue.toml")
+        .unwrap();
+    *policy = String::from_utf8(policy.clone())
+        .unwrap()
+        .replace(
+            "require_calldata_verification = false",
+            "require_calldata_verification = true",
+        )
+        .into_bytes();
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 100.0 usdc to eth on ethereum",
+    )
+    .unwrap();
+    let session = load_session(&mut host, &id);
+    assert!(session.plan_md.contains("Calldata minimum output:"));
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    assert_eq!(host.staged.len(), 1);
+    assert!(
+        load_session(&mut host, &id)
+            .policy_checks
+            .to_string()
+            .contains("minimum-output floor is enforced")
+    );
+}
+
+#[test]
+fn tampered_stored_safe_output_is_refused_before_staging() {
+    use alloy::primitives::{Address, U256};
+    use alloy::sol_types::{SolCall, SolValue};
+    for change in ["receiver", "token", "minimum"] {
+        let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+        let id = crate::workflow::create(
+            &mut host,
+            "test-wallet",
+            b"swap 100.0 usdc to eth on ethereum",
+        )
+        .unwrap();
+        let mut session = load_session(&mut host, &id);
+        let route = session.route.as_mut().unwrap();
+        let mut call =
+            crate::api_types::IEnsoRouter::safeRouteSingleCall::abi_decode(&route.tx.data).unwrap();
+        match change {
+            "receiver" => call.receiver = Address::repeat_byte(0x77),
+            "token" => {
+                call.tokenOut.tokenType = 1;
+                call.tokenOut.data = (Address::repeat_byte(0x77), U256::MAX)
+                    .abi_encode_params()
+                    .into();
+            }
+            _ => call.tokenOut.data = (U256::ZERO,).abi_encode_params().into(),
+        }
+        route.tx.data = call.abi_encode().into();
+        session.intents.last_mut().unwrap().data_hex = format!("0x{}", hex::encode(&route.tx.data));
+        host.store
+            .insert(session.key(), serde_json::to_vec(&session).unwrap());
+        assert!(
+            crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").is_err(),
+            "{change}"
+        );
+        assert!(host.staged.is_empty());
+    }
 }
 
 // ===========================================================================
@@ -1361,7 +1430,7 @@ fn settlement_received_after_balance_increase() {
         &route_id,
         "0x6b175474e89094c44da98b954eedeac495271d0f",
         "0x742d35cc6634c0532925a3b844bc9e7595f0beb1",
-        50_000_000_000_000_000,
+        49_750_000_000_000_000,
     );
 
     // Now simulate balance increase on destination chain
@@ -1375,6 +1444,18 @@ fn settlement_received_after_balance_increase() {
     );
     let delta = status.get("delta").and_then(|v| v.as_str()).unwrap();
     assert_ne!(delta, "0", "delta should be non-zero");
+    assert_eq!(status["minimum_expected"], "49750000000000000");
+    assert_eq!(status["minimum_source"], "router_calldata");
+    host.mark_outbox_success_with_transfer(
+        &route_id,
+        "0x6b175474e89094c44da98b954eedeac495271d0f",
+        "0x742d35cc6634c0532925a3b844bc9e7595f0beb1",
+        49_749_999_999_999_999,
+    );
+    assert_ne!(
+        crate::settlement::settlement_status(&mut host, &sess)["status"],
+        "destination_received"
+    );
 }
 
 // ===========================================================================
@@ -1971,6 +2052,34 @@ fn build_enso_response_native_quoted_with_minimum(
     ))
     .unwrap();
     body["minAmountOut"] = min_amount_out;
+    // Unlike quote metadata, this floor is enforced by Router V2 itself.
+    use alloy::sol_types::{SolCall, SolValue};
+    let route: crate::api_types::RouteResponse = serde_json::from_value(body.clone()).unwrap();
+    let original =
+        crate::api_types::IEnsoRouter::routeSingleCall::abi_decode(&route.tx.data).unwrap();
+    let value = match &body["minAmountOut"] {
+        serde_json::Value::Array(items) => &items[0],
+        value => value,
+    };
+    let minimum = alloy::primitives::U256::from_str_radix(value.as_str().unwrap(), 10).unwrap();
+    let guarded = crate::api_types::IEnsoRouter::safeRouteSingleCall {
+        tokenIn: original.tokenIn,
+        tokenOut: crate::api_types::IEnsoRouter::Token {
+            tokenType: 1,
+            data: (
+                "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                    .parse::<alloy::primitives::Address>()
+                    .unwrap(),
+                minimum,
+            )
+                .abi_encode_params()
+                .into(),
+        },
+        receiver: route.tx.from,
+        data: original.data,
+    }
+    .abi_encode();
+    body["tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(guarded)));
     serde_json::to_vec(&body).unwrap()
 }
 
@@ -2082,7 +2191,7 @@ fn refreshed_quote_outside_reviewed_bounds_is_refused_and_reported() {
     for (fresh, expected) in [
         (
             build_enso_response_native_quoted(1_120, "2984999999", DEFAULT_ROUTER),
-            "below the reviewed minimum output",
+            "does not reach a positive requested minimum",
         ),
         // The quote clears the floor, but the transaction's own minimum does
         // not: it could fill below what the owner reviewed.
@@ -2094,12 +2203,6 @@ fn refreshed_quote_outside_reviewed_bounds_is_refused_and_reported() {
                 serde_json::json!("2984999999"),
             ),
             "route's minimum output (2984999999)",
-        ),
-        // Without a reported minimum, a slippage-based floor is assumed:
-        // 2,990,000,000 less 0.5% is 2,975,050,000, below 2,985,000,000.
-        (
-            build_enso_response_native_quoted(1_120, "2990000000", DEFAULT_ROUTER),
-            "route's minimum output (2975050000)",
         ),
         (
             build_enso_response_native_quoted(

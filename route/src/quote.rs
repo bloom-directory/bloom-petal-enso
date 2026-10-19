@@ -60,27 +60,26 @@ pub fn reviewed_minimum_output(
 ) -> Result<U256, String> {
     let quoted = U256::from_str_radix(reviewed.amount_out.trim(), 10)
         .map_err(|_| "reviewed route has an invalid quoted output amount".to_string())?;
-    let kept = U256::from(10_000u64.saturating_sub(u64::from(req.slippage_bps)));
-    Ok(quoted * kept / U256::from(10_000u64))
-}
-
-/// The minimum output Enso reports for a route, when it reports exactly one.
-fn reported_minimum_output(route: &RouteResponse) -> Option<U256> {
-    let value = match route.min_amount_out.as_ref()? {
-        serde_json::Value::Array(items) if items.len() == 1 => &items[0],
-        other => other,
-    };
-    U256::from_str_radix(value.as_str()?.trim(), 10).ok()
+    if req.slippage_bps >= 10_000 || quoted.is_zero() {
+        return Err("Enso route needs a positive quote and slippage below 100%".into());
+    }
+    let denominator = U256::from(10_000u64);
+    let kept = U256::from(10_000u64 - u64::from(req.slippage_bps));
+    // Divide first to avoid overflowing a valid uint256 quote.
+    let floor = (quoted / denominator) * kept + (quoted % denominator) * kept / denominator;
+    let minimum = floor.max(req.min_amount_out.unwrap_or(U256::ZERO));
+    if minimum.is_zero() || minimum > quoted {
+        return Err("Enso quoted output does not reach a positive requested minimum".into());
+    }
+    Ok(minimum)
 }
 
 /// Accept a fresh quote only within the reviewed bounds: the same request,
 /// router and native value, and a transaction whose own minimum output is
 /// no lower than the reviewed quote less its slippage tolerance.
 ///
-/// The refresh asks Enso for exactly that floor (`minAmountOut`), so the
-/// minimum Enso reports must reach it. Without a reported minimum, the fresh
-/// quote less the reviewed slippage must reach it instead, which is the
-/// floor a slippage-based route would set.
+/// API `minAmountOut` metadata is not executable evidence. Same-chain routes
+/// must carry the matching receiver, token and floor in their safe-route call.
 pub fn verify_refreshed(
     reviewed: &RouteResponse,
     fresh: &RouteResponse,
@@ -100,19 +99,15 @@ pub fn verify_refreshed(
     }
     let fresh_output = U256::from_str_radix(fresh.amount_out.trim(), 10)
         .map_err(|_| "the refreshed Enso route has an invalid quoted output amount".to_string())?;
-    let minimum = reviewed_minimum_output(reviewed, req)?;
+    let minimum = reviewed_minimum_output(reviewed, req)?
+        .max(crate::calldata::output_minimum(reviewed, req).unwrap_or(U256::ZERO));
     if fresh_output.is_zero() || fresh_output < minimum {
         return Err(format!(
             "the refreshed Enso quote ({fresh_output}) is below the reviewed minimum output ({minimum})"
         ));
     }
-    let fresh_minimum = match reported_minimum_output(fresh) {
-        Some(reported) => reported,
-        None => {
-            let kept = U256::from(10_000u64.saturating_sub(u64::from(req.slippage_bps)));
-            fresh_output * kept / U256::from(10_000u64)
-        }
-    };
+    let fresh_minimum = crate::calldata::output_minimum(fresh, req)
+        .ok_or("the refreshed Enso route has no decoded destination output constraint")?;
     if fresh_minimum < minimum {
         return Err(format!(
             "the refreshed Enso route's minimum output ({fresh_minimum}) is below the reviewed minimum output ({minimum})"
