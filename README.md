@@ -117,15 +117,10 @@ are never interpreted by this Petal.
 - Same-chain ERC-20 settlement requires a successful source receipt containing
   an attributable `Transfer` to the receiver for at least the calldata minimum;
   older unverified routes use the quote and label its source
-- Cross-chain tracking queries the five documented bridge providers, caches
-  responses for ten seconds, and distinguishes delivery from keeper execution,
-  refunds and manual recovery. Sequential hops must link every chain and hash
-- Destination ERC-20 completion requires a matching successful receipt and net
-  incoming token logs meeting the reviewed quote floor. Direct native receipts
-  require a mined value transfer to an undelegated EOA at the same canonical
-  block. Provider linkage is explicitly labelled `provider_asserted`
-- Internal native transfers without trace evidence and incomplete bridge hops
-  remain unverified. A balance increase alone never establishes settlement
+- Cross-chain status reports source progress. After source success it reports
+  `destination_unverified`: this package has no destination tracker and offers
+  no polling retry hint. Source success does not prove destination receipt.
+- Native balance increases remain unattributed.
 
 Broker reads nested Weiroll command structure and catalog-supported calls
 whose inputs are constant. Return-dependent arguments remain symbolic;
@@ -137,6 +132,10 @@ explicit warnings and the existing venue preference gate. No additional
 owner ceremony is added.
 Cross-chain quote refresh preserves the exact reviewed shortcut; changed
 destination programs require a new intent and review.
+The original effective output floor survives every refresh and restart.
+It is a requested destination expectation for cross-chain routes, not an
+executable source-chain guarantee. Older sessions without a durable reviewed
+floor need a new review before refresh.
 
 ## Route Surface
 

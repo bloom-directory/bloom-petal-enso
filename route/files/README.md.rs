@@ -70,6 +70,8 @@ cancel that outbox entry and create a new intent. Retrying cannot help.
 - An aged quote is refreshed at staging only within the reviewed bounds
 - ERC-20 approval is exact-amount and must succeed before a second confirm
 - Same-chain ERC-20 settlement requires an attributable receipt Transfer
-- Native and cross-chain balance changes are reported as unattributed
+- Native balance changes are reported as unattributed
+- Cross-chain source success reports destination_unverified; this package
+  does not track destination settlement and does not suggest continued polling
 "#.to_vec())
 });

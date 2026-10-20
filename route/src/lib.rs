@@ -1,6 +1,5 @@
 pub mod api;
 pub mod api_types;
-pub mod bridge;
 pub mod calldata;
 pub mod input;
 pub mod policy;

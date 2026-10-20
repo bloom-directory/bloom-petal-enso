@@ -582,6 +582,12 @@ pub fn create_for_account<H: Host>(
         return Err("Enso route returned an invalid quoted output amount — refusing".into());
     }
     crate::calldata::bind_output_checks(&mut route_resp, &route_req)?;
+    // Store one effective floor before showing the plan. Replacement quotes
+    // must never become a new baseline for slippage.
+    route_req.min_amount_out = Some(
+        crate::quote::reviewed_minimum_output(&route_resp, &route_req)?
+            .max(crate::calldata::output_minimum(&route_resp, &route_req).unwrap_or(U256::ZERO)),
+    );
 
     let router_addr = format!("0x{:x}", route_resp.tx.to);
 
@@ -724,7 +730,7 @@ pub fn create_for_account<H: Host>(
         .collect();
 
     let mut sess = Session {
-        schema_version: 1,
+        schema_version: 2,
         id: id.clone(),
         wallet: wallet.to_string(),
         wallet_address: address,
@@ -1164,6 +1170,11 @@ fn refresh_route_quote<H: Host>(
     needs_approve: bool,
     now: u64,
 ) -> Result<(Session, RouteResponse), RefreshError> {
+    if sess.schema_version < 2 || req.min_amount_out.is_none() {
+        return Err(RefreshError::OutOfBounds(
+            "the original reviewed floor is unavailable; a new review is required".into(),
+        ));
+    }
     let api_key = resolve_api_key(host).map_err(RefreshError::Unavailable)?;
     let mut refresh_request = req.clone();
     refresh_request.min_amount_out = Some(
@@ -1196,6 +1207,7 @@ fn refresh_route_quote<H: Host>(
         })?;
     route_intent.data_hex = format!("0x{}", hex::encode(&fresh.tx.data));
     refreshed.route = Some(fresh.clone());
+    refreshed.route_request = Some(refresh_request);
     refreshed.policy_checks = policy_checks;
     refreshed.simulation = None;
     update_plan(&mut refreshed).map_err(RefreshError::OutOfBounds)?;

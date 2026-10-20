@@ -2369,133 +2369,6 @@ fn routes_declare_capabilities_their_workflows_need() {
 }
 
 #[test]
-fn bridge_delivery_execution_receipt_and_cache_are_distinct() {
-    use serde_json::json;
-    let source = format!("0x{}", "11".repeat(32));
-    let delivery = format!("0x{}", "22".repeat(32));
-    let execution = format!("0x{}", "33".repeat(32));
-    let receiver = "0x742d35cc6634c0532925a3b844bc9e7595f0beb1";
-    let token = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
-    let mut host = MockHost::new();
-    host.bridge_response = Some(
-        json!({"sourceChainId":1,"sourceTxHash":source,"destinationChainId":8453,"status":"delivered","destinationTxHash":delivery,"intent":{"phase":"awaiting_funds"}}),
-    );
-    let read = |host: &mut MockHost| {
-        crate::bridge::settlement(
-            host,
-            1,
-            &source,
-            crate::bridge::Destination {
-                chain: "base",
-                chain_id: 8453,
-                receiver,
-                token,
-                minimum: "100",
-            },
-        )
-    };
-    assert_eq!(
-        read(&mut host)["status"],
-        "bridge_delivered_execution_pending"
-    );
-    assert_eq!(host.bridge_calls, 5);
-    assert_eq!(
-        read(&mut host)["status"],
-        "bridge_delivered_execution_pending"
-    );
-    assert_eq!(host.bridge_calls, 5);
-    host.now += 10001;
-    host.bridge_response.as_mut().unwrap()["intent"] =
-        json!({"phase":"executed","executionTxHash":execution,"executionChainId":8453});
-    host.destination_receipt = Some(
-        json!({"transactionHash":execution,"status":"0x1","logs":[{"address":token,"topics":["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",format!("0x{}", "00".repeat(32)),format!("0x000000000000000000000000{}", &receiver[2..])],"data":format!("0x{:064x}",100)}]}),
-    );
-    let result = read(&mut host);
-    assert_eq!(result["status"], "destination_received_provider_linked");
-    assert_eq!(result["destination_execution_tx_hash"], execution);
-    assert_eq!(result["linkage_assurance"], "provider_asserted");
-    assert_eq!(host.bridge_calls, 10);
-    host.destination_receipt.as_mut().unwrap()["transactionHash"] = json!(delivery);
-    assert_eq!(read(&mut host)["status"], "destination_receipt_pending");
-    host.destination_receipt.as_mut().unwrap()["transactionHash"] = json!(execution);
-    host.destination_receipt.as_mut().unwrap()["logs"][0]["address"] = json!(receiver);
-    assert_eq!(read(&mut host)["status"], "destination_below_minimum");
-    host.destination_receipt.as_mut().unwrap()["status"] = json!("0x0");
-    assert_eq!(read(&mut host)["status"], "destination_execution_failed");
-    host.chain_ids.insert("base".into(), 1);
-    assert_eq!(read(&mut host)["status"], "destination_network_mismatch");
-}
-
-#[test]
-fn bridge_native_requires_mined_direct_value_and_provider_failures_stay_explicit() {
-    use serde_json::json;
-    let source = format!("0x{}", "11".repeat(32));
-    let execution = format!("0x{}", "33".repeat(32));
-    let block = format!("0x{}", "44".repeat(32));
-    let receiver = "0x742d35cc6634c0532925a3b844bc9e7595f0beb1";
-    let mut host = MockHost::new();
-    host.bridge_response = Some(
-        json!({"sourceChainId":1,"sourceTxHash":source,"destinationChainId":8453,"status":"delivered","destinationTxHash":execution}),
-    );
-    host.destination_receipt =
-        Some(json!({"transactionHash":execution,"blockHash":block,"status":"0x1"}));
-    let read = |host: &mut MockHost| {
-        crate::bridge::settlement(
-            host,
-            1,
-            &source,
-            crate::bridge::Destination {
-                chain: "base",
-                chain_id: 8453,
-                receiver,
-                token: crate::api_types::NATIVE_TOKEN,
-                minimum: "100",
-            },
-        )
-    };
-    assert_eq!(
-        read(&mut host)["status"],
-        "destination_native_amount_unverified"
-    );
-    host.destination_transaction = Some(
-        json!({"hash":execution,"blockHash":block,"to":receiver,"from":"0x1111111111111111111111111111111111111111","value":"0x64"}),
-    );
-    assert_eq!(
-        read(&mut host)["status"],
-        "destination_received_provider_linked"
-    );
-    host.destination_transaction.as_mut().unwrap()["blockHash"] = json!(source);
-    assert_eq!(
-        read(&mut host)["status"],
-        "destination_native_amount_unverified"
-    );
-    for (patch, expected) in [
-        (
-            json!({"status":"ready_for_manual_execution"}),
-            "bridge_manual_execution_required",
-        ),
-        (json!({"status":"failed"}), "destination_execution_failed"),
-        (json!({"isMultiBridge":true}), "multi_bridge_unverified"),
-        (
-            json!({"intent":{"phase":"refunded"}}),
-            "bridge_refund_reported",
-        ),
-    ] {
-        host.now += 10001;
-        let mut response = json!({"sourceChainId":1,"sourceTxHash":source,"destinationChainId":8453,"status":"pending"});
-        for (key, value) in patch.as_object().unwrap() {
-            response[key] = value.clone();
-        }
-        host.bridge_response = Some(response);
-        assert_eq!(read(&mut host)["status"], expected);
-    }
-    host.now += 10001;
-    host.enso_status = 429;
-    assert_eq!(read(&mut host)["status"], "bridge_pending");
-    assert!(crate::bridge::observe(&mut host, 1, "0xinvalid").is_err());
-}
-
-#[test]
 fn cross_chain_quote_refresh_requires_the_same_reviewed_shortcut() {
     let mut response: serde_json::Value =
         serde_json::from_slice(&build_enso_response_erc20()).unwrap();
@@ -2522,4 +2395,83 @@ fn cross_chain_quote_refresh_requires_the_same_reviewed_shortcut() {
             .unwrap_err()
             .contains("cross-chain shortcut changed")
     );
+}
+
+#[test]
+fn cross_chain_floor_survives_repeated_refresh_and_reload_and_status_is_honest() {
+    let mut response: serde_json::Value =
+        serde_json::from_slice(&build_enso_response_erc20()).unwrap();
+    response["route"][0]["destinationChainId"] = serde_json::json!(8453);
+    response["amountOut"] = serde_json::json!("1000");
+    let mut host = MockHost::new().with_enso_response(serde_json::to_vec(&response).unwrap());
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        br#"{"intent":"swap 100.0 usdc to eth","chain":"ethereum","destination_chain":"base"}"#,
+    )
+    .unwrap();
+    let original = load_session(&mut host, &id);
+    assert_eq!(
+        original
+            .route_request
+            .as_ref()
+            .unwrap()
+            .min_amount_out
+            .unwrap()
+            .to_string(),
+        "995"
+    );
+    // Failed simulation keeps the route unstaged so confirm can refresh again.
+    host.eth_call_success = false;
+    response["amountOut"] = serde_json::json!("995");
+    host.enso_response = Some(serde_json::to_vec(&response).unwrap());
+    for _ in 0..2 {
+        host.now += 120_000;
+        assert!(crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").is_err());
+        let reloaded = load_session(&mut host, &id);
+        assert_eq!(
+            reloaded
+                .route_request
+                .as_ref()
+                .unwrap()
+                .min_amount_out
+                .unwrap()
+                .to_string(),
+            "995"
+        );
+        assert_eq!(reloaded.route.as_ref().unwrap().amount_out, "995");
+        assert!(host.enso_urls.last().unwrap().contains("minAmountOut=995"));
+    }
+    response["amountOut"] = serde_json::json!("992");
+    host.enso_response = Some(serde_json::to_vec(&response).unwrap());
+    host.now += 120_000;
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    assert!(
+        error.contains("minimum") || error.contains("floor"),
+        "{error}"
+    );
+    host.eth_call_success = true;
+    response["amountOut"] = serde_json::json!("995");
+    host.enso_response = Some(serde_json::to_vec(&response).unwrap());
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    let sess = load_session(&mut host, &id);
+    host.mark_outbox_success(sess.primary_outbox_id().unwrap());
+    let result = crate::settlement::settlement_status(&mut host, &sess);
+    assert_eq!(result["status"], "destination_unverified");
+    assert_eq!(result["minimum_expected"], "995");
+    assert_eq!(result["retry_supported"], false);
+    assert_eq!(host.bridge_calls, 0);
+}
+
+#[test]
+fn legacy_session_refresh_requires_new_review() {
+    let (mut host, id) = quoted_session(120_000);
+    let mut sess = load_session(&mut host, &id);
+    sess.schema_version = 1;
+    sess.route_request.as_mut().unwrap().min_amount_out = None;
+    host.put(&sess.key(), &serde_json::to_vec(&sess).unwrap(), false)
+        .unwrap();
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    assert!(error.contains("new review"), "{error}");
+    assert_eq!(host.stage_count, 0);
 }

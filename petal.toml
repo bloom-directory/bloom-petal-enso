@@ -19,7 +19,7 @@ allowed = ["bloom:http", "bloom:store", "bloom:tx.outbox", "bloom:chain", "bloom
 binding = "enso"
 host = "api.enso.finance"
 methods = ["get"]
-paths = ["/api/v1/shortcuts/route", "/api/v1/layerzero/bridge/check", "/api/v1/ccip/bridge/check", "/api/v1/relay/bridge/check", "/api/v1/arbitrum-native/bridge/check", "/api/v1/cctp/bridge/check"]
+paths = ["/api/v1/shortcuts/route"]
 
 [store]
 namespaces = ["state"]

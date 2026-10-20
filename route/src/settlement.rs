@@ -86,31 +86,21 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
     }
 
     if !dest_chain.eq_ignore_ascii_case(&sess.chain) {
-        let Some(source_hash) = inspection.tx_hash.as_deref() else {
-            return serde_json::json!({"status":"source_hash_unavailable"});
-        };
-        let Some(destination_id) = req.destination_chain_id else {
-            return serde_json::json!({"status":"destination_network_unverified"});
-        };
-        let minimum = sess
-            .route
-            .as_ref()
-            .and_then(|route| crate::quote::reviewed_minimum_output(route, req).ok());
-        let Some(minimum) = minimum else {
-            return serde_json::json!({"status":"destination_minimum_unverified"});
-        };
-        return crate::bridge::settlement(
-            host,
-            req.chain_id,
-            source_hash,
-            crate::bridge::Destination {
-                chain: dest_chain,
-                chain_id: destination_id,
-                receiver: &receiver,
-                token: &token_out_hex,
-                minimum: &minimum.to_string(),
-            },
-        );
+        return serde_json::json!({
+            "status": "destination_unverified",
+            "message": "Destination settlement tracking is unsupported in this package; source success does not prove destination receipt.",
+            "source_state": inspection.state,
+            "source_tx_hash": inspection.tx_hash,
+            "route_outbox_id": route_outbox_id,
+            "destination_chain": dest_chain,
+            "receiver": receiver,
+            "token_out": token_out_hex,
+            "minimum_expected": if sess.schema_version >= 2 {
+                req.min_amount_out.map(|minimum| minimum.to_string())
+            } else { None },
+            "minimum_source": "reviewed_expectation_not_source_chain_guarantee",
+            "retry_supported": false,
+        });
     }
     let current = match read_balance(host, dest_chain, &token_out_hex, &receiver) {
         Ok(value) => value,
