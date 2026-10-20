@@ -49,8 +49,9 @@ Enso for the reviewed minimum output (reviewed quote less slippage), and
 stages it only if it keeps the reviewed router and native value and its
 minimum output reaches that floor. Otherwise nothing is staged and
 `status.json` `last_error` says why: for a route outside the reviewed bounds,
-abandon the intent and create a new one; for a temporary Enso or network
-failure, write `confirm` again.
+abandon the intent and create a new one, or, after its approval succeeded,
+write `confirm` again later or create a new intent; for a temporary Enso or
+network failure, write `confirm` again.
 Confirm the outbox entry promptly after staging. `status.json` `quote` gives
 `expires_at_ms`; once a staged, unsent quote expires, `last_error` says to
 cancel that outbox entry and create a new intent. Retrying cannot help.

@@ -2667,6 +2667,86 @@ fn refreshed_quote_outside_reviewed_bounds_is_refused_and_reported() {
 }
 
 #[test]
+fn out_of_bounds_refresh_after_an_approval_does_not_suggest_abandoning() {
+    let account = petal::testing::wallet_account("test-wallet", 0);
+    let mut host = MockHost::new()
+        .with_enso_response(build_enso_response_erc20())
+        .with_allowance("0");
+    let id = crate::workflow::create_for_account(
+        &mut host,
+        &account,
+        b"swap 100.0 usdc to eth on ethereum",
+    )
+    .unwrap();
+    crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap();
+    host.mark_outbox_success("outbox-1");
+    host.allowance = "100000000".into();
+    host.now += 120_000;
+    let mut worse: serde_json::Value =
+        serde_json::from_slice(&build_enso_response_erc20()).unwrap();
+    worse["amountOut"] = serde_json::json!("1");
+    host.enso_response = Some(serde_json::to_vec(&worse).unwrap());
+
+    let error = crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
+    assert!(
+        error.contains("below the reviewed minimum output"),
+        "{error}"
+    );
+    assert!(error.contains("write `confirm` again later"), "{error}");
+    assert!(error.contains("create a new intent"), "{error}");
+    assert!(error.contains("router allowance"), "{error}");
+    assert!(!error.contains("abandon this intent"), "{error}");
+    assert_eq!(host.stage_count, 1, "only the approval was staged");
+    assert_eq!(
+        load_session(&mut host, &id).last_error.as_deref(),
+        Some(error.as_str())
+    );
+
+    // Abandon is unchanged: it still refuses once the approval exists.
+    let abandon = crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap_err();
+    assert!(
+        abandon.contains("cannot abandon after an outbox transaction exists"),
+        "{abandon}"
+    );
+}
+
+#[test]
+fn refreshed_quote_rewrites_the_plan() {
+    let (mut host, id) = quoted_session(120_000);
+    host.enso_response = Some(build_enso_response_native_quoted_with_minimum(
+        1_120,
+        "2990000000",
+        DEFAULT_ROUTER,
+        serde_json::json!(["2985000000"]),
+    ));
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap();
+    let sess = load_session(&mut host, &id);
+    assert_eq!(sess.route.as_ref().unwrap().amount_out, "2990000000");
+    assert!(
+        sess.plan_md.contains("Expected output: 2990000000"),
+        "{}",
+        sess.plan_md
+    );
+    assert!(
+        !sess.plan_md.contains("Expected output: 3000000000"),
+        "{}",
+        sess.plan_md
+    );
+    // The plan lists the staged calldata, not the reviewed one.
+    assert!(
+        sess.plan_md.contains(&host.staged_data[0][..74]),
+        "{}",
+        sess.plan_md
+    );
+}
+
+#[test]
 fn temporary_refresh_failure_says_to_retry_not_abandon() {
     let (mut host, id) = quoted_session(120_000);
     host.enso_status = 503;
