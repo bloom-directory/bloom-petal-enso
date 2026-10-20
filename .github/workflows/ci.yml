@@ -29,6 +29,8 @@ jobs:
         run: cargo test --manifest-path route/Cargo.toml --locked
       - name: Clippy route crate
         run: cargo clippy --manifest-path route/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Check route architecture
         run: scripts/check-route-architecture.sh
       - name: Install wasm-tools
