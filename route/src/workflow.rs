@@ -8,7 +8,7 @@ pub use crate::runtime::{BloomHost, Host};
 use crate::session::{self, IntentState, PreparedIntent, Session};
 use crate::{api, input, settings};
 use alloy::primitives::{Address, U256};
-use petal::sdk::EvmTransaction;
+use petal::sdk::{EvmTransaction, StagedTransaction};
 
 // ---------------------------------------------------------------------------
 // persistence helpers
@@ -786,6 +786,59 @@ fn acquire_confirm_lock<H: Host>(
     Ok((key, value))
 }
 
+/// Written with put-new just before an intent is staged, and removed once the
+/// session save that records its outbox id succeeds. A marker beside an
+/// intent with no outbox id means a stage may have reached the outbox without
+/// being recorded, so that intent must never be staged again.
+fn staging_marker_key(wallet: &str, id: &str, index: usize) -> String {
+    format!("intents/{wallet}/{id}/staging-{index}.json")
+}
+
+/// The first unrecorded intent that an earlier confirm began staging.
+fn unrecorded_stage<H: Host>(host: &mut H, sess: &Session) -> Result<Option<usize>, String> {
+    for state in &sess.intent_states {
+        let key = staging_marker_key(&sess.wallet, &sess.id, state.index);
+        if state.outbox_id.is_none() && host.get(&key, 1024)?.is_some() {
+            return Ok(Some(state.index));
+        }
+    }
+    Ok(None)
+}
+
+/// Stage one prepared intent behind its staging marker.
+fn stage_marked<H: Host>(
+    host: &mut H,
+    sess: &Session,
+    index: usize,
+    tx: &EvmTransaction,
+) -> Result<StagedTransaction, String> {
+    let key = staging_marker_key(&sess.wallet, &sess.id, index);
+    let marker = json(&serde_json::json!({
+        "created_ms": host.now_ms(),
+        "chain": tx.chain,
+        "to": tx.to,
+    }))?;
+    host.put_new(&key, &marker, false).map_err(|error| {
+        format!("cannot record that staging began, so nothing was staged: {error}")
+    })?;
+    let staged = host.tx_stage(tx);
+    if staged.is_err() {
+        // The outbox refused the transaction, so a retry cannot duplicate it.
+        let _ = host.delete_if(&key, &marker);
+    }
+    staged
+}
+
+/// Remove an intent's staging marker after its outbox id has been saved. One
+/// left behind is harmless: a recorded outbox id is what a later confirm
+/// checks first.
+fn clear_staging_marker<H: Host>(host: &mut H, sess: &Session, index: usize) {
+    let key = staging_marker_key(&sess.wallet, &sess.id, index);
+    if let Ok(Some(marker)) = host.get(&key, 1024) {
+        let _ = host.delete_if(&key, &marker);
+    }
+}
+
 pub fn confirm<H: Host>(
     host: &mut H,
     account: &petal::WalletAccount,
@@ -886,6 +939,29 @@ fn confirm_locked<H: Host>(
     }
     verify_prepared_intents(&sess, &req, &route)?;
 
+    // An earlier confirm may have staged an intent and then failed to save
+    // its outbox id. Staging it again could send the same transaction twice.
+    if let Some(index) = unrecorded_stage(host, &sess)? {
+        let intent = &sess.intents[index];
+        let next = if sess.intent_states.iter().any(|s| s.outbox_id.is_some()) {
+            "this intent will not stage it again, so create a new intent if you still want the swap"
+        } else {
+            "then abandon this intent"
+        };
+        let reason = format!(
+            "an earlier confirm began staging this intent's {} transaction but did not record \
+             it, so this confirm staged nothing; it may already be in the wallet's outbox at \
+             /{}/chains/{}/outbox/pending: review it there and cancel it if it should not be \
+             sent, {next}",
+            intent.label,
+            account.dir(),
+            intent.chain,
+        );
+        sess.last_error = Some(reason.clone());
+        save(host, &sess)?;
+        return Err(reason);
+    }
+
     // Verify chain_id.
     let live_chain_id = host
         .chain_id(&sess.chain)
@@ -941,7 +1017,7 @@ fn confirm_locked<H: Host>(
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
             };
-            let staged = host.tx_stage(&evm_tx)?;
+            let staged = stage_marked(host, &sess, 0, &evm_tx)?;
             if let Some(state) = sess.intent_states.first_mut() {
                 state.status = "staged".into();
                 state.outbox_id = Some(staged.outbox_id.clone());
@@ -964,6 +1040,7 @@ fn confirm_locked<H: Host>(
                 "exact-amount approval staged; route remains unstaged",
             );
             save(host, &sess)?;
+            clear_staging_marker(host, &sess, 0);
             return Ok(());
         }
 
@@ -1073,7 +1150,7 @@ fn confirm_locked<H: Host>(
             max_priority_fee_per_gas: None,
         };
 
-        let staged = host.tx_stage(&evm_tx)?;
+        let staged = stage_marked(host, &sess, route_index, &evm_tx)?;
 
         if let Some(state) = sess.intent_states.get_mut(route_index) {
             state.status = "staged".into();
@@ -1092,6 +1169,7 @@ fn confirm_locked<H: Host>(
     sess.last_error = None;
     sess.transition(now, "staged", "route staged into outbox");
     save(host, &sess)?;
+    clear_staging_marker(host, &sess, route_index);
     Ok(())
 }
 

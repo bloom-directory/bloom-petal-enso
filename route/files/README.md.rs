@@ -54,6 +54,8 @@ failure, write `confirm` again.
 Confirm the outbox entry promptly after staging. `status.json` `quote` gives
 `expires_at_ms`; once a staged, unsent quote expires, `last_error` says to
 cancel that outbox entry and create a new intent. Retrying cannot help.
+If a confirm staged a transaction but could not record it, the next confirm
+stages nothing and `last_error` names the pending outbox entry to review.
 
 ### 4. Verify settlement
 ```json

@@ -45,6 +45,9 @@ struct MockHost {
     enso_urls: Vec<String>,
     /// Calldata of every staged transaction, in staging order.
     staged_data: Vec<String>,
+    /// Fail the first session save made once this many transactions have
+    /// been staged, as a store outage straight after a stage would.
+    fail_session_save_after_stage: Option<usize>,
 }
 
 impl MockHost {
@@ -113,6 +116,7 @@ require_calldata_verification = false
             enso_calls: 0,
             enso_urls: Vec::new(),
             staged_data: Vec::new(),
+            fail_session_save_after_stage: None,
         }
     }
 
@@ -229,6 +233,14 @@ impl Host for MockHost {
     }
 
     fn put(&mut self, key: &str, value: &[u8], _secret: bool) -> Result<(), String> {
+        if key.ends_with("/session.json")
+            && self
+                .fail_session_save_after_stage
+                .is_some_and(|stages| self.stage_count >= stages)
+        {
+            self.fail_session_save_after_stage = None;
+            return Err("simulated store write failure".into());
+        }
         self.store.insert(key.to_string(), value.to_vec());
         Ok(())
     }
@@ -1635,6 +1647,8 @@ fn partial_staging_failure_is_recoverable() {
     assert_eq!(sess.intent_states[1].status, "prepared");
     assert!(sess.intent_states[0].outbox_id.is_some());
     assert!(sess.intent_states[1].outbox_id.is_none());
+    // The outbox refused the route, so it leaves nothing to block a retry.
+    assert!(staging_markers(&host).is_empty());
 
     // Now remove the failure and retry — should stage the remaining intent
     host.stage_fail_after = None;
@@ -1650,6 +1664,131 @@ fn partial_staging_failure_is_recoverable() {
     assert_eq!(sess.state, "staged");
     assert_eq!(sess.staged_ids.len(), 2);
     assert_eq!(sess.intent_states[1].status, "staged");
+}
+
+// ===========================================================================
+// TEST: a stage whose outbox id was never saved is not repeated
+// ===========================================================================
+
+/// Staging markers left in the store.
+fn staging_markers(host: &MockHost) -> Vec<&String> {
+    host.store
+        .keys()
+        .filter(|key| key.contains("/staging-"))
+        .collect()
+}
+
+#[test]
+fn an_unrecorded_route_stage_is_refused_and_can_be_abandoned() {
+    let account = petal::testing::wallet_account("test-wallet", 0);
+    let mut host = MockHost::new().with_enso_response(build_enso_response_native());
+    let id = crate::workflow::create_for_account(
+        &mut host,
+        &account,
+        b"swap 1.0 eth to usdc on ethereum",
+    )
+    .unwrap();
+
+    // The route reaches the outbox, but the save recording it fails.
+    host.fail_session_save_after_stage = Some(1);
+    let error = crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
+    assert!(error.contains("simulated store write failure"), "{error}");
+    assert_eq!(host.stage_count, 1);
+
+    let error = crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
+    assert_eq!(
+        host.stage_count, 1,
+        "the same swap must not be staged twice"
+    );
+    assert!(error.contains("route transaction"), "{error}");
+    assert!(
+        error.contains("/wallets/test-wallet/0/chains/ethereum/outbox/pending"),
+        "{error}"
+    );
+    assert!(error.contains("then abandon this intent"), "{error}");
+    let sess = load_session(&mut host, &id);
+    assert_eq!(sess.last_error.as_deref(), Some(error.as_str()));
+
+    // No outbox id was ever recorded, so the intent can still be abandoned.
+    crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(load_session(&mut host, &id).state, "abandoned");
+    assert_eq!(host.stage_count, 1);
+}
+
+#[test]
+fn an_unrecorded_approval_stage_is_refused_and_can_be_abandoned() {
+    let account = petal::testing::wallet_account("test-wallet", 0);
+    let mut host = MockHost::new()
+        .with_enso_response(build_enso_response_erc20())
+        .with_allowance("0");
+    let id = crate::workflow::create_for_account(
+        &mut host,
+        &account,
+        b"swap 100.0 usdc to eth on ethereum",
+    )
+    .unwrap();
+
+    host.fail_session_save_after_stage = Some(1);
+    crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
+    let error = crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
+    assert_eq!(host.stage_count, 1, "the approval must not be staged twice");
+    assert!(error.contains("approve transaction"), "{error}");
+    assert!(error.contains("then abandon this intent"), "{error}");
+
+    crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(load_session(&mut host, &id).state, "abandoned");
+}
+
+#[test]
+fn an_unrecorded_route_stage_after_an_approval_says_to_create_a_new_intent() {
+    let account = petal::testing::wallet_account("test-wallet", 0);
+    let mut host = MockHost::new()
+        .with_enso_response(build_enso_response_erc20())
+        .with_allowance("0");
+    let id = crate::workflow::create_for_account(
+        &mut host,
+        &account,
+        b"swap 100.0 usdc to eth on ethereum",
+    )
+    .unwrap();
+    crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap();
+    host.mark_outbox_success("outbox-1");
+    host.allowance = "100000000".into();
+
+    host.fail_session_save_after_stage = Some(2);
+    crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
+    assert_eq!(host.stage_count, 2);
+    let error = crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
+    assert_eq!(host.stage_count, 2, "the route must not be staged twice");
+    assert!(error.contains("route transaction"), "{error}");
+    assert!(error.contains("create a new intent"), "{error}");
+    // The recorded approval means abandon would refuse, so do not suggest it.
+    assert!(!error.contains("abandon"), "{error}");
+}
+
+#[test]
+fn staging_markers_are_removed_once_the_outbox_id_is_saved() {
+    let account = petal::testing::wallet_account("test-wallet", 0);
+    let mut host = MockHost::new()
+        .with_enso_response(build_enso_response_erc20())
+        .with_allowance("0");
+    let id = crate::workflow::create_for_account(
+        &mut host,
+        &account,
+        b"swap 100.0 usdc to eth on ethereum",
+    )
+    .unwrap();
+
+    crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap();
+    assert!(staging_markers(&host).is_empty(), "approval marker");
+    host.mark_outbox_success("outbox-1");
+    host.allowance = "100000000".into();
+    crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap();
+    assert!(staging_markers(&host).is_empty(), "route marker");
+
+    let sess = load_session(&mut host, &id);
+    assert_eq!(sess.state, "staged");
+    assert_eq!(host.stage_count, 2);
 }
 
 // ===========================================================================

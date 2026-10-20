@@ -56,6 +56,11 @@ a staged route's quote expires while its outbox entry is still pending,
 `last_error` tells the agent to cancel that entry and create a new intent,
 because confirming an expired route can revert or be refused.
 
+Each transaction is staged behind a marker that is removed once the session
+records its outbox id. If an earlier confirm staged a transaction but could
+not record it, confirm refuses to stage it again; `last_error` names the
+wallet's pending outbox, where that entry can be reviewed or cancelled.
+
 ## Configuration
 
 Set the package-wide Enso API key once for all accounts:
