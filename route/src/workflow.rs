@@ -786,9 +786,14 @@ fn acquire_confirm_lock<H: Host>(
     Ok((key, value))
 }
 
-pub fn confirm<H: Host>(host: &mut H, wallet: &str, id: &str, body: &[u8]) -> Result<(), String> {
-    let (lock_key, lock_value) = acquire_confirm_lock(host, wallet, id)?;
-    let result = confirm_locked(host, wallet, id, body);
+pub fn confirm<H: Host>(
+    host: &mut H,
+    account: &petal::WalletAccount,
+    id: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let (lock_key, lock_value) = acquire_confirm_lock(host, account.wallet(), id)?;
+    let result = confirm_locked(host, account, id, body);
     let unlock = host.delete_if(&lock_key, &lock_value);
     match (result, unlock) {
         (Err(error), _) => Err(error),
@@ -801,10 +806,11 @@ pub fn confirm<H: Host>(host: &mut H, wallet: &str, id: &str, body: &[u8]) -> Re
 
 fn confirm_locked<H: Host>(
     host: &mut H,
-    wallet: &str,
+    account: &petal::WalletAccount,
     id: &str,
     body: &[u8],
 ) -> Result<(), String> {
+    let wallet = account.wallet();
     let confirmation = std::str::from_utf8(body)
         .map_err(|_| "confirmation body must be UTF-8")?
         .trim();
@@ -852,6 +858,17 @@ fn confirm_locked<H: Host>(
     let tx_from_hex = format!("0x{:x}", route.tx.from);
     if !tx_from_hex.eq_ignore_ascii_case(&wallet_addr) {
         return Err("route tx from does not match session wallet_address".into());
+    }
+    // The route was quoted for the address the account had at creation.
+    // Re-read the projection so it is never staged once that has changed.
+    let current_addr = wallet_address(host, account).map_err(|error| {
+        format!("cannot re-read the account's EVM address before staging: {error}")
+    })?;
+    if !current_addr.eq_ignore_ascii_case(&wallet_addr) {
+        return Err(format!(
+            "account {account} now has EVM address {current_addr}, but this intent was \
+             quoted for {wallet_addr}; nothing was staged, create a new intent for this account"
+        ));
     }
 
     // Re-verify route input integrity.

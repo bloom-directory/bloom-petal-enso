@@ -67,6 +67,7 @@ cancel that outbox entry and create a new intent. Retrying cannot help.
 - Enso-owned venue preferences are enforced at create and confirm
 - Bloom wallet policy and approval limits remain host-enforced
 - Simulation must pass before the route transaction is staged
+- Confirm stages nothing once the account's EVM address has changed
 - An aged quote is refreshed at staging only within the reviewed bounds
 - ERC-20 approval is exact-amount and must succeed before a second confirm
 - Same-chain ERC-20 settlement requires an attributable receipt Transfer

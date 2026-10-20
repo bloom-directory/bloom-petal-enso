@@ -108,6 +108,8 @@ are never interpreted by this Petal.
   bundled defaults apply to unconfigured wallets, while authoritative wallet
   policy is independently enforced by Bloom when a transaction is staged
 - Simulation must pass before the route transaction is staged
+- Confirm re-reads the account's EVM address and stages nothing for a route
+  quoted for a different address
 - ERC-20 approval is exact-amount and must have a successful receipt first
 - Broadcast requires the standard outbox confirm (owner gate)
 - Same-chain ERC-20 settlement requires a successful source receipt containing

@@ -680,8 +680,13 @@ fn full_lifecycle_create_confirm_stages_outbox() {
     .expect("create should succeed");
 
     // Confirm — stage into outbox
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm")
-        .expect("confirm should succeed");
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .expect("confirm should succeed");
 
     // Verify session state
     let key = crate::session::key("test-wallet", &id);
@@ -719,14 +724,24 @@ fn confirm_is_idempotent() {
     .expect("create should succeed");
 
     // First confirm
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm")
-        .expect("first confirm should succeed");
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .expect("first confirm should succeed");
 
     let first_tx_counter = host.tx_counter;
 
     // Second confirm should be a no-op
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm")
-        .expect("second confirm should succeed (idempotent)");
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .expect("second confirm should succeed (idempotent)");
 
     // No new tx should have been staged
     assert_eq!(host.tx_counter, first_tx_counter);
@@ -742,7 +757,13 @@ fn empty_confirmation_is_rejected() {
     )
     .unwrap();
 
-    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"").unwrap_err();
+    let error = crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"",
+    )
+    .unwrap_err();
     assert!(error.contains("exactly `confirm`"), "{error}");
     assert_eq!(host.tx_counter, 0);
 }
@@ -763,7 +784,13 @@ fn missing_venue_configuration_allows_canonical_route() {
         b"swap 100 usdc to eth on ethereum",
     )
     .unwrap();
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap();
     assert!(host.stage_count > 0);
 }
 
@@ -900,8 +927,13 @@ fn abandon_after_staging_fails() {
     )
     .expect("create should succeed");
 
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm")
-        .expect("confirm should succeed");
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .expect("confirm should succeed");
 
     let err = crate::workflow::abandon(&mut host, "test-wallet", &id)
         .expect_err("abandon should fail after staging");
@@ -925,8 +957,13 @@ fn wrong_wallet_cannot_load_session() {
     .expect("create should succeed");
 
     // Loading under a different wallet should fail — session key is scoped.
-    let err = crate::workflow::confirm(&mut host, "wrong-wallet", &id, b"confirm")
-        .expect_err("confirm should fail with wrong wallet");
+    let err = crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("wrong-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .expect_err("confirm should fail with wrong wallet");
     assert!(err.contains("not found") || err.contains("wallet mismatch"));
 }
 
@@ -1196,8 +1233,13 @@ fn full_lifecycle_with_approve_two_intents() {
     assert_eq!(sess.intents.len(), 2);
 
     // First confirmation stages only the exact-amount approval.
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm")
-        .expect("confirm should succeed");
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .expect("confirm should succeed");
 
     let mut sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     assert_eq!(sess.state, "awaiting_approval");
@@ -1213,8 +1255,13 @@ fn full_lifecycle_with_approve_two_intents() {
 
     // The second confirmation verifies the receipt and allowance, simulates,
     // then stages the route.
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm")
-        .expect("route confirmation should succeed");
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .expect("route confirmation should succeed");
 
     sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     assert_eq!(sess.state, "staged");
@@ -1244,7 +1291,12 @@ fn confirm_on_abandoned_session_should_fail() {
     crate::workflow::abandon(&mut host, "test-wallet", &id).expect("abandon should succeed");
 
     // Now try to confirm — this should be rejected
-    let result = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm");
+    let result = crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    );
 
     assert!(
         result.is_err(),
@@ -1391,7 +1443,12 @@ fn chain_id_mismatch_rejected_at_confirm() {
     // Mutate chain_id after create — simulate chain re-organization
     host.chain_ids.insert("ethereum".to_string(), 999);
 
-    let result = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm");
+    let result = crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    );
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("chain_id"));
 }
@@ -1464,7 +1521,13 @@ fn settlement_received_after_balance_increase() {
     .unwrap();
 
     // Stage the intents so staged_ids is non-empty
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap();
 
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     let route_id = sess.intent_states[0].outbox_id.clone().unwrap();
@@ -1504,7 +1567,13 @@ fn settlement_source_pending_before_receipt() {
     )
     .unwrap();
 
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap();
 
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     let status = crate::settlement::settlement_status(&mut host, &sess);
@@ -1537,8 +1606,13 @@ fn partial_staging_failure_is_recoverable() {
     // Make tx_stage fail after 1 successful stage. The first confirmation
     // stages only approval and must still succeed.
     host.stage_fail_after = Some(1);
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm")
-        .expect("approval staging should succeed");
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .expect("approval staging should succeed");
 
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     let approval_id = sess.intent_states[0].outbox_id.clone().unwrap();
@@ -1547,7 +1621,12 @@ fn partial_staging_failure_is_recoverable() {
         "115792089237316195423570985008687907853269984665640564039457584007913129639935".into();
 
     // The route staging attempt now fails without duplicating approval.
-    let result = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm");
+    let result = crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    );
     assert!(result.is_err(), "route staging should fail");
 
     // Session should have first intent staged but not second
@@ -1559,8 +1638,13 @@ fn partial_staging_failure_is_recoverable() {
 
     // Now remove the failure and retry — should stage the remaining intent
     host.stage_fail_after = None;
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm")
-        .expect("retry confirm should succeed");
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .expect("retry confirm should succeed");
 
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     assert_eq!(sess.state, "staged");
@@ -1586,16 +1670,34 @@ fn double_confirm_with_approve_is_idempotent() {
     )
     .expect("create should succeed");
 
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap();
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     let approval_id = sess.intent_states[0].outbox_id.clone().unwrap();
     host.mark_outbox_success(&approval_id);
     host.allowance =
         "115792089237316195423570985008687907853269984665640564039457584007913129639935".into();
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap();
     let count_after_route = host.tx_counter;
 
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap();
     assert_eq!(
         host.tx_counter, count_after_route,
         "confirmation after the route is staged must be idempotent"
@@ -1692,7 +1794,13 @@ fn multiple_sessions_same_wallet_are_independent() {
     assert_ne!(id1, id2, "sessions should have different IDs");
 
     // Confirm only the first
-    crate::workflow::confirm(&mut host, "test-wallet", &id1, b"confirm").unwrap();
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id1,
+        b"confirm",
+    )
+    .unwrap();
 
     let sess1 = crate::workflow::load(&mut host, "test-wallet", &id1).unwrap();
     let sess2 = crate::workflow::load(&mut host, "test-wallet", &id2).unwrap();
@@ -1759,7 +1867,13 @@ fn active_confirmation_lock_prevents_duplicate_staging() {
     .unwrap();
     host.put_new(&lock_key, &lock, false).unwrap();
 
-    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    let error = crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap_err();
     assert!(error.contains("already in progress"), "{error}");
     assert_eq!(host.stage_count, 0);
 }
@@ -1781,7 +1895,13 @@ fn stale_confirmation_lock_is_recovered() {
     .unwrap();
     host.put_new(&lock_key, &stale, false).unwrap();
 
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap();
     assert_eq!(host.stage_count, 1);
     assert!(!host.store.contains_key(&lock_key));
 }
@@ -1804,7 +1924,13 @@ fn confirm_rejects_tampered_prepared_transaction() {
     )
     .unwrap();
 
-    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    let error = crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap_err();
     assert!(error.contains("does not match"), "{error}");
     assert_eq!(host.stage_count, 0);
 }
@@ -1856,7 +1982,13 @@ fn confirm_accepts_legacy_cross_chain_destination_metadata() {
     )
     .unwrap();
 
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap();
     assert_eq!(host.stage_count, 1);
 }
 
@@ -1869,7 +2001,13 @@ fn unrelated_balance_increase_is_not_claimed_as_settlement() {
         b"swap 100.0 usdc to dai on ethereum",
     )
     .unwrap();
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap();
     let session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     let route_id = session.intent_states[0].outbox_id.clone().unwrap();
     host.mark_outbox_success(&route_id);
@@ -1994,7 +2132,13 @@ fn venue_disable_is_rechecked_before_staging() {
     .unwrap();
     crate::policy::write_venue_config(&mut host, "test-wallet", b"[defi]\nenabled = false\n")
         .unwrap();
-    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    let error = crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap_err();
     assert!(error.contains("disabled"), "{error}");
     assert_eq!(host.stage_count, 0);
 }
@@ -2095,6 +2239,63 @@ fn create_refuses_an_invalid_wallet_name_before_any_request() {
     );
     assert_eq!(host.enso_calls, 0, "the API key must not reach Enso");
     assert!(!host.store.keys().any(|key| key.contains("Alice")));
+}
+
+#[test]
+fn confirm_refuses_once_the_account_address_has_changed() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_native());
+    let id = crate::workflow::create_for_account(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        b"swap 1.0 eth to usdc on ethereum",
+    )
+    .unwrap();
+
+    host.vfs.insert(
+        "wallets/test-wallet/0/address.evm".into(),
+        b"0x000000000000000000000000000000000000dEaD\n".to_vec(),
+    );
+    let error = crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("now has EVM address 0x000000000000000000000000000000000000dEaD"),
+        "{error}"
+    );
+    assert!(
+        error.contains("quoted for 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1"),
+        "{error}"
+    );
+    assert_eq!(host.stage_count, 0);
+
+    host.vfs.remove("wallets/test-wallet/0/address.evm");
+    let error = crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap_err();
+    assert!(error.contains("no address"), "{error}");
+    assert_eq!(host.stage_count, 0);
+
+    // The original address, in any casing, still stages.
+    host.vfs.insert(
+        "wallets/test-wallet/0/address.evm".into(),
+        b"0x742d35cc6634c0532925a3b844bc9e7595f0beb1\n".to_vec(),
+    );
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap();
+    assert_eq!(host.stage_count, 1);
 }
 
 // ===========================================================================
@@ -2198,7 +2399,13 @@ fn quoted_session(delay_ms: u64) -> (MockHost, String) {
 #[test]
 fn fresh_quote_is_staged_without_requoting() {
     let (mut host, id) = quoted_session(10_000);
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap();
     assert_eq!(host.enso_calls, 1);
     let sess = load_session(&mut host, &id);
     assert_eq!(sess.state, "staged");
@@ -2222,7 +2429,13 @@ fn aged_quote_is_refreshed_before_staging_within_reviewed_bounds() {
         DEFAULT_ROUTER,
         serde_json::json!(["2985000000"]),
     ));
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap();
     assert_eq!(host.enso_calls, 2);
     // The refresh asked for the reviewed floor, not the reviewed slippage.
     let refresh_url = &host.enso_urls[1];
@@ -2296,8 +2509,13 @@ fn refreshed_quote_outside_reviewed_bounds_is_refused_and_reported() {
     ] {
         let (mut host, id) = quoted_session(120_000);
         host.enso_response = Some(fresh);
-        let error =
-            crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+        let error = crate::workflow::confirm(
+            &mut host,
+            &petal::testing::wallet_account("test-wallet", 0),
+            &id,
+            b"confirm",
+        )
+        .unwrap_err();
         assert!(error.contains(expected), "{error}");
         assert!(error.contains("create a new one"), "{error}");
         assert!(host.staged.is_empty(), "nothing may be staged");
@@ -2313,7 +2531,13 @@ fn refreshed_quote_outside_reviewed_bounds_is_refused_and_reported() {
 fn temporary_refresh_failure_says_to_retry_not_abandon() {
     let (mut host, id) = quoted_session(120_000);
     host.enso_status = 503;
-    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    let error = crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap_err();
     assert!(error.contains("write `confirm` again"), "{error}");
     assert!(!error.contains("abandon"), "{error}");
     assert!(host.staged.is_empty());
@@ -2328,7 +2552,13 @@ fn temporary_refresh_failure_says_to_retry_not_abandon() {
         DEFAULT_ROUTER,
         serde_json::json!("2985000000"),
     ));
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    crate::workflow::confirm(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"confirm",
+    )
+    .unwrap();
     assert_eq!(load_session(&mut host, &id).state, "staged");
 }
 
@@ -2403,6 +2633,7 @@ fn routes_declare_capabilities_their_workflows_need() {
         "bloom:store",
         "bloom:tx.outbox",
         "bloom:chain",
+        "bloom:vfs.read",
     ] {
         assert!(
             confirm.contains(&format!("\"{cap}\"")),
@@ -2410,7 +2641,7 @@ fn routes_declare_capabilities_their_workflows_need() {
         );
     }
     let create = include_str!("../files/intents/[wallet]/[index]/new.rs");
-    for cap in ["bloom:http", "bloom:store", "bloom:chain"] {
+    for cap in ["bloom:http", "bloom:store", "bloom:chain", "bloom:vfs.read"] {
         assert!(
             create.contains(&format!("\"{cap}\"")),
             "new must declare {cap}"
