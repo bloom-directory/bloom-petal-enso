@@ -16,6 +16,9 @@ petal::route_file!(
             Err(crate::workflow::CreateError::InvalidInput(message)) => {
                 petal::error(-3, crate::redaction::sanitize_message(&message))
             }
+            Err(crate::workflow::CreateError::Account { code, message }) => {
+                petal::error(code, crate::redaction::sanitize_message(&message))
+            }
             Err(crate::workflow::CreateError::Failed(message)) => {
                 petal::error(-4, crate::redaction::sanitize_message(&message))
             }

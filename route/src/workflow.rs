@@ -42,10 +42,31 @@ fn resolve_api_key<H: Host>(host: &mut H) -> Result<String, String> {
     Ok(resolved.key.expose().to_string())
 }
 
-fn wallet_address<H: Host>(host: &mut H, account: &petal::WalletAccount) -> Result<String, String> {
-    let path = account.address_evm_path();
-    let raw = host.vfs_read(&path, petal::ADDRESS_MAX_BYTES)?;
-    petal::parse_evm_address(&raw).map_err(|reason| format!("{path}: {reason}"))
+/// Lets the SDK read an account's address through [`Host`].
+struct HostVfs<'a, H>(&'a mut H);
+
+impl<H: Host> petal::VfsRead for HostVfs<'_, H> {
+    fn read(&mut self, path: &str, max_bytes: usize) -> Result<Vec<u8>, petal::SdkError> {
+        self.0.vfs_read(path, max_bytes)
+    }
+}
+
+/// The account's EVM address, classified as the SDK classifies the read: an
+/// account with no EVM address is not found (`-1`), a denied read is `-2`,
+/// and anything else is a backend failure.
+fn wallet_address<H: Host>(
+    host: &mut H,
+    account: &petal::WalletAccount,
+) -> Result<String, CreateError> {
+    account
+        .address_evm_from(&mut HostVfs(host))
+        .map_err(|response| match response {
+            petal::DispatchResponse::Error { code: -4, message } => CreateError::Failed(message),
+            petal::DispatchResponse::Error { code, message } => {
+                CreateError::Account { code, message }
+            }
+            _ => CreateError::Failed("cannot read the account address".into()),
+        })
 }
 
 fn validate_session_id(id: &str) -> Result<(), String> {
@@ -367,18 +388,27 @@ fn render_plan_md(view: PlanView<'_>) -> String {
 // ---------------------------------------------------------------------------
 
 /// Why `new` refused an intent. Input mistakes surface as invalid input
-/// (EINVAL on the mount); everything else, such as Enso, RPC, simulation or
-/// policy failures, surfaces as a backend failure.
+/// (EINVAL on the mount); an account Bloom selected without a readable EVM
+/// address keeps the SDK's code; everything else, such as Enso, RPC,
+/// simulation or policy failures, surfaces as a backend failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateError {
     InvalidInput(String),
+    /// The account has no EVM address (`-1`) or Bloom denied reading it
+    /// (`-2`).
+    Account {
+        code: i32,
+        message: String,
+    },
     Failed(String),
 }
 
 impl CreateError {
     pub fn message(&self) -> &str {
         match self {
-            Self::InvalidInput(message) | Self::Failed(message) => message,
+            Self::InvalidInput(message) | Self::Account { message, .. } | Self::Failed(message) => {
+                message
+            }
         }
     }
 }
@@ -407,7 +437,9 @@ pub fn create_for_account<H: Host>(
     account: &petal::WalletAccount,
     body: &[u8],
 ) -> Result<String, CreateError> {
-    let wallet = account.wallet();
+    // Refuse a wallet name Bloom would never select before any read, store
+    // key or Enso request is made for it.
+    let wallet = crate::wallet::validate_id(account.wallet()).map_err(CreateError::InvalidInput)?;
     let now = host.now_ms();
     let parsed = input::parse_new_body(body).map_err(CreateError::InvalidInput)?;
     let address = wallet_address(host, account)?;

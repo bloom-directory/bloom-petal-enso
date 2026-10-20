@@ -16,6 +16,8 @@ struct MockHost {
     store: HashMap<String, Vec<u8>>,
     secrets: HashMap<String, Vec<u8>>,
     vfs: HashMap<String, Vec<u8>>,
+    /// VFS paths whose read fails with a specific host status.
+    vfs_errors: HashMap<String, petal::SdkError>,
     tx_counter: u64,
     staged: HashMap<String, StagedTransaction>,
     inspections: HashMap<String, OutboxInspection>,
@@ -93,6 +95,7 @@ require_calldata_verification = false
             store,
             secrets,
             vfs,
+            vfs_errors: HashMap::new(),
             tx_counter: 0,
             staged: HashMap::new(),
             inspections: HashMap::new(),
@@ -247,11 +250,14 @@ impl Host for MockHost {
         Ok(())
     }
 
-    fn vfs_read(&mut self, path: &str, _max: usize) -> Result<Vec<u8>, String> {
+    fn vfs_read(&mut self, path: &str, _max: usize) -> Result<Vec<u8>, petal::SdkError> {
+        if let Some(error) = self.vfs_errors.get(path) {
+            return Err(error.clone());
+        }
         self.vfs
             .get(path)
             .cloned()
-            .ok_or_else(|| format!("vfs: not found: {path}"))
+            .ok_or(petal::SdkError::Host(petal::HostStatus::NotFound))
     }
 
     fn chain_read(&mut self, chain: &str, method: &str, _params: &str) -> Result<String, String> {
@@ -2020,6 +2026,75 @@ fn create_on_account_one_reads_only_its_numbered_address() {
     .expect("account one has the selected EVM address");
     let session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     assert_eq!(session.wallet, "test-wallet");
+}
+
+#[test]
+fn create_reports_an_unreadable_account_address_with_the_sdk_code() {
+    use crate::workflow::CreateError;
+
+    // Account 3 projects no `address.evm`, as for an account with no EVM key.
+    let mut host = MockHost::new().with_enso_response(build_enso_response_native());
+    let error = crate::workflow::create_for_account(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 3),
+        b"swap 1.0 eth to usdc on ethereum",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            CreateError::Account { code: -1, message }
+                if message.contains("wallets/test-wallet/3/address.evm")
+                    && message.contains("no address")
+        ),
+        "{error:?}"
+    );
+
+    host.vfs_errors.insert(
+        "wallets/test-wallet/0/address.evm".into(),
+        petal::SdkError::Host(petal::HostStatus::Denied),
+    );
+    let error = crate::workflow::create_for_account(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        b"swap 1.0 eth to usdc on ethereum",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, CreateError::Account { code: -2, .. }),
+        "{error:?}"
+    );
+    assert_eq!(
+        host.enso_calls, 0,
+        "no route is requested without an address"
+    );
+}
+
+#[test]
+fn create_refuses_an_invalid_wallet_name_before_any_request() {
+    use crate::workflow::CreateError;
+
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    host.vfs.insert(
+        "wallets/Alice/0/address.evm".into(),
+        b"0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1".to_vec(),
+    );
+    let error = crate::workflow::create_for_account(
+        &mut host,
+        &petal::testing::wallet_account("Alice", 0),
+        b"swap 100.0 usdc to eth on ethereum",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            CreateError::InvalidInput(message)
+                if message.contains("wallet must be a Bloom wallet name")
+        ),
+        "{error:?}"
+    );
+    assert_eq!(host.enso_calls, 0, "the API key must not reach Enso");
+    assert!(!host.store.keys().any(|key| key.contains("Alice")));
 }
 
 // ===========================================================================

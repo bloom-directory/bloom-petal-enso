@@ -10,16 +10,21 @@ pub fn validate_id(value: &str) -> Result<&str, String> {
         && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(
-            "wallet must be a Bloom wallet id, not an on-chain address; use the id under /bloom/wallets/<id>"
+            "wallet must be a Bloom wallet id, not an on-chain address; use the id under /wallets/<id>"
                 .into(),
         );
     }
     petal::validate_wallet_segment(value)
 }
 
-/// Read and validate the generated `[wallet]` route parameter.
+/// Read and validate the generated `[wallet]` route capture.
+///
+/// The capture is positional, so a caller-supplied `wallet` parameter cannot
+/// shadow it as it could through `petal::param`. This is the wallet
+/// [`account`] checks Bloom's trusted selection against.
 pub fn param(ctx: &petal::Ctx) -> Result<&str, petal::DispatchResponse> {
-    let value = petal::param(ctx, "wallet")?;
+    let value = petal::route_generated_param(ctx, "wallet")
+        .ok_or_else(|| petal::route_invalid("missing wallet"))?;
     validate_id(value).map_err(petal::route_invalid)
 }
 
@@ -43,6 +48,13 @@ mod tests {
         const PATH: &'static str = "intents/[wallet]/[index]/new";
         const CANONICAL_PATH: &'static str = "intents/[wallet]/[index]/new";
         const PARAMS: &'static [(&'static str, usize)] = &[("wallet", 1), ("index", 2)];
+    }
+
+    struct Confirm;
+    impl petal::RouteIdentity for Confirm {
+        const PATH: &'static str = "intents/[wallet]/[index]/[id]/confirm";
+        const CANONICAL_PATH: &'static str = "intents/[wallet]/[index]/[id]/confirm";
+        const PARAMS: &'static [(&'static str, usize)] = &[("wallet", 1), ("index", 2), ("id", 3)];
     }
 
     fn selected(
@@ -71,6 +83,35 @@ mod tests {
         }
         let alice = selected("alice", 1).expect("a Bloom wallet name");
         assert_eq!((alice.wallet(), alice.number()), ("alice", 1));
+    }
+
+    #[test]
+    fn a_caller_wallet_param_cannot_shadow_the_route_capture() {
+        // Bloom's router never builds such a context, but if one carried a
+        // caller `wallet`, every route here must still act for the capture.
+        let new_intent = petal::testing::RouteCtx::new("intents/alice/0/new")
+            .param("wallet", "mallory")
+            .account("alice", 0)
+            .bind::<NewIntent>();
+        let confirm = petal::testing::RouteCtx::new("intents/alice/0/0123456789abcdef/confirm")
+            .param("wallet", "mallory")
+            .account("alice", 0)
+            .bind::<Confirm>();
+        assert_eq!(account(&new_intent).unwrap().wallet(), "alice");
+        assert_eq!(account(&confirm).unwrap().wallet(), "alice");
+        assert_eq!(param(&confirm), Ok("alice"));
+    }
+
+    #[test]
+    fn an_on_chain_address_is_pointed_at_the_wallet_tree() {
+        let address = "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1";
+        assert_eq!(
+            validate_id(address),
+            Err(
+                "wallet must be a Bloom wallet id, not an on-chain address; use the id under /wallets/<id>"
+                    .into()
+            )
+        );
     }
 
     #[test]
