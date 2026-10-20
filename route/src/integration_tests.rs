@@ -43,10 +43,8 @@ struct MockHost {
     enso_urls: Vec<String>,
     /// Calldata of every staged transaction, in staging order.
     staged_data: Vec<String>,
-    bridge_response: Option<serde_json::Value>,
-    destination_receipt: Option<serde_json::Value>,
-    destination_transaction: Option<serde_json::Value>,
     bridge_calls: usize,
+    destination_calls: usize,
 }
 
 impl MockHost {
@@ -114,10 +112,8 @@ require_calldata_verification = false
             enso_calls: 0,
             enso_urls: Vec::new(),
             staged_data: Vec::new(),
-            bridge_response: None,
-            destination_receipt: None,
-            destination_transaction: None,
             bridge_calls: 0,
+            destination_calls: 0,
         }
     }
 
@@ -202,13 +198,7 @@ impl Host for MockHost {
     fn http(&mut self, req: HttpRequest, _max: usize) -> Result<HttpResponse, String> {
         if req.url.contains("/bridge/check?") {
             self.bridge_calls += 1;
-            assert_eq!(req.method, "GET");
-            assert!(req.url.starts_with("https://api.enso.finance/api/v1/"));
-            return Ok(HttpResponse {
-                status: self.enso_status,
-                headers: vec![],
-                body: serde_json::to_vec(&self.bridge_response).unwrap(),
-            });
+            return Err("destination provider tracking is not supported".into());
         }
         if req.url.contains("api.enso.finance")
             && let Some(ref body) = self.enso_response
@@ -275,11 +265,9 @@ impl Host for MockHost {
     fn chain_read(&mut self, chain: &str, method: &str, _params: &str) -> Result<String, String> {
         match method {
             "eth_getCode" => Ok("\"0x\"".into()),
-            "eth_getTransactionReceipt" => {
-                Ok(serde_json::to_string(&self.destination_receipt).unwrap())
-            }
-            "eth_getTransactionByHash" => {
-                Ok(serde_json::to_string(&self.destination_transaction).unwrap())
+            "eth_getTransactionReceipt" | "eth_getTransactionByHash" => {
+                self.destination_calls += 1;
+                Err("destination receipt tracking is not supported".into())
             }
             "eth_call" => {
                 if self.eth_call_success {
@@ -2462,6 +2450,7 @@ fn cross_chain_floor_survives_repeated_refresh_and_reload_and_status_is_honest()
     assert_eq!(result["minimum_expected"], "995");
     assert_eq!(result["retry_supported"], false);
     assert_eq!(host.bridge_calls, 0);
+    assert_eq!(host.destination_calls, 0);
 }
 
 #[test]
