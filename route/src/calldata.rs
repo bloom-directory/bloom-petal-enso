@@ -238,6 +238,29 @@ mod tests {
     }
 
     #[test]
+    fn stronger_explicit_and_calldata_floors_survive_quote_replacement() {
+        let (mut route, mut req) = fixture(false, false);
+        req.min_amount_out = Some(U256::from(998));
+        bind_output_checks(&mut route, &req).unwrap();
+        assert_eq!(output_minimum(&route, &req), Some(U256::from(998)));
+        req.min_amount_out = Some(U256::from(996));
+        assert_eq!(
+            crate::quote::reviewed_minimum_output(&route, &req).unwrap(),
+            U256::from(996)
+        );
+        let effective = crate::quote::reviewed_minimum_output(&route, &req)
+            .unwrap()
+            .max(output_minimum(&route, &req).unwrap());
+        assert_eq!(effective, U256::from(998));
+        req.min_amount_out = Some(effective);
+        route.amount_out = "998".into();
+        assert_eq!(
+            crate::quote::reviewed_minimum_output(&route, &req).unwrap(),
+            effective
+        );
+    }
+
+    #[test]
     fn rejects_changed_receiver_token_floor_and_extra_outputs() {
         let (mut route, req) = fixture(false, false);
         bind_output_checks(&mut route, &req).unwrap();
