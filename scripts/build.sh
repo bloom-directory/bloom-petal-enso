@@ -11,6 +11,10 @@ if [[ "${PETAL_COMPILE_TIME_SECRET+x}" == "x" ]]; then
   fi
   export ENSO_API_KEY="$PETAL_COMPILE_TIME_SECRET"
   unset PETAL_COMPILE_TIME_SECRET
+else
+  # The route embeds ENSO_API_KEY at compile time. Only the release secret
+  # above may supply it, never a variable left in a developer's shell.
+  unset ENSO_API_KEY
 fi
 
 # Bloom materializes composed route artifacts here after package validation.
@@ -19,10 +23,10 @@ fi
 # before it gets a chance to regenerate them.
 rm -rf -- "$ROOT/artifacts"
 
+# Build with an explicitly supplied CLI, otherwise with the one pinned at
+# PETAL_REV, never whichever `petal` happens to be first on PATH.
 if [[ -n "${PETAL_BIN:-}" ]]; then
-  "$PETAL_BIN" build --root "$ROOT"
-elif command -v petal >/dev/null 2>&1; then
-  petal build --root "$ROOT"
+  petal_bin="$PETAL_BIN"
 else
   tool_root="$ROOT/target/petal-tool"
   cargo install \
@@ -31,5 +35,6 @@ else
     --locked \
     --root "$tool_root" \
     bloom-petal-cli
-  "$tool_root/bin/petal" build --root "$ROOT"
+  petal_bin="$tool_root/bin/petal"
 fi
+"$petal_bin" build --root "$ROOT"
