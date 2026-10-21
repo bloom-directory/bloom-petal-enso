@@ -991,6 +991,53 @@ fn native_eth_to_cbbtc_on_base_resolves() {
     assert_eq!(sess.intents[0].value_wei, "1000000000000000");
 }
 
+/// Public ceremony input: actual Petal output, with a deterministic mock quote.
+/// This is not evidence that the shortcut executes or that funds were received.
+#[test]
+fn protected_swap_ceremony_fixture() {
+    let mut response: serde_json::Value =
+        serde_json::from_slice(&build_enso_response_native_amount(1_000_000_000_000_000)).unwrap();
+    response["tx"]["to"] = serde_json::json!("0xf75584ef6673ad213a685a1b58cc0330b8ea22cf");
+    response["amountOut"] = serde_json::json!("3000000");
+    let mut host = MockHost::new().with_enso_response(serde_json::to_vec(&response).unwrap());
+    let policy = host
+        .store
+        .get_mut("settings/test-wallet/venue.toml")
+        .unwrap();
+    *policy = String::from_utf8(policy.clone())
+        .unwrap()
+        .replace(
+            "0x1234567890abcdef1234567890abcdef12345678",
+            "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+        )
+        .into_bytes();
+    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 0.001 eth to usdc on base")
+        .unwrap();
+    let session = load_session(&mut host, &id);
+    assert_eq!(
+        crate::calldata::output_minimum(
+            session.route.as_ref().unwrap(),
+            session.route_request.as_ref().unwrap()
+        )
+        .unwrap()
+        .to_string(),
+        "2985000"
+    );
+    let fixture = serde_json::json!({
+        "provenance": "Enso Petal protected_swap_ceremony_fixture; mocked 3 USDC quote; no execution or settlement evidence",
+        "chain_id": 8453,
+        "sender": session.wallet_address,
+        "transaction": session.intents.last().unwrap(),
+    });
+    if let Some(directory) = std::env::var_os("BLOOM_UI_FIXTURE_DIR") {
+        std::fs::write(
+            std::path::Path::new(&directory).join("enso-petal-swap.json"),
+            serde_json::to_vec_pretty(&fixture).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
 // ===========================================================================
 // TEST: policy_overall aggregates correctly
 // ===========================================================================
