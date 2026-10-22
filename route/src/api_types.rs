@@ -166,8 +166,11 @@ impl RouteResponse {
 
         match token.tokenType {
             0 => {
-                // Router V2 ignores native input data; msg.value is the debit.
+                // The deployed routers on 11 chains revert with WrongMsgValue
+                // unless the native input data is exactly msg.value; the
+                // Tempo/Robinhood build ignores it. Enso always sends it.
                 req.token_in == NATIVE_TOKEN.parse::<Address>().unwrap()
+                    && token.data.as_ref() == (req.amount_in,).abi_encode_params()
                     && self.tx.value == req.amount_in
             }
             1 => {

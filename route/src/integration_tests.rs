@@ -769,7 +769,7 @@ fn venue_defaults_are_identical_when_read_and_loaded() {
     for chain in [
         "ethereum",
         "optimism",
-        "bnb",
+        "bsc",
         "polygon",
         "base",
         "arbitrum",
@@ -795,7 +795,7 @@ fn venue_defaults_cover_bloom_enso_intersection() {
         ("arbitrum", common),
         ("optimism", common),
         ("polygon", common),
-        ("bnb", common),
+        ("bsc", common),
         ("avalanche", common),
         ("gnosis", common),
         ("hyperliquid", common),
@@ -866,7 +866,7 @@ fn abandon_after_staging_fails() {
 
     let err = crate::workflow::abandon(&mut host, "test-wallet", &id)
         .expect_err("abandon should fail after staging");
-    assert!(err.contains("cannot abandon"));
+    assert!(err.contains("is in the outbox"), "{err}");
 }
 
 // ===========================================================================
@@ -1258,6 +1258,145 @@ fn full_lifecycle_with_approve_two_intents() {
     assert_eq!(sess.intent_states[0].status, "confirmed");
     assert_eq!(sess.intent_states[1].status, "staged");
     assert!(sess.intent_states[1].depends_on.is_some());
+}
+
+/// A staged swap can be abandoned once its outbox entry is discarded, never
+/// while it could still execute.
+#[test]
+fn a_discarded_swap_can_be_abandoned() {
+    let (mut host, id) = quoted_session(10_000);
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    let route_id = load_session(&mut host, &id).intent_states[0]
+        .outbox_id
+        .clone()
+        .unwrap();
+    let error = crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap_err();
+    assert!(error.contains("`cancel` to its `confirm` file"), "{error}");
+    host.inspections.insert(
+        route_id.clone(),
+        OutboxInspection {
+            outbox_id: route_id,
+            state: "cancelled".into(),
+            tx_hash: None,
+            receipt_json: None,
+        },
+    );
+    crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(load_session(&mut host, &id).state, "abandoned");
+}
+
+/// A stronger minimum already in Enso's route becomes the reviewed floor.
+#[test]
+fn a_stronger_calldata_minimum_becomes_the_reviewed_floor() {
+    let mut host =
+        MockHost::new().with_enso_response(build_enso_response_native_quoted_with_minimum(
+            1_000,
+            "3000000000",
+            DEFAULT_ROUTER,
+            serde_json::json!(["2990000000"]),
+        ));
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 1.0 eth to usdc on ethereum",
+    )
+    .unwrap();
+    assert_eq!(
+        load_session(&mut host, &id)
+            .route_request
+            .unwrap()
+            .min_amount_out,
+        Some(alloy::primitives::U256::from(2_990_000_000u64))
+    );
+}
+
+/// A staging failure after a passing simulation is what the session reports.
+#[test]
+fn a_staging_failure_replaces_the_previous_error() {
+    let (mut host, id) = quoted_session(10_000);
+    host.eth_call_success = false;
+    assert!(crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").is_err());
+    assert!(
+        load_session(&mut host, &id)
+            .last_error
+            .unwrap()
+            .contains("simulation failed")
+    );
+    host.eth_call_success = true;
+    host.stage_fail_after = Some(0);
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    let sess = load_session(&mut host, &id);
+    assert_eq!(sess.last_error.as_deref(), Some(error.as_str()));
+    assert!(error.contains("staging the swap failed"), "{error}");
+    assert!(sess.simulation.is_some());
+}
+
+/// A same-chain session from before output checks, with an unguarded route,
+/// is refused at confirm rather than staged.
+#[test]
+fn an_unguarded_same_chain_route_is_never_staged() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 100.0 usdc to dai on ethereum",
+    )
+    .unwrap();
+    let mut session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    let original: crate::api_types::RouteResponse =
+        serde_json::from_slice(&build_enso_response_erc20()).unwrap();
+    session.route.as_mut().unwrap().tx.data = original.tx.data.clone();
+    session.intents.last_mut().unwrap().data_hex = format!("0x{}", hex::encode(&original.tx.data));
+    host.put(
+        &session.key(),
+        &serde_json::to_vec(&session).unwrap(),
+        false,
+    )
+    .unwrap();
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    assert!(error.contains("no on-chain output check"), "{error}");
+    assert_eq!(host.stage_count, 0);
+}
+
+/// A cross-chain swap whose quote changed while the owner approved the token
+/// allowance can be abandoned and started again, not left stuck.
+#[test]
+fn a_cross_chain_swap_refused_after_its_approval_can_be_abandoned() {
+    let mut response: serde_json::Value =
+        serde_json::from_slice(&build_enso_response_erc20()).unwrap();
+    response["route"][0]["destinationChainId"] = serde_json::json!(8453);
+    response["amountOut"] = serde_json::json!("1000");
+    let mut host = MockHost::new()
+        .with_enso_response(serde_json::to_vec(&response).unwrap())
+        .with_allowance("0");
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        br#"{"intent":"swap 100.0 usdc to eth","chain":"ethereum","destination_chain":"base"}"#,
+    )
+    .unwrap();
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    let approval_id = sess.intent_states[0].outbox_id.clone().unwrap();
+
+    // While the approval is still pending, abandoning says what to do first.
+    let pending = crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap_err();
+    assert!(pending.contains("still pending"), "{pending}");
+
+    host.mark_outbox_success(&approval_id);
+    host.allowance =
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935".into();
+    // The bridge quote changed during the approval, so the swap is refused.
+    host.now += 120_000;
+    response["amountOut"] = serde_json::json!("1001");
+    response["tx"]["data"] =
+        serde_json::json!(format!("{}00", response["tx"]["data"].as_str().unwrap()));
+    host.enso_response = Some(serde_json::to_vec(&response).unwrap());
+    assert!(crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").is_err());
+
+    crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+    let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(sess.state, "abandoned");
 }
 
 // ===========================================================================
@@ -2208,6 +2347,39 @@ fn aged_quote_is_refreshed_before_staging_within_reviewed_bounds() {
 }
 
 #[test]
+fn a_higher_refreshed_quote_does_not_raise_the_reviewed_floor() {
+    // Reviewed at 3,000,000,000 less 0.5%: floor 2,985,000,000. The market
+    // then rises, and Enso returns a safe route held to exactly that floor.
+    // The first refresh is saved but not staged (simulation fails); the next
+    // one compares against what the owner reviewed, not that replacement.
+    let (mut host, id) = quoted_session(120_000);
+    host.eth_call_success = false;
+    host.enso_response = Some(build_enso_response_native_quoted_with_minimum(
+        1_120,
+        "3030000000",
+        DEFAULT_ROUTER,
+        serde_json::json!(["2985000000"]),
+    ));
+    assert!(crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").is_err());
+    host.eth_call_success = true;
+    host.now += 120_000;
+    host.enso_response = Some(build_enso_response_native_quoted_with_minimum(
+        1_240,
+        "3000000000",
+        DEFAULT_ROUTER,
+        serde_json::json!(["2985000000"]),
+    ));
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    let sess = load_session(&mut host, &id);
+    assert_eq!(sess.state, "staged");
+    assert_eq!(
+        sess.route_request.as_ref().unwrap().min_amount_out,
+        Some(alloy::primitives::U256::from(2_985_000_000u64)),
+        "a replacement quote must not become the new floor"
+    );
+}
+
+#[test]
 fn refreshed_quote_outside_reviewed_bounds_is_refused_and_reported() {
     for (fresh, expected) in [
         (
@@ -2276,7 +2448,7 @@ fn temporary_refresh_failure_says_to_retry_not_abandon() {
 fn expired_staged_quote_error_names_the_outbox_entry_and_next_step() {
     let message = crate::quote::expired_staged_error("0002-63206");
     assert!(message.contains("0002-63206"));
-    assert!(message.contains("create a new intent"));
+    assert!(message.contains("pending/0002-63206/confirm") && message.contains("create a new one"));
 }
 
 // ===========================================================================

@@ -52,9 +52,13 @@ minimum output reaches that floor. Otherwise nothing is staged and
 `status.json` `last_error` says why: for a route outside the reviewed bounds,
 abandon the intent and create a new one; for a temporary Enso or network
 failure, write `confirm` again.
-Confirm the outbox entry promptly after staging. `status.json` `quote` gives
-`expires_at_ms`; once a staged, unsent quote expires, `last_error` says to
-cancel that outbox entry and create a new intent. Retrying cannot help.
+Confirm the outbox entry promptly after staging, and ask the owner to approve
+within about two minutes: Enso quotes expire quickly, and an approval binds
+the exact transaction, so a late approval reverts in simulation rather than
+refreshing. `status.json` `quote` gives `expires_at_ms`. Once a staged, unsent
+quote expires, discard the entry by writing `cancel` to its outbox
+`pending/<id>/confirm` file (not `cancel`, which replaces a broadcast
+transaction), write `abandon` here, and create a new intent.
 
 ### 4. Verify settlement
 ```json

@@ -479,8 +479,8 @@ pub fn create_for_account<H: Host>(
                  or end the intent with `on <chain>`"
                     .into(),
             )
-        })?
-        .to_ascii_lowercase();
+        })?;
+    let chain_name = input::canonical_chain(chain_name);
 
     // Resolve the configured RPC and prove that it is the requested chain.
     let chain_id = host
@@ -496,7 +496,7 @@ pub fn create_for_account<H: Host>(
     let destination_chain = parsed
         .destination_chain
         .as_ref()
-        .map(|chain| chain.to_ascii_lowercase());
+        .map(|chain| input::canonical_chain(chain));
     let dest_chain_name = destination_chain.as_deref().unwrap_or(&chain_name);
     let dest_chain_id = if let Some(ref dest) = destination_chain {
         Some(
@@ -1080,7 +1080,17 @@ fn confirm_locked<H: Host>(
             max_priority_fee_per_gas: None,
         };
 
-        let staged = host.tx_stage(&evm_tx)?;
+        // Record this attempt's outcome, so the session never shows an
+        // earlier error or a missing simulation after staging fails.
+        let staged = match host.tx_stage(&evm_tx) {
+            Ok(staged) => staged,
+            Err(error) => {
+                let reason = format!("staging the swap failed: {error}");
+                sess.last_error = Some(reason.clone());
+                save(host, &sess)?;
+                return Err(reason);
+            }
+        };
 
         if let Some(state) = sess.intent_states.get_mut(route_index) {
             state.status = "staged".into();
@@ -1176,12 +1186,9 @@ fn refresh_route_quote<H: Host>(
         ));
     }
     let api_key = resolve_api_key(host).map_err(RefreshError::Unavailable)?;
-    let mut refresh_request = req.clone();
-    refresh_request.min_amount_out = Some(
-        crate::quote::reviewed_minimum_output(reviewed, req)
-            .map_err(RefreshError::OutOfBounds)?
-            .max(crate::calldata::output_minimum(reviewed, req).unwrap_or(U256::ZERO)),
-    );
+    // The floor stored at review is the only baseline; a replacement quote
+    // never raises or lowers it.
+    let refresh_request = req.clone();
     let mut fresh = api::route(host, &api_key, &refresh_request).map_err(|error| {
         RefreshError::Unavailable(format!(
             "cannot refresh the Enso quote before staging: {error}"
@@ -1251,16 +1258,50 @@ pub fn abandon_with_body<H: Host>(
         return Err("wallet mismatch: session does not belong to this wallet".into());
     }
 
-    // Refuse if any intent has been staged to the outbox.
-    if sess.intent_states.iter().any(|s| s.outbox_id.is_some()) {
-        return Err("cannot abandon after an outbox transaction exists".into());
-    }
-
     if sess.terminal() {
         return Err("session is already terminal".into());
     }
 
-    sess.transition(now, "abandoned", "user abandoned before staging");
+    // The swap itself must not be in the outbox. A finished token approval
+    // may be: its exact allowance stays, and a new intent reuses it.
+    let mut approval_left = false;
+    for (intent, state) in sess.intents.iter().zip(&sess.intent_states) {
+        let Some(outbox_id) = state.outbox_id.as_deref() else {
+            continue;
+        };
+        let inspection = host.tx_inspect(&sess.wallet, &sess.chain, outbox_id)?;
+        if intent.label == "route" {
+            // Only a swap that will never execute can be abandoned.
+            if !matches!(
+                inspection.state.as_str(),
+                "failed" | "reverted" | "cancelled"
+            ) {
+                return Err(format!(
+                    "the swap {outbox_id} is in the outbox; discard it by writing `cancel` to its `confirm` file, then abandon"
+                ));
+            }
+            continue;
+        }
+        if !matches!(
+            inspection.state.as_str(),
+            "success" | "failed" | "reverted" | "cancelled"
+        ) {
+            return Err(format!(
+                "the token approval {outbox_id} is still pending in the outbox; confirm or discard it there, then abandon"
+            ));
+        }
+        approval_left = true;
+    }
+
+    sess.transition(
+        now,
+        "abandoned",
+        if approval_left {
+            "user abandoned; the token approval already sent stays and a new intent reuses it"
+        } else {
+            "user abandoned before staging"
+        },
+    );
     save(host, &sess)
 }
 

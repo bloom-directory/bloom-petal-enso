@@ -52,8 +52,11 @@ temporary Enso or network failure only needs another `confirm`. `status.json`
 reports `quote.fetched_at_ms`, `quote.expires_at_ms`, `quote.expires_from`
 (`enso_valid_until` or `fetch_time`) and `quote.expired`. When
 a staged route's quote expires while its outbox entry is still pending,
-`last_error` tells the agent to cancel that entry and create a new intent,
-because confirming an expired route can revert or be refused.
+`last_error` tells the agent to discard that entry (write `cancel` to its
+outbox `confirm` file), abandon the intent and create a new one, because
+confirming an expired route can revert or be refused. The owner's approval
+binds the exact transaction, so it cannot pick up a fresher quote; ask for
+approval within about two minutes of staging.
 
 ## Configuration
 

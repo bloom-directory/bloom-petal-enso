@@ -76,7 +76,7 @@ pub fn reviewed_minimum_output(
 
 /// Accept a fresh quote only within the reviewed bounds: the same request,
 /// router and native value, and a transaction whose own minimum output is
-/// no lower than the reviewed quote less its slippage tolerance.
+/// no lower than the floor stored when the owner reviewed the swap.
 ///
 /// API `minAmountOut` metadata is not executable evidence. Same-chain routes
 /// must carry the matching receiver, token and floor in their safe-route call.
@@ -99,8 +99,10 @@ pub fn verify_refreshed(
     }
     let fresh_output = U256::from_str_radix(fresh.amount_out.trim(), 10)
         .map_err(|_| "the refreshed Enso route has an invalid quoted output amount".to_string())?;
-    let minimum = reviewed_minimum_output(reviewed, req)?
-        .max(crate::calldata::output_minimum(reviewed, req).unwrap_or(U256::ZERO));
+    let minimum = req
+        .min_amount_out
+        .filter(|floor| !floor.is_zero())
+        .ok_or("the reviewed minimum output is unavailable; a new review is required")?;
     if fresh_output.is_zero() || fresh_output < minimum {
         return Err(format!(
             "the refreshed Enso quote ({fresh_output}) is below the reviewed minimum output ({minimum})"
@@ -143,7 +145,8 @@ pub fn status_view(route: &RouteResponse, now_ms: u64) -> Option<serde_json::Val
 pub fn expired_staged_error(outbox_id: &str) -> String {
     format!(
         "the Enso quote in outbox {outbox_id} expired; confirming that pending entry can \
-         revert or be refused, so cancel it and create a new intent for a fresh quote"
+         revert or be refused. Discard it by writing `cancel` to its outbox \
+         `pending/{outbox_id}/confirm` file, abandon this intent, and create a new one"
     )
 }
 

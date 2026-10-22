@@ -1,6 +1,8 @@
 //! Router V2's signed source and destination constraints. Inner shortcuts stay
 //! byte-for-byte intact; same-chain routes use the router's atomic balance checks.
 //! Contract: EnsoBuild/shortcuts-client-contracts@483408a3219451858abcd92c2f7b19a9783c14cc.
+//! The deployed routers 0xf755… (10 chains) and 0xa146… (Linea) were built from
+//! 6f012e9/c2ba4c9 and require native input data to equal msg.value.
 
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol_types::{SolCall, SolValue};
@@ -142,11 +144,20 @@ pub fn verify_output_checks(route: &RouteResponse, req: &RouteRequest) -> Result
     }
     let envelope = decode(&route.tx.data)?;
     if envelope.outputs.is_none() {
-        return Ok(false);
+        // Every same-chain route is bound to a safe-route check at review;
+        // one without it predates that and needs a new review.
+        return Err(
+            "this same-chain Enso route has no on-chain output check; create a new intent".into(),
+        );
     }
     let minimum = output_minimum(route, req)
         .ok_or("Enso safe route output token or receiver does not match the request")?;
-    let required = crate::quote::reviewed_minimum_output(route, req)?;
+    // After review the stored floor is the bar; before it is stored, the
+    // quote less slippage is.
+    let required = match req.min_amount_out.filter(|floor| !floor.is_zero()) {
+        Some(floor) => floor,
+        None => crate::quote::reviewed_minimum_output(route, req)?,
+    };
     if minimum.is_zero() || minimum < required {
         return Err(format!(
             "Enso safe route's minimum output ({minimum}) is below the reviewed minimum output ({required})"
@@ -176,7 +187,7 @@ mod tests {
         let input = IEnsoRouter::Token {
             tokenType: if native { 0 } else { 1 },
             data: if native {
-                vec![]
+                (req.amount_in,).abi_encode_params()
             } else {
                 (token_in, req.amount_in).abi_encode_params()
             }
@@ -201,6 +212,27 @@ mod tests {
             "amountOut": "1000", "route": []
         })).unwrap();
         (route, req)
+    }
+
+    #[test]
+    fn native_input_data_must_equal_the_value_sent() {
+        for (data, accepted) in [
+            ((U256::from(100),).abi_encode_params(), true),
+            (vec![], false),
+            ((U256::from(1),).abi_encode_params(), false),
+        ] {
+            let (mut route, req) = fixture(true, false);
+            route.tx.data = IEnsoRouter::routeSingleCall {
+                tokenIn: IEnsoRouter::Token {
+                    tokenType: 0,
+                    data: data.into(),
+                },
+                data: Bytes::from_static(b"unchanged inner bytes"),
+            }
+            .abi_encode()
+            .into();
+            assert_eq!(route.input_matches_request(&req), accepted);
+        }
     }
 
     #[test]
@@ -321,11 +353,13 @@ mod tests {
         let mut refresh_request = req.clone();
         refresh_request.min_amount_out = Some(U256::from(995));
         bind_output_checks(&mut fresh, &refresh_request).unwrap();
-        crate::quote::verify_refreshed(&route, &fresh, &req).unwrap();
+        crate::quote::verify_refreshed(&route, &fresh, &refresh_request).unwrap();
         assert_eq!(output_minimum(&fresh, &req), Some(U256::from(995)));
         let (mut unguarded, _) = fixture(true, false);
         unguarded.min_amount_out = Some(serde_json::json!("1000"));
-        assert!(crate::quote::verify_refreshed(&route, &unguarded, &req).is_err());
+        assert!(crate::quote::verify_refreshed(&route, &unguarded, &refresh_request).is_err());
+        // Without a stored floor there is nothing to refresh against.
+        assert!(crate::quote::verify_refreshed(&route, &fresh, &req).is_err());
     }
 
     #[test]
