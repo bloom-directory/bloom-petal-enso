@@ -7,15 +7,16 @@ petal::route_file!(spec: petal::static_read_spec(), read: |_ctx: &petal::Ctx| {
 
 No configuration write is needed. Read and override preferences at:
 `/petals/enso/settings/<wallet>/<index>/venue.toml`.
-Defaults enable swaps on all 13 Bloom/Enso chains: Ethereum, Base, Tempo,
-Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche,
-Gnosis, Linea, HyperEVM, and Arc. Use `hyperliquid` for HyperEVM and
+Defaults enable swaps on 12 chains: Ethereum, Base, Tempo, Robinhood Chain,
+Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea and
+HyperEVM. Use `hyperliquid` for HyperEVM and
 `robinhood` for Robinhood Chain. Use token contract addresses for symbols
 not in the static registry. Each chain uses its Enso Router V2, to the wallet
 itself, with at most
 100 bps slippage (requests default to 50 bps).
-Missing protocol metadata and unverified receiver/minimum-output calldata
-produce warnings: review the plan before owner approval and broadcast.
+Same-chain swaps carry an on-chain receiver and minimum-output check; the
+plan states it. Cross-chain swaps and missing protocol metadata produce
+warnings: review the plan before owner approval and broadcast.
 Write the full TOML document to customize; `[defi]` with `enabled = false`
 disables swaps. Existing saved restrictions take precedence over defaults.
 
