@@ -136,42 +136,16 @@ require_calldata_verification = false
                 outbox_id: id.to_string(),
                 state: "success".into(),
                 tx_hash: Some(format!("0x{}", "ab".repeat(32))),
-                receipt_json: Some(r#"{"outcome":"success"}"#.into()),
-            },
-        );
-    }
-
-    fn mark_outbox_success_with_transfer(
-        &mut self,
-        id: &str,
-        token: &str,
-        receiver: &str,
-        amount: u128,
-    ) {
-        let receiver_topic = format!(
-            "0x{}{}",
-            "00".repeat(12),
-            receiver.trim_start_matches("0x").to_ascii_lowercase()
-        );
-        let receipt = serde_json::json!({
-            "outcome": "success",
-            "logs": [{
-                "address": token,
-                "topics": [
-                    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
-                    format!("0x{}", "00".repeat(32)),
-                    receiver_topic,
-                ],
-                "data": format!("0x{amount:064x}"),
-            }]
-        });
-        self.inspections.insert(
-            id.to_string(),
-            OutboxInspection {
-                outbox_id: id.to_string(),
-                state: "success".into(),
-                tx_hash: Some(format!("0x{}", "ab".repeat(32))),
-                receipt_json: Some(receipt.to_string()),
+                // Machine's MinedReceipt shape: no logs.
+                receipt_json: Some(
+                    serde_json::json!({
+                        "outcome": "success",
+                        "tx_hash": format!("0x{}", "ab".repeat(32)),
+                        "block_number": 1,
+                        "revert_reason": null,
+                    })
+                    .to_string(),
+                ),
             },
         );
     }
@@ -1472,51 +1446,34 @@ fn settlement_native_output_is_trackable() {
 }
 
 // ===========================================================================
-// TEST: settlement detects received funds after balance increase
+// TEST: settlement compares the balance increase with the route minimum
 // ===========================================================================
 
 #[test]
-fn settlement_received_after_balance_increase() {
+fn settlement_compares_balance_increase_with_minimum() {
     let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
     let body = br#"swap 100.0 usdc to dai on ethereum"#;
     let id = crate::workflow::create(&mut host, "test-wallet", body).unwrap();
-
-    // Stage the intents so staged_ids is non-empty
     crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
 
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     let route_id = sess.intent_states[0].outbox_id.clone().unwrap();
-    host.mark_outbox_success_with_transfer(
-        &route_id,
-        "0x6b175474e89094c44da98b954eedeac495271d0f",
-        "0x742d35cc6634c0532925a3b844bc9e7595f0beb1",
-        49_750_000_000_000_000,
-    );
+    host.mark_outbox_success(&route_id);
+    let before: u128 = sess.observed_before.as_deref().unwrap().parse().unwrap();
+    let minimum = 49_750_000_000_000_000_u128;
 
-    // Now simulate balance increase on destination chain
-    host.balance_override = Some("2000000000000000000".to_string());
-
+    host.balance_override = Some((before + minimum).to_string());
     let status = crate::settlement::settlement_status(&mut host, &sess);
-
-    assert_eq!(
-        status.get("status").and_then(|v| v.as_str()),
-        Some("destination_received")
-    );
-    let delta = status.get("delta").and_then(|v| v.as_str()).unwrap();
-    assert_ne!(delta, "0", "delta should be non-zero");
-    assert_eq!(status["minimum_expected"], "49750000000000000");
+    assert_eq!(status["status"], "destination_observed_unattributed");
+    assert_eq!(status["minimum_expected"], minimum.to_string());
     assert_eq!(status["minimum_source"], "router_calldata");
-    host.mark_outbox_success_with_transfer(
-        &route_id,
-        "0x6b175474e89094c44da98b954eedeac495271d0f",
-        "0x742d35cc6634c0532925a3b844bc9e7595f0beb1",
-        49_749_999_999_999_999,
-    );
-    assert_ne!(
-        crate::settlement::settlement_status(&mut host, &sess)["status"],
-        "destination_received"
-    );
+    assert!(status.get("retry_interval_ms").is_none());
+
+    host.balance_override = Some((before + minimum - 1).to_string());
+    let status = crate::settlement::settlement_status(&mut host, &sess);
+    assert_eq!(status["status"], "destination_below_minimum");
+    assert!(status.get("retry_interval_ms").is_none());
 }
 
 // ===========================================================================
@@ -1540,6 +1497,7 @@ fn settlement_source_pending_before_receipt() {
         status.get("status").and_then(|v| v.as_str()),
         Some("source_pending")
     );
+    assert_eq!(status["retry_interval_ms"], 10000);
 }
 
 // ===========================================================================

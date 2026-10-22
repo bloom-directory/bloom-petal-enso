@@ -1,4 +1,4 @@
-// One bounded settlement read. Clients may re-read after the retry hint.
+// One bounded settlement read. Only results with `retry_interval_ms` can still change.
 
 petal::route_file!(
     spec: petal::store_read_spec().caps(&["bloom:store", "bloom:chain", "bloom:tx.outbox"]),
@@ -26,12 +26,6 @@ petal::route_file!(
         }
 
         // Check settlement immediately.
-        let mut result = crate::settlement::settlement_status(&mut host, &sess);
-        if let Some(object) = result.as_object_mut() {
-            if object.get("retry_supported") != Some(&serde_json::json!(false)) {
-                object.insert("retry_interval_ms".into(), serde_json::json!(10000));
-            }
-        }
-        petal::read_json_value(&result)
+        petal::read_json_value(&crate::settlement::settlement_status(&mut host, &sess))
     }
 );
