@@ -69,9 +69,10 @@ cancel that outbox entry and create a new intent. Retrying cannot help.
 - Simulation must pass before the route transaction is staged
 - An aged quote is refreshed at staging only within the reviewed bounds
 - ERC-20 approval is exact-amount and must succeed before a second confirm
-- Same-chain ERC-20 settlement requires an attributable receipt Transfer
-- Native balance changes are reported as unattributed
+- Same-chain balance increases are reported as unattributed; the receipt has
+  no logs to attribute them
 - Cross-chain source success reports destination_unverified; this package
-  does not track destination settlement and does not suggest continued polling
+  does not track destination settlement
+- Only source_pending carries a retry hint
 "#.to_vec())
 });

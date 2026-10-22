@@ -114,13 +114,15 @@ are never interpreted by this Petal.
 - Simulation must pass before the route transaction is staged
 - ERC-20 approval is exact-amount and must have a successful receipt first
 - Broadcast requires the standard outbox confirm (owner gate)
-- Same-chain ERC-20 settlement requires a successful source receipt containing
-  an attributable `Transfer` to the receiver for at least the calldata minimum;
-  older unverified routes use the quote and label its source
-- Cross-chain status reports source progress. After source success it reports
-  `destination_unverified`: this package has no destination tracker and offers
-  no polling retry hint. Source success does not prove destination receipt.
-- Native balance increases remain unattributed.
+- After source success, a same-chain balance increase of at least the calldata
+  minimum reports `destination_observed_unattributed`: Machine's receipt has
+  no logs, so the increase is not attributed to the route. Older unverified
+  routes use the quote and label its source
+- Cross-chain status reports source progress, then `destination_unverified`:
+  this package has no destination tracker. Source success does not prove
+  destination receipt.
+- Only `source_pending` carries a retry hint; other results do not change on
+  their own.
 
 Broker reads nested Weiroll command structure and catalog-supported calls
 whose inputs are constant. Return-dependent arguments remain symbolic;

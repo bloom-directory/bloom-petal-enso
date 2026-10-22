@@ -68,9 +68,6 @@ pub struct Session {
     #[serde(default)]
     pub destination_chain: Option<String>,
     pub intent_text: String,
-    /// Original input, including explicitly supplied minimum/venue fields.
-    #[serde(default)]
-    pub request_text: String,
     /// Persisted route request. In schema 2, min_amount_out is the durable
     /// effective reviewed floor, rather than only the user's explicit input.
     #[serde(default)]

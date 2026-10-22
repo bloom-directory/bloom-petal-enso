@@ -1171,7 +1171,6 @@ fn history_trims_at_100_entries() {
         chain: "ethereum".into(),
         destination_chain: None,
         intent_text: "test".into(),
-        request_text: "test".into(),
         route_request: None,
         route: None,
         plan_md: String::new(),

@@ -737,7 +737,6 @@ pub fn create_for_account<H: Host>(
         chain: chain_name,
         destination_chain: destination_chain.clone(),
         intent_text: parsed.intent.clone(),
-        request_text: String::from_utf8_lossy(body).into_owned(),
         route_request: Some(route_req),
         route: Some(route_resp),
         plan_md,
