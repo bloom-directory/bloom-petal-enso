@@ -1285,6 +1285,47 @@ fn a_discarded_swap_can_be_abandoned() {
     assert_eq!(load_session(&mut host, &id).state, "abandoned");
 }
 
+#[test]
+fn abandoned_approval_history_only_claims_successful_allowances() {
+    for outcome in ["success", "failed", "reverted", "cancelled"] {
+        let mut host = MockHost::new()
+            .with_enso_response(build_enso_response_erc20())
+            .with_allowance("0");
+        let id = crate::workflow::create(
+            &mut host,
+            "test-wallet",
+            b"swap 100 usdc to eth on ethereum",
+        )
+        .unwrap();
+        crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+        let approval_id = load_session(&mut host, &id).intent_states[0]
+            .outbox_id
+            .clone()
+            .unwrap();
+        host.inspections.insert(
+            approval_id.clone(),
+            OutboxInspection {
+                outbox_id: approval_id,
+                state: outcome.into(),
+                tx_hash: None,
+                receipt_json: None,
+            },
+        );
+        crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+        let session = load_session(&mut host, &id);
+        assert_eq!(session.state, "abandoned");
+        assert_eq!(
+            session
+                .history
+                .last()
+                .unwrap()
+                .reason
+                .contains("new intent reuses it"),
+            outcome == "success"
+        );
+    }
+}
+
 /// A stronger minimum already in Enso's route becomes the reviewed floor.
 #[test]
 fn a_stronger_calldata_minimum_becomes_the_reviewed_floor() {
@@ -1588,30 +1629,46 @@ fn settlement_native_output_is_trackable() {
 // ===========================================================================
 
 #[test]
-fn settlement_compares_balance_increase_with_minimum() {
-    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+fn protected_settlement_is_not_downgraded_by_fees() {
+    for output in ["dai", "eth"] {
+        let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
-    let body = br#"swap 100.0 usdc to dai on ethereum"#;
-    let id = crate::workflow::create(&mut host, "test-wallet", body).unwrap();
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+        let body = format!("swap 100.0 usdc to {output} on ethereum");
+        let id = crate::workflow::create(&mut host, "test-wallet", body.as_bytes()).unwrap();
+        crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
 
-    let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
-    let route_id = sess.intent_states[0].outbox_id.clone().unwrap();
-    host.mark_outbox_success(&route_id);
-    let before: u128 = sess.observed_before.as_deref().unwrap().parse().unwrap();
-    let minimum = 49_750_000_000_000_000_u128;
+        let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+        let route_id = sess.intent_states[0].outbox_id.clone().unwrap();
+        host.mark_outbox_success(&route_id);
+        let before: u128 = sess.observed_before.as_deref().unwrap().parse().unwrap();
+        let minimum = 49_750_000_000_000_000_u128;
 
-    host.balance_override = Some((before + minimum).to_string());
-    let status = crate::settlement::settlement_status(&mut host, &sess);
-    assert_eq!(status["status"], "destination_observed_unattributed");
-    assert_eq!(status["minimum_expected"], minimum.to_string());
-    assert_eq!(status["minimum_source"], "router_calldata");
-    assert!(status.get("retry_interval_ms").is_none());
+        host.balance_override = Some((before + minimum).to_string());
+        let status = crate::settlement::settlement_status(&mut host, &sess);
+        assert_eq!(status["status"], "destination_minimum_enforced");
+        assert_eq!(status["minimum_expected"], minimum.to_string());
+        assert_eq!(status["minimum_source"], "router_calldata");
+        assert!(status.get("retry_interval_ms").is_none());
 
-    host.balance_override = Some((before + minimum - 1).to_string());
-    let status = crate::settlement::settlement_status(&mut host, &sess);
-    assert_eq!(status["status"], "destination_below_minimum");
-    assert!(status.get("retry_interval_ms").is_none());
+        host.balance_override = Some((before + minimum - 1).to_string());
+        let status = crate::settlement::settlement_status(&mut host, &sess);
+        assert_eq!(status["status"], "destination_minimum_enforced");
+        assert_eq!(status["delta"], (minimum - 1).to_string());
+        assert!(status.get("retry_interval_ms").is_none());
+
+        host.balance_override = Some((before - 1).to_string());
+        let status = crate::settlement::settlement_status(&mut host, &sess);
+        assert_eq!(status["status"], "destination_minimum_enforced");
+        assert_eq!(status["observed_after"], (before - 1).to_string());
+
+        let mut no_baseline = sess.clone();
+        no_baseline.observed_before = None;
+        host.balance_override = Some("invalid balance".into());
+        let status = crate::settlement::settlement_status(&mut host, &no_baseline);
+        assert_eq!(status["status"], "destination_minimum_enforced");
+        assert!(status["observation_error"].is_string());
+        assert!(status.get("delta").is_none());
+    }
 }
 
 // ===========================================================================
@@ -2008,10 +2065,12 @@ fn unrelated_balance_increase_is_not_claimed_as_settlement() {
     )
     .unwrap();
     crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
-    let session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    let mut session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     let route_id = session.intent_states[0].outbox_id.clone().unwrap();
     host.mark_outbox_success(&route_id);
     host.balance_override = Some("2000000000000000000".into());
+    // Legacy unprotected calldata cannot prove the minimum was enforced.
+    session.route.as_mut().unwrap().tx.data = vec![0].into();
 
     let status = crate::settlement::settlement_status(&mut host, &session);
     assert_eq!(
@@ -2529,6 +2588,13 @@ fn routes_declare_capabilities_their_workflows_need() {
         assert!(
             status.contains(&format!("\"{cap}\"")),
             "status.json must declare {cap}"
+        );
+    }
+    let abandon = include_str!("../files/intents/[wallet]/[index]/[id]/abandon.rs");
+    for cap in ["bloom:store", "bloom:tx.outbox"] {
+        assert!(
+            abandon.contains(&format!("\"{cap}\"")),
+            "abandon must declare {cap}"
         );
     }
 }

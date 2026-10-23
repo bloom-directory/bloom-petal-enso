@@ -8,8 +8,9 @@ use crate::api_types::NATIVE_TOKEN;
 use crate::runtime::Host;
 use crate::session::Session;
 /// Compute the current settlement status for a session. Machine's receipt
-/// carries no logs, so a balance increase is reported without claiming that
-/// the route caused it. Only `source_pending` can still change on its own, so
+/// carries no logs, but successful safe routes prove their atomic output check
+/// passed. Later balance observations include fees and unrelated activity.
+/// Only `source_pending` can still change on its own, so
 /// only it carries a retry hint.
 pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::Value {
     let req = match sess.route_request.as_ref() {
@@ -102,6 +103,38 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
             "minimum_source": "reviewed_expectation_not_source_chain_guarantee",
             "retry_supported": false,
         });
+    }
+    // The router checked the receiver's balance within execution, before gas
+    // charges or later transfers affect our observation. Do not turn a mined
+    // protected swap into a failure based on that later net balance.
+    if let Some(minimum) = sess.route.as_ref().and_then(|route| {
+        crate::calldata::verify_output_checks(route, req)
+            .ok()
+            .filter(|verified| *verified)
+            .and_then(|_| crate::calldata::output_minimum(route, req))
+    }) {
+        let mut status = serde_json::json!({
+            "status": "destination_minimum_enforced",
+            "source_state": inspection.state,
+            "source_tx_hash": inspection.tx_hash,
+            "route_outbox_id": route_outbox_id,
+            "minimum_expected": minimum.to_string(),
+            "minimum_source": "router_calldata",
+            "destination_chain": dest_chain,
+            "receiver": receiver,
+            "token_out": token_out_hex,
+            "observed_before": sess.observed_before,
+        });
+        match read_balance(host, dest_chain, &token_out_hex, &receiver) {
+            Ok(current) => {
+                if let Some(before) = &sess.observed_before {
+                    status["delta"] = sub_decimal(&current, before).into();
+                }
+                status["observed_after"] = current.into();
+            }
+            Err(error) => status["observation_error"] = error.into(),
+        }
+        return status;
     }
     let current = match read_balance(host, dest_chain, &token_out_hex, &receiver) {
         Ok(value) => value,

@@ -1290,7 +1290,7 @@ pub fn abandon_with_body<H: Host>(
                 "the token approval {outbox_id} is still pending in the outbox; confirm or discard it there, then abandon"
             ));
         }
-        approval_left = true;
+        approval_left |= inspection.state == "success";
     }
 
     sess.transition(
@@ -1299,7 +1299,7 @@ pub fn abandon_with_body<H: Host>(
         if approval_left {
             "user abandoned; the token approval already sent stays and a new intent reuses it"
         } else {
-            "user abandoned before staging"
+            "user abandoned; no successful token approval remains from this intent"
         },
     );
     save(host, &sess)

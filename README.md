@@ -117,10 +117,11 @@ are never interpreted by this Petal.
 - Simulation must pass before the route transaction is staged
 - ERC-20 approval is exact-amount and must have a successful receipt first
 - Broadcast requires the standard outbox confirm (owner gate)
-- After source success, a same-chain balance increase of at least the calldata
-  minimum reports `destination_observed_unattributed`: Machine's receipt has
-  no logs, so the increase is not attributed to the route. Older unverified
-  routes use the quote and label its source
+- After source success, a verified same-chain safe route reports
+  `destination_minimum_enforced`: its atomic output check passed. Later balance
+  changes are informational and can include gas fees or unrelated transfers;
+  a smaller net gain does not mean the swap failed. Older unverified routes
+  retain unattributed balance observations and label the minimum's source
 - Cross-chain status reports source progress, then `destination_unverified`:
   this package has no destination tracker. Source success does not prove
   destination receipt.
@@ -180,3 +181,8 @@ sessions contain exact outbox and settlement correlation data needed for manual
 reconciliation. This package does not migrate or remove that state. Inspect
 pending sessions before replacing an installation; automatic recovery across
 the old storage layout is unsupported.
+
+Local rebuilds change the package hash. State, configured API keys and outbox
+inspection are scoped to that hash; reinstalling a different package does not
+migrate them. Finish or reconcile in-flight sessions before upgrading and
+configure the new installation separately.

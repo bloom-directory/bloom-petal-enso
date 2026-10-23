@@ -74,8 +74,9 @@ transaction), write `abandon` here, and create a new intent.
 - Simulation must pass before the route transaction is staged
 - An aged quote is refreshed at staging only within the reviewed bounds
 - ERC-20 approval is exact-amount and must succeed before a second confirm
-- Same-chain balance increases are reported as unattributed; the receipt has
-  no logs to attribute them
+- Successful protected same-chain swaps report destination_minimum_enforced;
+  the router's atomic output check passed. Later balance changes include fees
+  and are informational, not a reason to repeat a successful swap
 - Cross-chain source success reports destination_unverified; this package
   does not track destination settlement
 - Only source_pending carries a retry hint

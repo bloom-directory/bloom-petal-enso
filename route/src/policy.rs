@@ -137,14 +137,20 @@ fn set_contains_case_insensitive(set: &BTreeSet<String>, needle: &str) -> bool {
 }
 
 fn receiver_matches(set: &BTreeSet<String>, ctx: &RoutePolicyContext<'_>) -> bool {
-    let literal = format!(
-        "{}:{}:{}",
-        ctx.destination_chain.to_ascii_lowercase(),
-        ctx.token_out.to_ascii_lowercase(),
-        ctx.receiver.to_ascii_lowercase()
-    );
     let class = format!("class:{}", ctx.receiver_class.to_ascii_lowercase());
-    set_contains_case_insensitive(set, &literal) || set_contains_case_insensitive(set, &class)
+    set_contains_case_insensitive(set, &class)
+        || set.iter().any(|entry| {
+            let mut parts = entry.split(':');
+            let (Some(chain), Some(token), Some(receiver), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return false;
+            };
+            crate::input::canonical_chain(chain)
+                == crate::input::canonical_chain(ctx.destination_chain)
+                && token.eq_ignore_ascii_case(ctx.token_out)
+                && receiver.eq_ignore_ascii_case(ctx.receiver)
+        })
 }
 
 const MAX_VENUE_CONFIG_BYTES: usize = 256 * 1024;
@@ -466,6 +472,36 @@ mod tests {
         assert!(chain_listed(&list, "bsc") && chain_listed(&list, "BNB"));
         let list: BTreeSet<String> = ["bsc".to_owned()].into_iter().collect();
         assert!(chain_listed(&list, "bnb") && !chain_listed(&list, "base"));
+    }
+
+    #[test]
+    fn receiver_allow_and_deny_rules_match_chain_aliases() {
+        for rule_chain in ["bnb", "bsc", "BNB"] {
+            for destination in ["bnb", "bsc", "BSC"] {
+                let mut ctx = context(&[]);
+                ctx.destination_chain = destination;
+                let rule = format!("{rule_chain}:{}:{}", ctx.token_out, ctx.receiver);
+                let mut policy = policy();
+                policy.defi.allowed_receivers = [rule.clone()].into_iter().collect();
+                let receiver_outcome = |policy: &VerifiedPolicy, ctx: &RoutePolicyContext<'_>| {
+                    evaluate(policy, ctx)
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|check| check["rule"] == "defi.receiver")
+                        .unwrap()["outcome"]
+                        .clone()
+                };
+                assert_eq!(receiver_outcome(&policy, &ctx), "pass");
+                policy.defi.denied_receivers = [rule].into_iter().collect();
+                assert_eq!(receiver_outcome(&policy, &ctx), "deny");
+                ctx.destination_chain = "base";
+                assert!(!receiver_matches(&policy.defi.denied_receivers, &ctx));
+                ctx.destination_chain = destination;
+                ctx.receiver = "0x2222222222222222222222222222222222222222";
+                assert!(!receiver_matches(&policy.defi.denied_receivers, &ctx));
+            }
+        }
     }
 
     fn policy() -> VerifiedPolicy {
