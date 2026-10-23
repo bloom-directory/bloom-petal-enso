@@ -8,7 +8,7 @@ pub use crate::runtime::{BloomHost, Host};
 use crate::session::{self, IntentState, PreparedIntent, Session};
 use crate::{api, input, settings};
 use alloy::primitives::{Address, U256};
-use petal::sdk::EvmTransaction;
+use petal::sdk::{EvmTransaction, StagedTransaction};
 
 // ---------------------------------------------------------------------------
 // persistence helpers
@@ -42,22 +42,31 @@ fn resolve_api_key<H: Host>(host: &mut H) -> Result<String, String> {
     Ok(resolved.key.expose().to_string())
 }
 
-fn wallet_address<H: Host>(host: &mut H, wallet: &str, account: u32) -> Result<String, String> {
-    crate::wallet::validate_id(wallet)?;
-    let address =
-        String::from_utf8(host.vfs_read(&format!("wallets/{wallet}/{account}/address.evm"), 128)?)
-            .map_err(|_| "wallet EVM address is not UTF-8")?
-            .trim()
-            .to_string();
-    validate_address(&address)?;
-    Ok(address)
+/// Lets the SDK read an account's address through [`Host`].
+struct HostVfs<'a, H>(&'a mut H);
+
+impl<H: Host> petal::VfsRead for HostVfs<'_, H> {
+    fn read(&mut self, path: &str, max_bytes: usize) -> Result<Vec<u8>, petal::SdkError> {
+        self.0.vfs_read(path, max_bytes)
+    }
 }
 
-fn validate_address(addr: &str) -> Result<(), String> {
-    if !addr.starts_with("0x") || addr.len() != 42 {
-        return Err("wallet address must be a 0x-prefixed 20-byte hex string".into());
-    }
-    Ok(())
+/// The account's EVM address, classified as the SDK classifies the read: an
+/// account with no EVM address is not found (`-1`), a denied read is `-2`,
+/// and anything else is a backend failure.
+fn wallet_address<H: Host>(
+    host: &mut H,
+    account: &petal::WalletAccount,
+) -> Result<String, CreateError> {
+    account
+        .address_evm_from(&mut HostVfs(host))
+        .map_err(|response| match response {
+            petal::DispatchResponse::Error { code: -4, message } => CreateError::Failed(message),
+            petal::DispatchResponse::Error { code, message } => {
+                CreateError::Account { code, message }
+            }
+            _ => CreateError::Failed("cannot read the account address".into()),
+        })
 }
 
 fn validate_session_id(id: &str) -> Result<(), String> {
@@ -379,18 +388,27 @@ fn render_plan_md(view: PlanView<'_>) -> String {
 // ---------------------------------------------------------------------------
 
 /// Why `new` refused an intent. Input mistakes surface as invalid input
-/// (EINVAL on the mount); everything else, such as Enso, RPC, simulation or
-/// policy failures, surfaces as a backend failure.
+/// (EINVAL on the mount); an account Bloom selected without a readable EVM
+/// address keeps the SDK's code; everything else, such as Enso, RPC,
+/// simulation or policy failures, surfaces as a backend failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateError {
     InvalidInput(String),
+    /// The account has no EVM address (`-1`) or Bloom denied reading it
+    /// (`-2`).
+    Account {
+        code: i32,
+        message: String,
+    },
     Failed(String),
 }
 
 impl CreateError {
     pub fn message(&self) -> &str {
         match self {
-            Self::InvalidInput(message) | Self::Failed(message) => message,
+            Self::InvalidInput(message) | Self::Account { message, .. } | Self::Failed(message) => {
+                message
+            }
         }
     }
 }
@@ -413,20 +431,18 @@ impl From<&str> for CreateError {
     }
 }
 
-pub fn create<H: Host>(host: &mut H, wallet: &str, body: &[u8]) -> Result<String, CreateError> {
-    create_for_account(host, wallet, 0, body)
-}
-
 /// Create for Bloom's trusted selected account.
 pub fn create_for_account<H: Host>(
     host: &mut H,
-    wallet: &str,
-    account: u32,
+    account: &petal::WalletAccount,
     body: &[u8],
 ) -> Result<String, CreateError> {
+    // Refuse a wallet name Bloom would never select before any read, store
+    // key or Enso request is made for it.
+    let wallet = crate::wallet::validate_id(account.wallet()).map_err(CreateError::InvalidInput)?;
     let now = host.now_ms();
     let parsed = input::parse_new_body(body).map_err(CreateError::InvalidInput)?;
-    let address = wallet_address(host, wallet, account)?;
+    let address = wallet_address(host, account)?;
     let api_key = resolve_api_key(host)?;
 
     // Determine source chain. It must be named: a guessed chain would quote
@@ -770,9 +786,67 @@ fn acquire_confirm_lock<H: Host>(
     Ok((key, value))
 }
 
-pub fn confirm<H: Host>(host: &mut H, wallet: &str, id: &str, body: &[u8]) -> Result<(), String> {
-    let (lock_key, lock_value) = acquire_confirm_lock(host, wallet, id)?;
-    let result = confirm_locked(host, wallet, id, body);
+/// Written with put-new just before an intent is staged, and removed once the
+/// session save that records its outbox id succeeds. A marker beside an
+/// intent with no outbox id means a stage may have reached the outbox without
+/// being recorded, so that intent must never be staged again.
+fn staging_marker_key(wallet: &str, id: &str, index: usize) -> String {
+    format!("intents/{wallet}/{id}/staging-{index}.json")
+}
+
+/// The first unrecorded intent that an earlier confirm began staging.
+fn unrecorded_stage<H: Host>(host: &mut H, sess: &Session) -> Result<Option<usize>, String> {
+    for state in &sess.intent_states {
+        let key = staging_marker_key(&sess.wallet, &sess.id, state.index);
+        if state.outbox_id.is_none() && host.get(&key, 1024)?.is_some() {
+            return Ok(Some(state.index));
+        }
+    }
+    Ok(None)
+}
+
+/// Stage one prepared intent behind its staging marker.
+fn stage_marked<H: Host>(
+    host: &mut H,
+    sess: &Session,
+    index: usize,
+    tx: &EvmTransaction,
+) -> Result<StagedTransaction, String> {
+    let key = staging_marker_key(&sess.wallet, &sess.id, index);
+    let marker = json(&serde_json::json!({
+        "created_ms": host.now_ms(),
+        "chain": tx.chain,
+        "to": tx.to,
+    }))?;
+    host.put_new(&key, &marker, false).map_err(|error| {
+        format!("cannot record that staging began, so nothing was staged: {error}")
+    })?;
+    let staged = host.tx_stage(tx);
+    if staged.is_err() {
+        // The outbox refused the transaction, so a retry cannot duplicate it.
+        let _ = host.delete_if(&key, &marker);
+    }
+    staged
+}
+
+/// Remove an intent's staging marker after its outbox id has been saved. One
+/// left behind is harmless: a recorded outbox id is what a later confirm
+/// checks first.
+fn clear_staging_marker<H: Host>(host: &mut H, sess: &Session, index: usize) {
+    let key = staging_marker_key(&sess.wallet, &sess.id, index);
+    if let Ok(Some(marker)) = host.get(&key, 1024) {
+        let _ = host.delete_if(&key, &marker);
+    }
+}
+
+pub fn confirm<H: Host>(
+    host: &mut H,
+    account: &petal::WalletAccount,
+    id: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let (lock_key, lock_value) = acquire_confirm_lock(host, account.wallet(), id)?;
+    let result = confirm_locked(host, account, id, body);
     let unlock = host.delete_if(&lock_key, &lock_value);
     match (result, unlock) {
         (Err(error), _) => Err(error),
@@ -785,10 +859,11 @@ pub fn confirm<H: Host>(host: &mut H, wallet: &str, id: &str, body: &[u8]) -> Re
 
 fn confirm_locked<H: Host>(
     host: &mut H,
-    wallet: &str,
+    account: &petal::WalletAccount,
     id: &str,
     body: &[u8],
 ) -> Result<(), String> {
+    let wallet = account.wallet();
     let confirmation = std::str::from_utf8(body)
         .map_err(|_| "confirmation body must be UTF-8")?
         .trim();
@@ -837,6 +912,17 @@ fn confirm_locked<H: Host>(
     if !tx_from_hex.eq_ignore_ascii_case(&wallet_addr) {
         return Err("route tx from does not match session wallet_address".into());
     }
+    // The route was quoted for the address the account had at creation.
+    // Re-read the projection so it is never staged once that has changed.
+    let current_addr = wallet_address(host, account).map_err(|error| {
+        format!("cannot re-read the account's EVM address before staging: {error}")
+    })?;
+    if !current_addr.eq_ignore_ascii_case(&wallet_addr) {
+        return Err(format!(
+            "account {account} now has EVM address {current_addr}, but this intent was \
+             quoted for {wallet_addr}; nothing was staged, create a new intent for this account"
+        ));
+    }
 
     // Re-verify route input integrity.
     if !route.input_matches_request(&req) {
@@ -852,6 +938,29 @@ fn confirm_locked<H: Host>(
         return Err("stored route has an invalid quoted output amount — refusing".into());
     }
     verify_prepared_intents(&sess, &req, &route)?;
+
+    // An earlier confirm may have staged an intent and then failed to save
+    // its outbox id. Staging it again could send the same transaction twice.
+    if let Some(index) = unrecorded_stage(host, &sess)? {
+        let intent = &sess.intents[index];
+        let next = if sess.intent_states.iter().any(|s| s.outbox_id.is_some()) {
+            "this intent will not stage it again, so create a new intent if you still want the swap"
+        } else {
+            "then abandon this intent"
+        };
+        let reason = format!(
+            "an earlier confirm began staging this intent's {} transaction but did not record \
+             it, so this confirm staged nothing; it may already be in the wallet's outbox at \
+             /{}/chains/{}/outbox/pending: review it there and cancel it if it should not be \
+             sent, {next}",
+            intent.label,
+            account.dir(),
+            intent.chain,
+        );
+        sess.last_error = Some(reason.clone());
+        save(host, &sess)?;
+        return Err(reason);
+    }
 
     // Verify chain_id.
     let live_chain_id = host
@@ -908,7 +1017,7 @@ fn confirm_locked<H: Host>(
                 max_fee_per_gas: None,
                 max_priority_fee_per_gas: None,
             };
-            let staged = host.tx_stage(&evm_tx)?;
+            let staged = stage_marked(host, &sess, 0, &evm_tx)?;
             if let Some(state) = sess.intent_states.first_mut() {
                 state.status = "staged".into();
                 state.outbox_id = Some(staged.outbox_id.clone());
@@ -931,6 +1040,7 @@ fn confirm_locked<H: Host>(
                 "exact-amount approval staged; route remains unstaged",
             );
             save(host, &sess)?;
+            clear_staging_marker(host, &sess, 0);
             return Ok(());
         }
 
@@ -984,12 +1094,21 @@ fn confirm_locked<H: Host>(
                 fresh
             }
             Err(error) => {
+                // Abandon refuses once an outbox transaction exists, which
+                // after a successful approval it does.
+                let abandonable = sess.intent_states.iter().all(|s| s.outbox_id.is_none());
                 let reason = match error {
                     RefreshError::Unavailable(reason) => {
                         format!("{reason}; nothing was staged, write `confirm` again to retry")
                     }
-                    RefreshError::OutOfBounds(reason) => format!(
+                    RefreshError::OutOfBounds(reason) if abandonable => format!(
                         "{reason}; abandon this intent and create a new one for a fresh route"
+                    ),
+                    RefreshError::OutOfBounds(reason) => format!(
+                        "{reason}; nothing was staged, and this intent's approval already \
+                         succeeded, so it cannot be abandoned: write `confirm` again later to \
+                         retry with a fresh quote, or create a new intent. The exact-amount \
+                         router allowance from this intent's approval remains granted"
                     ),
                 };
                 sess.last_error = Some(reason.clone());
@@ -1040,7 +1159,7 @@ fn confirm_locked<H: Host>(
             max_priority_fee_per_gas: None,
         };
 
-        let staged = host.tx_stage(&evm_tx)?;
+        let staged = stage_marked(host, &sess, route_index, &evm_tx)?;
 
         if let Some(state) = sess.intent_states.get_mut(route_index) {
             state.status = "staged".into();
@@ -1059,6 +1178,7 @@ fn confirm_locked<H: Host>(
     sess.last_error = None;
     sess.transition(now, "staged", "route staged into outbox");
     save(host, &sess)?;
+    clear_staging_marker(host, &sess, route_index);
     Ok(())
 }
 
@@ -1159,6 +1279,20 @@ fn refresh_route_quote<H: Host>(
     refreshed.route = Some(fresh.clone());
     refreshed.policy_checks = policy_checks;
     verify_prepared_intents(&refreshed, req, &fresh).map_err(RefreshError::OutOfBounds)?;
+    // The plan must describe the route that is about to be staged.
+    refreshed.plan_md = render_plan_md(PlanView {
+        intent_text: &refreshed.intent_text,
+        chain_name: &refreshed.chain,
+        destination_chain: refreshed.destination_chain.as_deref(),
+        req,
+        route: &fresh,
+        intents: &refreshed.intents,
+        route_verified: true,
+        receiver_class: refreshed.receiver_class.as_deref().unwrap_or("unknown"),
+        observed_before: refreshed.observed_before.as_deref(),
+        policy_checks: &refreshed.policy_checks,
+        simulation: refreshed.simulation.as_ref(),
+    });
     let state = refreshed.state.clone();
     refreshed.transition(
         now,

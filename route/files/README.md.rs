@@ -49,11 +49,14 @@ Enso for the reviewed minimum output (reviewed quote less slippage), and
 stages it only if it keeps the reviewed router and native value and its
 minimum output reaches that floor. Otherwise nothing is staged and
 `status.json` `last_error` says why: for a route outside the reviewed bounds,
-abandon the intent and create a new one; for a temporary Enso or network
-failure, write `confirm` again.
+abandon the intent and create a new one, or, after its approval succeeded,
+write `confirm` again later or create a new intent; for a temporary Enso or
+network failure, write `confirm` again.
 Confirm the outbox entry promptly after staging. `status.json` `quote` gives
 `expires_at_ms`; once a staged, unsent quote expires, `last_error` says to
 cancel that outbox entry and create a new intent. Retrying cannot help.
+If a confirm staged a transaction but could not record it, the next confirm
+stages nothing and `last_error` names the pending outbox entry to review.
 
 ### 4. Verify settlement
 ```json
@@ -67,6 +70,7 @@ cancel that outbox entry and create a new intent. Retrying cannot help.
 - Enso-owned venue preferences are enforced at create and confirm
 - Bloom wallet policy and approval limits remain host-enforced
 - Simulation must pass before the route transaction is staged
+- Confirm stages nothing once the account's EVM address has changed
 - An aged quote is refreshed at staging only within the reviewed bounds
 - ERC-20 approval is exact-amount and must succeed before a second confirm
 - Same-chain ERC-20 settlement requires an attributable receipt Transfer

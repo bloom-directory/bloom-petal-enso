@@ -48,13 +48,20 @@ the stored request, keep the reviewed router and native value, report a
 minimum output at least that floor (without a reported minimum, its quote
 less the slippage must reach it), and pass the venue preferences again;
 otherwise nothing is staged and `status.json` `last_error` explains the
-refusal. A route outside those bounds means abandoning the intent; a
+refusal. A route outside those bounds means abandoning the intent, or, once
+its approval has succeeded and abandon is refused, writing `confirm` again
+later or creating a new intent (the approval's router allowance remains); a
 temporary Enso or network failure only needs another `confirm`. `status.json`
 reports `quote.fetched_at_ms`, `quote.expires_at_ms`, `quote.expires_from`
 (`enso_valid_until` or `fetch_time`) and `quote.expired`. When
 a staged route's quote expires while its outbox entry is still pending,
 `last_error` tells the agent to cancel that entry and create a new intent,
 because confirming an expired route can revert or be refused.
+
+Each transaction is staged behind a marker that is removed once the session
+records its outbox id. If an earlier confirm staged a transaction but could
+not record it, confirm refuses to stage it again; `last_error` names the
+wallet's pending outbox, where that entry can be reviewed or cancelled.
 
 ## Configuration
 
@@ -108,6 +115,8 @@ are never interpreted by this Petal.
   bundled defaults apply to unconfigured wallets, while authoritative wallet
   policy is independently enforced by Bloom when a transaction is staged
 - Simulation must pass before the route transaction is staged
+- Confirm re-reads the account's EVM address and stages nothing for a route
+  quoted for a different address
 - ERC-20 approval is exact-amount and must have a successful receipt first
 - Broadcast requires the standard outbox confirm (owner gate)
 - Same-chain ERC-20 settlement requires a successful source receipt containing
