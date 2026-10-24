@@ -103,7 +103,10 @@ pub fn bind_output_checks(route: &mut RouteResponse, req: &RouteRequest) -> Resu
     }
     let envelope = decode(&route.tx.data)?;
     if envelope.outputs.is_none() {
-        let minimum = crate::quote::reviewed_minimum_output(route, req)?;
+        let minimum = match req.min_amount_out.filter(|floor| !floor.is_zero()) {
+            Some(floor) => floor,
+            None => crate::quote::reviewed_minimum_output(route, req)?,
+        };
         let native = req.token_out == NATIVE_TOKEN.parse::<Address>().unwrap();
         let output = IEnsoRouter::Token {
             tokenType: if native { 0 } else { 1 },
@@ -212,6 +215,19 @@ mod tests {
             "amountOut": "1000", "route": []
         })).unwrap();
         (route, req)
+    }
+
+    #[test]
+    fn higher_unwrapped_refresh_preserves_reviewed_floor() {
+        for native in [false, true] {
+            for multi in [false, true] {
+                let (mut route, mut req) = fixture(native, multi);
+                req.min_amount_out = Some(U256::from(995));
+                route.amount_out = "1100".into();
+                bind_output_checks(&mut route, &req).unwrap();
+                assert_eq!(output_minimum(&route, &req), Some(U256::from(995)));
+            }
+        }
     }
 
     #[test]

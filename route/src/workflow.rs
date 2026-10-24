@@ -1245,6 +1245,26 @@ pub fn abandon_with_body<H: Host>(
     id: &str,
     body: &[u8],
 ) -> Result<(), String> {
+    // Serialize with confirmation before loading the session: an approval-only
+    // snapshot must never overwrite a swap staged by a concurrent confirmation.
+    let (lock_key, lock_value) = acquire_confirm_lock(host, wallet, id)?;
+    let result = abandon_locked(host, wallet, id, body);
+    let unlock = host.delete_if(&lock_key, &lock_value);
+    match (result, unlock) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(format!(
+            "session was abandoned but confirmation lock cleanup failed: {error}"
+        )),
+    }
+}
+
+fn abandon_locked<H: Host>(
+    host: &mut H,
+    wallet: &str,
+    id: &str,
+    body: &[u8],
+) -> Result<(), String> {
     let command = std::str::from_utf8(body)
         .map_err(|_| "abandon body must be UTF-8")?
         .trim();

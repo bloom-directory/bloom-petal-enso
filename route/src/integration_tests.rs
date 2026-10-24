@@ -45,6 +45,9 @@ struct MockHost {
     staged_data: Vec<String>,
     bridge_calls: usize,
     destination_calls: usize,
+    confirm_on_session_read: Option<String>,
+    abandon_on_stage: Option<String>,
+    concurrent_result: Option<Result<(), String>>,
 }
 
 impl MockHost {
@@ -114,6 +117,9 @@ require_calldata_verification = false
             staged_data: Vec::new(),
             bridge_calls: 0,
             destination_calls: 0,
+            confirm_on_session_read: None,
+            abandon_on_stage: None,
+            concurrent_result: None,
         }
     }
 
@@ -189,7 +195,18 @@ impl Host for MockHost {
     }
 
     fn get(&mut self, key: &str, _max: usize) -> Result<Option<Vec<u8>>, String> {
-        Ok(self.store.get(key).cloned())
+        let snapshot = self.store.get(key).cloned();
+        if key.ends_with("/session.json")
+            && let Some(id) = self.confirm_on_session_read.take()
+        {
+            self.concurrent_result = Some(crate::workflow::confirm(
+                self,
+                "test-wallet",
+                &id,
+                b"confirm",
+            ));
+        }
+        Ok(snapshot)
     }
 
     fn get_secret(&mut self, key: &str, _max: usize) -> Result<Option<Vec<u8>>, String> {
@@ -274,6 +291,10 @@ impl Host for MockHost {
             approval: None,
         };
         self.staged.insert(id.clone(), staged.clone());
+        if let Some(session_id) = self.abandon_on_stage.take() {
+            self.concurrent_result =
+                Some(crate::workflow::abandon(self, "test-wallet", &session_id));
+        }
         Ok(staged)
     }
 
@@ -1283,6 +1304,65 @@ fn a_discarded_swap_can_be_abandoned() {
     );
     crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
     assert_eq!(load_session(&mut host, &id).state, "abandoned");
+}
+
+#[test]
+fn abandon_and_confirm_serialize_after_approval_success() {
+    for abandon_first in [false, true] {
+        let mut host = MockHost::new()
+            .with_enso_response(build_enso_response_erc20())
+            .with_allowance("0");
+        let id = crate::workflow::create(
+            &mut host,
+            "test-wallet",
+            b"swap 100 usdc to eth on ethereum",
+        )
+        .unwrap();
+        crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+        let approval_id = load_session(&mut host, &id).intent_states[0]
+            .outbox_id
+            .clone()
+            .unwrap();
+        host.inspections.insert(
+            approval_id.clone(),
+            OutboxInspection {
+                outbox_id: approval_id,
+                state: "success".into(),
+                tx_hash: None,
+                receipt_json: None,
+            },
+        );
+        host.allowance = "100000000".into();
+        if abandon_first {
+            // Pause abandon after reading its snapshot; attempt a full confirm
+            // before returning it. Without the lock this hides a staged swap.
+            host.confirm_on_session_read = Some(id.clone());
+            crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+            assert_eq!(load_session(&mut host, &id).state, "abandoned");
+            assert_eq!(host.staged.len(), 1, "only the approval may exist");
+        } else {
+            // Attempt abandon after durable staging but before session save.
+            host.abandon_on_stage = Some(id.clone());
+            crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+            let session = load_session(&mut host, &id);
+            assert_eq!(session.state, "staged");
+            assert!(session.intent_states[1].outbox_id.is_some());
+            assert_eq!(host.staged.len(), 2);
+            let error = crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap_err();
+            assert!(error.contains("discard"), "{error}");
+            assert_eq!(
+                load_session(&mut host, &id).intent_states[1].outbox_id,
+                session.intent_states[1].outbox_id
+            );
+        }
+        let error = host.concurrent_result.take().unwrap().unwrap_err();
+        assert!(error.contains("already in progress"), "{error}");
+        assert!(
+            !host
+                .store
+                .contains_key(&format!("intents/test-wallet/{id}/confirm.lock"))
+        );
+    }
 }
 
 #[test]
@@ -2443,7 +2523,7 @@ fn refreshed_quote_outside_reviewed_bounds_is_refused_and_reported() {
     for (fresh, expected) in [
         (
             build_enso_response_native_quoted(1_120, "2984999999", DEFAULT_ROUTER),
-            "does not reach a positive requested minimum",
+            "is below the reviewed minimum output",
         ),
         // The quote clears the floor, but the transaction's own minimum does
         // not: it could fill below what the owner reviewed.
