@@ -7,13 +7,11 @@
 use crate::api_types::NATIVE_TOKEN;
 use crate::runtime::Host;
 use crate::session::Session;
-use alloy::primitives::U256;
-
-const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-
-/// Compute the current settlement status for a session. Same-chain ERC-20
-/// completion requires an attributable receipt log; balance-only observations
-/// are reported without claiming that the route caused them.
+/// Compute the current settlement status for a session. Machine's receipt
+/// carries no logs, but successful safe routes prove their atomic output check
+/// passed. Later balance observations include fees and unrelated activity.
+/// Only `source_pending` can still change on its own, so
+/// only it carries a retry hint.
 pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::Value {
     let req = match sess.route_request.as_ref() {
         Some(r) => r,
@@ -74,7 +72,7 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
             inspection.state.as_str(),
             "failed" | "reverted" | "cancelled"
         );
-        return serde_json::json!({
+        let mut status = serde_json::json!({
             "status": if failed { "source_failed" } else { "source_pending" },
             "source_state": inspection.state,
             "source_tx_hash": inspection.tx_hash,
@@ -83,8 +81,61 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
             "receiver": receiver,
             "token_out": token_out_hex,
         });
+        if !failed {
+            status["retry_interval_ms"] = 10000.into();
+        }
+        return status;
     }
 
+    if !dest_chain.eq_ignore_ascii_case(&sess.chain) {
+        return serde_json::json!({
+            "status": "destination_unverified",
+            "message": "Destination settlement tracking is unsupported in this package; source success does not prove destination receipt.",
+            "source_state": inspection.state,
+            "source_tx_hash": inspection.tx_hash,
+            "route_outbox_id": route_outbox_id,
+            "destination_chain": dest_chain,
+            "receiver": receiver,
+            "token_out": token_out_hex,
+            "minimum_expected": if sess.schema_version >= 2 {
+                req.min_amount_out.map(|minimum| minimum.to_string())
+            } else { None },
+            "minimum_source": "reviewed_expectation_not_source_chain_guarantee",
+            "retry_supported": false,
+        });
+    }
+    // The router checked the receiver's balance within execution, before gas
+    // charges or later transfers affect our observation. Do not turn a mined
+    // protected swap into a failure based on that later net balance.
+    if let Some(minimum) = sess.route.as_ref().and_then(|route| {
+        crate::calldata::verify_output_checks(route, req)
+            .ok()
+            .filter(|verified| *verified)
+            .and_then(|_| crate::calldata::output_minimum(route, req))
+    }) {
+        let mut status = serde_json::json!({
+            "status": "destination_minimum_enforced",
+            "source_state": inspection.state,
+            "source_tx_hash": inspection.tx_hash,
+            "route_outbox_id": route_outbox_id,
+            "minimum_expected": minimum.to_string(),
+            "minimum_source": "router_calldata",
+            "destination_chain": dest_chain,
+            "receiver": receiver,
+            "token_out": token_out_hex,
+            "observed_before": sess.observed_before,
+        });
+        match read_balance(host, dest_chain, &token_out_hex, &receiver) {
+            Ok(current) => {
+                if let Some(before) = &sess.observed_before {
+                    status["delta"] = sub_decimal(&current, before).into();
+                }
+                status["observed_after"] = current.into();
+            }
+            Err(error) => status["observation_error"] = error.into(),
+        }
+        return status;
+    }
     let current = match read_balance(host, dest_chain, &token_out_hex, &receiver) {
         Ok(value) => value,
         Err(error) => {
@@ -107,8 +158,16 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
     };
 
     let delta = sub_decimal(&current, &before);
-    let minimum = match sess.route.as_ref().map(|route| route.amount_out.trim()) {
-        Some(value) if is_decimal(value) => value,
+    let (minimum, minimum_source) = match sess.route.as_ref() {
+        Some(route) => match crate::calldata::output_minimum(route, req) {
+            Some(value) => (value.to_string(), "router_calldata"),
+            None if is_decimal(route.amount_out.trim()) => {
+                (route.amount_out.trim().to_string(), "enso_quote_unverified")
+            }
+            None => {
+                return serde_json::json!({"status": "error", "error": "Enso route has no valid output floor"});
+            }
+        },
         _ => {
             return serde_json::json!({
                 "status": "error",
@@ -116,25 +175,10 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
             });
         }
     };
-    let balance_reached_quote = !lt_decimal(&delta, minimum);
-    let same_chain = dest_chain.eq_ignore_ascii_case(&sess.chain);
-    let receipt_transfer = if same_chain && !token_out_hex.eq_ignore_ascii_case(NATIVE_TOKEN) {
-        inspection
-            .receipt_json
-            .as_deref()
-            .and_then(|receipt| transfer_amount_to_receiver(receipt, &token_out_hex, &receiver))
-    } else {
-        None
-    };
-    let receipt_reached_quote = receipt_transfer
-        .as_deref()
-        .is_some_and(|amount| !lt_decimal(amount, minimum));
-    let status = if receipt_reached_quote {
-        "destination_received"
-    } else if balance_reached_quote {
+    let status = if !lt_decimal(&delta, &minimum) {
         "destination_observed_unattributed"
     } else {
-        "destination_below_quote"
+        "destination_below_minimum"
     };
 
     serde_json::json!({
@@ -145,61 +189,12 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
         "observed_before": before,
         "observed_after": current,
         "delta": delta,
-        "receipt_transfer_amount": receipt_transfer,
         "minimum_expected": minimum,
+        "minimum_source": minimum_source,
         "destination_chain": dest_chain,
         "receiver": receiver,
         "token_out": token_out_hex,
     })
-}
-
-fn transfer_amount_to_receiver(receipt: &str, token: &str, receiver: &str) -> Option<String> {
-    let receipt: serde_json::Value = serde_json::from_str(receipt).ok()?;
-    let logs = receipt.get("logs")?.as_array()?;
-    let receiver = receiver
-        .strip_prefix("0x")
-        .unwrap_or(receiver)
-        .to_ascii_lowercase();
-    let mut total = U256::ZERO;
-    let mut matched = false;
-    for log in logs {
-        let Some(address) = log.get("address").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        if !address.eq_ignore_ascii_case(token) {
-            continue;
-        }
-        let Some(topics) = log.get("topics").and_then(|value| value.as_array()) else {
-            continue;
-        };
-        if topics.len() < 3 {
-            continue;
-        }
-        let (Some(event_topic), Some(recipient_topic)) = (topics[0].as_str(), topics[2].as_str())
-        else {
-            continue;
-        };
-        let recipient_topic = recipient_topic.trim_start_matches("0x");
-        if !event_topic.eq_ignore_ascii_case(TRANSFER_TOPIC)
-            || recipient_topic.len() != 64
-            || !recipient_topic[24..].eq_ignore_ascii_case(&receiver)
-        {
-            continue;
-        }
-        let Some(data) = log.get("data").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        let data = data.trim_start_matches("0x");
-        if data.len() != 64 {
-            continue;
-        }
-        let Ok(amount) = U256::from_str_radix(data, 16) else {
-            continue;
-        };
-        total = total.checked_add(amount)?;
-        matched = true;
-    }
-    matched.then(|| total.to_string())
 }
 
 /// Observe the pre-stage balance of the output token for the receiver.
@@ -244,7 +239,7 @@ fn normalize_decimal(value: &str) -> String {
     }
 }
 
-fn lt_decimal(a: &str, b: &str) -> bool {
+pub(crate) fn lt_decimal(a: &str, b: &str) -> bool {
     let a = normalize_decimal(a);
     let b = normalize_decimal(b);
     if a.len() != b.len() {
@@ -331,51 +326,5 @@ mod tests {
     #[test]
     fn strip_leading_zeros() {
         assert_eq!(sub_decimal("1000", "999"), "1");
-    }
-
-    #[test]
-    fn attributes_erc20_transfer_log_to_receiver() {
-        let token = "0x6b175474e89094c44da98b954eedeac495271d0f";
-        let receiver = "0x742d35cc6634c0532925a3b844bc9e7595f0beb1";
-        let receipt = serde_json::json!({
-            "logs": [{
-                "address": token,
-                "topics": [
-                    TRANSFER_TOPIC,
-                    format!("0x{}", "00".repeat(32)),
-                    format!("0x{}{}", "00".repeat(12), receiver.trim_start_matches("0x")),
-                ],
-                "data": format!("0x{:064x}", U256::from(123_u64)),
-            }]
-        });
-        assert_eq!(
-            transfer_amount_to_receiver(&receipt.to_string(), token, receiver).as_deref(),
-            Some("123")
-        );
-    }
-
-    #[test]
-    fn skips_malformed_logs_before_attributable_transfer() {
-        let token = "0x6b175474e89094c44da98b954eedeac495271d0f";
-        let receiver = "0x742d35cc6634c0532925a3b844bc9e7595f0beb1";
-        let receipt = serde_json::json!({
-            "logs": [
-                {"topics": "not-an-array"},
-                {"address": token, "topics": [TRANSFER_TOPIC, null, null], "data": "0x00"},
-                {
-                    "address": token,
-                    "topics": [
-                        TRANSFER_TOPIC,
-                        format!("0x{}", "00".repeat(32)),
-                        format!("0x{}{}", "00".repeat(12), receiver.trim_start_matches("0x")),
-                    ],
-                    "data": format!("0x{:064x}", U256::from(123_u64)),
-                }
-            ]
-        });
-        assert_eq!(
-            transfer_amount_to_receiver(&receipt.to_string(), token, receiver).as_deref(),
-            Some("123")
-        );
     }
 }

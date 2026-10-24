@@ -14,7 +14,10 @@ use crate::api_types::NATIVE_TOKEN;
 pub const MAX_NEW_BODY_BYTES: usize = 16 * 1024;
 
 /// Body of `new` writes — accepts either a JSON object or plain NL text.
+/// Unknown fields are refused: a misspelled or unsupported option such as a
+/// minimum output must not be silently dropped.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NewIntentBody {
     #[serde(default)]
     #[allow(dead_code)]
@@ -394,6 +397,16 @@ pub fn chain_to_id(name: &str) -> Option<u64> {
     }
 }
 
+/// The Bloom chain name (Machine's `[chains]` key) for any accepted alias, so
+/// `bnb` and `bsc` name the same chain everywhere. Unknown names pass through
+/// lowercased for Machine to resolve or refuse.
+pub fn canonical_chain(name: &str) -> String {
+    chain_to_id(name)
+        .and_then(chain_id_to_name)
+        .map(str::to_owned)
+        .unwrap_or_else(|| name.to_ascii_lowercase())
+}
+
 /// Chain ID to the Bloom chain name (the key in Bloom's `[chains]` config).
 pub fn chain_id_to_name(id: u64) -> Option<&'static str> {
     match id {
@@ -416,6 +429,14 @@ pub fn chain_id_to_name(id: u64) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_body_fields_are_refused() {
+        let error =
+            parse_new_body(br#"{"intent":"swap 1 eth to usdc on base","min_amount_out":"5"}"#)
+                .unwrap_err();
+        assert!(error.contains("min_amount_out"), "{error}");
+    }
 
     #[test]
     fn parses_swap_intent() {
