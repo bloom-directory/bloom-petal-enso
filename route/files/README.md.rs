@@ -57,8 +57,7 @@ within about two minutes: Enso quotes expire quickly, and an approval binds
 the exact transaction, so a late approval reverts in simulation rather than
 refreshing. `status.json` `quote` gives `expires_at_ms`. Once a staged, unsent
 quote expires, discard the entry by writing `cancel` to its outbox
-`pending/<id>/confirm` file (not `cancel`, which replaces a broadcast
-transaction), write `abandon` here, and create a new intent.
+`pending/<id>/confirm` file, write `abandon` here, and create a new intent.
 
 ### 4. Verify settlement
 ```json

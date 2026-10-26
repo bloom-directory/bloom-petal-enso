@@ -265,8 +265,8 @@ fn render_plan_md(view: PlanView<'_>) -> String {
          - Token in: `{token_in_hex}`\n\
          - Token out: `{token_out_hex}`\n\
          - Amount in: {}\n\
-         - Expected output: {}\n\
-         - Slippage tolerance: {} bps (0.{}%)\n\
+         - Expected output (current Enso quote): {}\n\
+         - Slippage tolerance: {} bps ({}.{:02}%), applied to the first reviewed quote\n\
          - Receiver: `{receiver_addr}`\n\
          - Route verified: {route_verified}\n\
          - Protocols: {protocol_str}\n\
@@ -277,7 +277,8 @@ fn render_plan_md(view: PlanView<'_>) -> String {
         req.amount_in,
         route.amount_out,
         req.slippage_bps,
-        req.slippage_bps,
+        req.slippage_bps / 100,
+        req.slippage_bps % 100,
         route.gas.as_deref().unwrap_or("not estimated"),
         route
             .price_impact
@@ -287,7 +288,7 @@ fn render_plan_md(view: PlanView<'_>) -> String {
 
     match crate::calldata::output_minimum(route, req) {
         Some(minimum) => out.push_str(&format!(
-            "- Calldata minimum output: {minimum} raw units of `{token_out_hex}` to `{receiver_addr}`. The Router V2 call checks this balance increase atomically; it is not a receipt or a guarantee of future execution.\n\n"
+            "- Calldata minimum output: {minimum} raw units of `{token_out_hex}` to `{receiver_addr}`. This is the owner-reviewed floor; a refreshed quote never changes it. The Router V2 call checks this balance increase atomically; it is not a receipt or a guarantee of future execution.\n\n"
         )),
         None => out.push_str("- Destination output is not constrained by a decoded same-chain router check.\n\n"),
     }

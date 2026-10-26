@@ -19,6 +19,8 @@ struct MockHost {
     tx_counter: u64,
     staged: HashMap<String, StagedTransaction>,
     inspections: HashMap<String, OutboxInspection>,
+    /// If set, tx_inspect fails with this error.
+    inspect_error: Option<String>,
     /// Pre-built Enso API response body.
     enso_response: Option<Vec<u8>>,
     /// Whether eth_call should succeed.
@@ -101,6 +103,7 @@ require_calldata_verification = false
             tx_counter: 0,
             staged: HashMap::new(),
             inspections: HashMap::new(),
+            inspect_error: None,
             enso_response: None,
             eth_call_success: true,
             chain_ids,
@@ -317,6 +320,9 @@ impl Host for MockHost {
         _chain: &str,
         id: &str,
     ) -> Result<OutboxInspection, String> {
+        if let Some(error) = &self.inspect_error {
+            return Err(error.clone());
+        }
         if let Some(insp) = self.inspections.get(id) {
             return Ok(insp.clone());
         }
@@ -1773,6 +1779,18 @@ fn settlement_source_pending_before_receipt() {
         Some("source_pending")
     );
     assert_eq!(status["retry_interval_ms"], 10000);
+
+    // A transient inspection failure is not terminal: keep polling.
+    host.inspect_error = Some("outbox unavailable".into());
+    let status = crate::settlement::settlement_status(&mut host, &sess);
+    assert_eq!(status["status"], "source_pending");
+    assert_eq!(status["retry_interval_ms"], 10000);
+    assert!(
+        status["error"]
+            .as_str()
+            .unwrap()
+            .contains("outbox unavailable")
+    );
 }
 
 // ===========================================================================
@@ -1888,6 +1906,19 @@ fn omitted_mev_section_keeps_the_default_slippage_ceiling() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("max_slippage"), "{error}");
+}
+
+#[test]
+fn plan_shows_slippage_as_a_percentage() {
+    for (bps, shown) in [(5, "5 bps (0.05%)"), (100, "100 bps (1.00%)")] {
+        let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+        let body = format!(
+            r#"{{"intent":"swap 100.0 usdc to eth","chain":"ethereum","slippage_bps":{bps}}}"#
+        );
+        let id = crate::workflow::create(&mut host, "test-wallet", body.as_bytes()).unwrap();
+        let plan = load_session(&mut host, &id).plan_md;
+        assert!(plan.contains(shown), "{plan}");
+    }
 }
 
 // ===========================================================================
@@ -2462,9 +2493,21 @@ fn aged_quote_is_refreshed_before_staging_within_reviewed_bounds() {
     assert_eq!(sess.state, "staged");
     assert_eq!(sess.last_error, None);
     assert_eq!(sess.route.as_ref().unwrap().amount_out, "2990000000");
-    assert!(sess.plan_md.contains("Expected output: 2990000000"));
+    assert!(
+        sess.plan_md
+            .contains("Expected output (current Enso quote): 2990000000")
+    );
     assert!(sess.plan_md.contains("Calldata minimum output: 2985000000"));
-    assert!(!sess.plan_md.contains("Expected output: 3000000000"));
+    assert!(sess.plan_md.contains("This is the owner-reviewed floor"));
+    assert!(
+        sess.plan_md
+            .contains("50 bps (0.50%), applied to the first reviewed quote")
+    );
+    assert!(
+        !sess
+            .plan_md
+            .contains("Expected output (current Enso quote): 3000000000")
+    );
     assert!(
         sess.history
             .iter()

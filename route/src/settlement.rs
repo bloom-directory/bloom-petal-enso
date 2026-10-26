@@ -10,8 +10,8 @@ use crate::session::Session;
 /// Compute the current settlement status for a session. Machine's receipt
 /// carries no logs, but successful safe routes prove their atomic output check
 /// passed. Later balance observations include fees and unrelated activity.
-/// Only `source_pending` can still change on its own, so
-/// only it carries a retry hint.
+/// Only `source_pending` (including a failed outbox inspection) can still
+/// change on its own, so only it carries a retry hint.
 pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::Value {
     let req = match sess.route_request.as_ref() {
         Some(r) => r,
@@ -60,9 +60,10 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
         Ok(value) => value,
         Err(error) => {
             return serde_json::json!({
-                "status": "error",
+                "status": "source_pending",
                 "error": format!("cannot inspect route outbox: {error}"),
                 "route_outbox_id": route_outbox_id,
+                "retry_interval_ms": 10000,
             });
         }
     };
