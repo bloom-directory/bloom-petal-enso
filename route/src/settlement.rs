@@ -10,8 +10,8 @@ use crate::session::Session;
 /// Compute the current settlement status for a session. Machine's receipt
 /// carries no logs, but successful safe routes prove their atomic output check
 /// passed. Later balance observations include fees and unrelated activity.
-/// Only `source_pending` (including a failed outbox inspection) can still
-/// change on its own, so only it carries a retry hint.
+/// Only `source_pending` (including a transient outbox inspection failure) can
+/// still change on its own, so only it carries a retry hint.
 pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::Value {
     let req = match sess.route_request.as_ref() {
         Some(r) => r,
@@ -58,6 +58,22 @@ pub fn settlement_status<H: Host>(host: &mut H, sess: &Session) -> serde_json::V
 
     let inspection = match host.tx_inspect(&sess.wallet, &sess.chain, route_outbox_id) {
         Ok(value) => value,
+        // Machine refuses an entry another package staged (for example after
+        // an upgrade) and reports a missing one as not found. Neither changes
+        // on retry.
+        Err(
+            error @ petal::SdkError::Host(
+                petal::HostStatus::NotFound
+                | petal::HostStatus::Denied
+                | petal::HostStatus::Invalid,
+            ),
+        ) => {
+            return serde_json::json!({
+                "status": "error",
+                "error": format!("cannot inspect route outbox: {error}"),
+                "route_outbox_id": route_outbox_id,
+            });
+        }
         Err(error) => {
             return serde_json::json!({
                 "status": "source_pending",

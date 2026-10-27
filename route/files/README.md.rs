@@ -78,6 +78,7 @@ quote expires, discard the entry by writing `cancel` to its outbox
   and are informational, not a reason to repeat a successful swap
 - Cross-chain source success reports destination_unverified; this package
   does not track destination settlement
-- Only source_pending carries a retry hint
+- Only source_pending carries a retry hint; an outbox inspection that Machine
+  refuses or cannot find returns error
 "#.to_vec())
 });

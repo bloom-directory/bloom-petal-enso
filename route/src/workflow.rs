@@ -974,7 +974,9 @@ fn confirm_locked<H: Host>(
         }
 
         let approval_id = approve_state.outbox_id.clone().unwrap();
-        let inspection = host.tx_inspect(wallet, &approve.chain, &approval_id)?;
+        let inspection = host
+            .tx_inspect(wallet, &approve.chain, &approval_id)
+            .map_err(|error| error.message())?;
         if inspection.state != "success" {
             if matches!(
                 inspection.state.as_str(),
@@ -1290,7 +1292,9 @@ fn abandon_locked<H: Host>(
         let Some(outbox_id) = state.outbox_id.as_deref() else {
             continue;
         };
-        let inspection = host.tx_inspect(&sess.wallet, &sess.chain, outbox_id)?;
+        let inspection = host
+            .tx_inspect(&sess.wallet, &sess.chain, outbox_id)
+            .map_err(|error| error.message())?;
         if intent.label == "route" {
             // Only a swap that will never execute can be abandoned.
             if !matches!(

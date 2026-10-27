@@ -38,7 +38,7 @@ pub trait Host {
         wallet: &str,
         chain: &str,
         id: &str,
-    ) -> Result<OutboxInspection, String>;
+    ) -> Result<OutboxInspection, petal::SdkError>;
 
     // --- Chain helpers -----------------------------------------------------
 
@@ -161,8 +161,8 @@ impl Host for BloomHost {
         wallet: &str,
         chain: &str,
         id: &str,
-    ) -> Result<OutboxInspection, String> {
-        petal::sdk::tx_inspect(wallet, chain, id).map_err(|error| error.message())
+    ) -> Result<OutboxInspection, petal::SdkError> {
+        petal::sdk::tx_inspect(wallet, chain, id)
     }
 
     fn eth_call(

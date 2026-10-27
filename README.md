@@ -126,7 +126,9 @@ are never interpreted by this Petal.
   this package has no destination tracker. Source success does not prove
   destination receipt.
 - Only `source_pending` carries a retry hint; other results do not change on
-  their own.
+  their own. A failed outbox inspection stays `source_pending` unless Machine
+  refused it or found no entry (for example after a package upgrade); that
+  returns `error`.
 
 Broker reads nested Weiroll command structure and catalog-supported calls
 whose inputs are constant. Return-dependent arguments remain symbolic;

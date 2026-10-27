@@ -20,7 +20,7 @@ struct MockHost {
     staged: HashMap<String, StagedTransaction>,
     inspections: HashMap<String, OutboxInspection>,
     /// If set, tx_inspect fails with this error.
-    inspect_error: Option<String>,
+    inspect_error: Option<petal::SdkError>,
     /// Pre-built Enso API response body.
     enso_response: Option<Vec<u8>>,
     /// Whether eth_call should succeed.
@@ -319,7 +319,7 @@ impl Host for MockHost {
         _wallet: &str,
         _chain: &str,
         id: &str,
-    ) -> Result<OutboxInspection, String> {
+    ) -> Result<OutboxInspection, petal::SdkError> {
         if let Some(error) = &self.inspect_error {
             return Err(error.clone());
         }
@@ -1781,16 +1781,25 @@ fn settlement_source_pending_before_receipt() {
     assert_eq!(status["retry_interval_ms"], 10000);
 
     // A transient inspection failure is not terminal: keep polling.
-    host.inspect_error = Some("outbox unavailable".into());
+    host.inspect_error = Some(petal::SdkError::Message(
+        "backend: read EVM outbox receipt: busy".into(),
+    ));
     let status = crate::settlement::settlement_status(&mut host, &sess);
     assert_eq!(status["status"], "source_pending");
     assert_eq!(status["retry_interval_ms"], 10000);
-    assert!(
-        status["error"]
-            .as_str()
-            .unwrap()
-            .contains("outbox unavailable")
-    );
+    assert!(status["error"].as_str().unwrap().contains("busy"));
+
+    // A refused or missing entry never changes on retry: report a final error.
+    for refusal in [
+        petal::HostStatus::Denied,
+        petal::HostStatus::NotFound,
+        petal::HostStatus::Invalid,
+    ] {
+        host.inspect_error = Some(petal::SdkError::Host(refusal));
+        let status = crate::settlement::settlement_status(&mut host, &sess);
+        assert_eq!(status["status"], "error", "{status}");
+        assert!(status.get("retry_interval_ms").is_none(), "{status}");
+    }
 }
 
 // ===========================================================================
