@@ -7,15 +7,16 @@ petal::route_file!(spec: petal::static_read_spec(), read: |_ctx: &petal::Ctx| {
 
 No configuration write is needed. Read and override preferences at:
 `/petals/enso/settings/<wallet>/<index>/venue.toml`.
-Defaults enable swaps on all 13 Bloom/Enso chains: Ethereum, Base, Tempo,
-Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche,
-Gnosis, Linea, HyperEVM, and Arc. Use `hyperliquid` for HyperEVM and
+Defaults enable swaps on 12 chains: Ethereum, Base, Tempo, Robinhood Chain,
+Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea and
+HyperEVM. Use `hyperliquid` for HyperEVM and
 `robinhood` for Robinhood Chain. Use token contract addresses for symbols
 not in the static registry. Each chain uses its Enso Router V2, to the wallet
 itself, with at most
 100 bps slippage (requests default to 50 bps).
-Missing protocol metadata and unverified receiver/minimum-output calldata
-produce warnings: review the plan before owner approval and broadcast.
+Same-chain swaps carry an on-chain receiver and minimum-output check; the
+plan states it. Cross-chain swaps and missing protocol metadata produce
+warnings: review the plan before owner approval and broadcast.
 Write the full TOML document to customize; `[defi]` with `enabled = false`
 disables swaps. Existing saved restrictions take precedence over defaults.
 
@@ -51,9 +52,12 @@ minimum output reaches that floor. Otherwise nothing is staged and
 `status.json` `last_error` says why: for a route outside the reviewed bounds,
 abandon the intent and create a new one; for a temporary Enso or network
 failure, write `confirm` again.
-Confirm the outbox entry promptly after staging. `status.json` `quote` gives
-`expires_at_ms`; once a staged, unsent quote expires, `last_error` says to
-cancel that outbox entry and create a new intent. Retrying cannot help.
+Confirm the outbox entry promptly after staging, and ask the owner to approve
+within about two minutes: Enso quotes expire quickly, and an approval binds
+the exact transaction, so a late approval reverts in simulation rather than
+refreshing. `status.json` `quote` gives `expires_at_ms`. Once a staged, unsent
+quote expires, discard the entry by writing `cancel` to its outbox
+`pending/<id>/confirm` file, write `abandon` here, and create a new intent.
 
 ### 4. Verify settlement
 ```json
@@ -69,7 +73,12 @@ cancel that outbox entry and create a new intent. Retrying cannot help.
 - Simulation must pass before the route transaction is staged
 - An aged quote is refreshed at staging only within the reviewed bounds
 - ERC-20 approval is exact-amount and must succeed before a second confirm
-- Same-chain ERC-20 settlement requires an attributable receipt Transfer
-- Native and cross-chain balance changes are reported as unattributed
+- Successful protected same-chain swaps report destination_minimum_enforced;
+  the router's atomic output check passed. Later balance changes include fees
+  and are informational, not a reason to repeat a successful swap
+- Cross-chain source success reports destination_unverified; this package
+  does not track destination settlement
+- Only source_pending carries a retry hint; an outbox inspection that Machine
+  refuses or cannot find returns error
 "#.to_vec())
 });

@@ -19,6 +19,8 @@ struct MockHost {
     tx_counter: u64,
     staged: HashMap<String, StagedTransaction>,
     inspections: HashMap<String, OutboxInspection>,
+    /// If set, tx_inspect fails with this error.
+    inspect_error: Option<petal::SdkError>,
     /// Pre-built Enso API response body.
     enso_response: Option<Vec<u8>>,
     /// Whether eth_call should succeed.
@@ -43,6 +45,11 @@ struct MockHost {
     enso_urls: Vec<String>,
     /// Calldata of every staged transaction, in staging order.
     staged_data: Vec<String>,
+    bridge_calls: usize,
+    destination_calls: usize,
+    confirm_on_session_read: Option<String>,
+    abandon_on_stage: Option<String>,
+    concurrent_result: Option<Result<(), String>>,
 }
 
 impl MockHost {
@@ -96,6 +103,7 @@ require_calldata_verification = false
             tx_counter: 0,
             staged: HashMap::new(),
             inspections: HashMap::new(),
+            inspect_error: None,
             enso_response: None,
             eth_call_success: true,
             chain_ids,
@@ -110,6 +118,11 @@ require_calldata_verification = false
             enso_calls: 0,
             enso_urls: Vec::new(),
             staged_data: Vec::new(),
+            bridge_calls: 0,
+            destination_calls: 0,
+            confirm_on_session_read: None,
+            abandon_on_stage: None,
+            concurrent_result: None,
         }
     }
 
@@ -132,42 +145,16 @@ require_calldata_verification = false
                 outbox_id: id.to_string(),
                 state: "success".into(),
                 tx_hash: Some(format!("0x{}", "ab".repeat(32))),
-                receipt_json: Some(r#"{"outcome":"success"}"#.into()),
-            },
-        );
-    }
-
-    fn mark_outbox_success_with_transfer(
-        &mut self,
-        id: &str,
-        token: &str,
-        receiver: &str,
-        amount: u128,
-    ) {
-        let receiver_topic = format!(
-            "0x{}{}",
-            "00".repeat(12),
-            receiver.trim_start_matches("0x").to_ascii_lowercase()
-        );
-        let receipt = serde_json::json!({
-            "outcome": "success",
-            "logs": [{
-                "address": token,
-                "topics": [
-                    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
-                    format!("0x{}", "00".repeat(32)),
-                    receiver_topic,
-                ],
-                "data": format!("0x{amount:064x}"),
-            }]
-        });
-        self.inspections.insert(
-            id.to_string(),
-            OutboxInspection {
-                outbox_id: id.to_string(),
-                state: "success".into(),
-                tx_hash: Some(format!("0x{}", "ab".repeat(32))),
-                receipt_json: Some(receipt.to_string()),
+                // Machine's MinedReceipt shape: no logs.
+                receipt_json: Some(
+                    serde_json::json!({
+                        "outcome": "success",
+                        "tx_hash": format!("0x{}", "ab".repeat(32)),
+                        "block_number": 1,
+                        "revert_reason": null,
+                    })
+                    .to_string(),
+                ),
             },
         );
     }
@@ -192,6 +179,10 @@ impl Host for MockHost {
     }
 
     fn http(&mut self, req: HttpRequest, _max: usize) -> Result<HttpResponse, String> {
+        if req.url.contains("/bridge/check?") {
+            self.bridge_calls += 1;
+            return Err("destination provider tracking is not supported".into());
+        }
         if req.url.contains("api.enso.finance")
             && let Some(ref body) = self.enso_response
         {
@@ -207,7 +198,18 @@ impl Host for MockHost {
     }
 
     fn get(&mut self, key: &str, _max: usize) -> Result<Option<Vec<u8>>, String> {
-        Ok(self.store.get(key).cloned())
+        let snapshot = self.store.get(key).cloned();
+        if key.ends_with("/session.json")
+            && let Some(id) = self.confirm_on_session_read.take()
+        {
+            self.concurrent_result = Some(crate::workflow::confirm(
+                self,
+                "test-wallet",
+                &id,
+                b"confirm",
+            ));
+        }
+        Ok(snapshot)
     }
 
     fn get_secret(&mut self, key: &str, _max: usize) -> Result<Option<Vec<u8>>, String> {
@@ -256,6 +258,11 @@ impl Host for MockHost {
 
     fn chain_read(&mut self, chain: &str, method: &str, _params: &str) -> Result<String, String> {
         match method {
+            "eth_getCode" => Ok("\"0x\"".into()),
+            "eth_getTransactionReceipt" | "eth_getTransactionByHash" => {
+                self.destination_calls += 1;
+                Err("destination receipt tracking is not supported".into())
+            }
             "eth_call" => {
                 if self.eth_call_success {
                     Ok("\"0x\"".to_string())
@@ -287,6 +294,10 @@ impl Host for MockHost {
             approval: None,
         };
         self.staged.insert(id.clone(), staged.clone());
+        if let Some(session_id) = self.abandon_on_stage.take() {
+            self.concurrent_result =
+                Some(crate::workflow::abandon(self, "test-wallet", &session_id));
+        }
         Ok(staged)
     }
 
@@ -308,7 +319,10 @@ impl Host for MockHost {
         _wallet: &str,
         _chain: &str,
         id: &str,
-    ) -> Result<OutboxInspection, String> {
+    ) -> Result<OutboxInspection, petal::SdkError> {
+        if let Some(error) = &self.inspect_error {
+            return Err(error.clone());
+        }
         if let Some(insp) = self.inspections.get(id) {
             return Ok(insp.clone());
         }
@@ -782,7 +796,7 @@ fn venue_defaults_are_identical_when_read_and_loaded() {
     for chain in [
         "ethereum",
         "optimism",
-        "bnb",
+        "bsc",
         "polygon",
         "base",
         "arbitrum",
@@ -808,13 +822,12 @@ fn venue_defaults_cover_bloom_enso_intersection() {
         ("arbitrum", common),
         ("optimism", common),
         ("polygon", common),
-        ("bnb", common),
+        ("bsc", common),
         ("avalanche", common),
         ("gnosis", common),
         ("hyperliquid", common),
         ("linea", "0xa146d46823f3f594b785200102be5385cafce9b5"),
         ("robinhood", "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"),
-        ("arc", "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"),
         ("tempo", "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"),
     ] {
         assert!(policy.defi.allowed_source_chains.contains(chain), "{chain}");
@@ -829,8 +842,9 @@ fn venue_defaults_cover_bloom_enso_intersection() {
                 .contains(&format!("{chain}:{router}"))
         );
     }
-    assert_eq!(policy.defi.allowed_source_chains.len(), 13);
-    assert_eq!(policy.defi.allowed_destination_chains.len(), 13);
+    assert_eq!(policy.defi.allowed_source_chains.len(), 12);
+    assert_eq!(policy.defi.allowed_destination_chains.len(), 12);
+    assert!(!policy.defi.allowed_source_chains.contains("arc"));
     assert!(!policy.defi.allowed_source_chains.contains("unsupported"));
     assert!(
         !policy
@@ -879,7 +893,7 @@ fn abandon_after_staging_fails() {
 
     let err = crate::workflow::abandon(&mut host, "test-wallet", &id)
         .expect_err("abandon should fail after staging");
-    assert!(err.contains("cannot abandon"));
+    assert!(err.contains("is in the outbox"), "{err}");
 }
 
 // ===========================================================================
@@ -978,6 +992,53 @@ fn native_eth_to_cbbtc_on_base_resolves() {
     assert_eq!(sess.intents[0].value_wei, "1000000000000000");
 }
 
+/// Public ceremony input: actual Petal output, with a deterministic mock quote.
+/// This is not evidence that the shortcut executes or that funds were received.
+#[test]
+fn protected_swap_ceremony_fixture() {
+    let mut response: serde_json::Value =
+        serde_json::from_slice(&build_enso_response_native_amount(1_000_000_000_000_000)).unwrap();
+    response["tx"]["to"] = serde_json::json!("0xf75584ef6673ad213a685a1b58cc0330b8ea22cf");
+    response["amountOut"] = serde_json::json!("3000000");
+    let mut host = MockHost::new().with_enso_response(serde_json::to_vec(&response).unwrap());
+    let policy = host
+        .store
+        .get_mut("settings/test-wallet/venue.toml")
+        .unwrap();
+    *policy = String::from_utf8(policy.clone())
+        .unwrap()
+        .replace(
+            "0x1234567890abcdef1234567890abcdef12345678",
+            "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+        )
+        .into_bytes();
+    let id = crate::workflow::create(&mut host, "test-wallet", b"swap 0.001 eth to usdc on base")
+        .unwrap();
+    let session = load_session(&mut host, &id);
+    assert_eq!(
+        crate::calldata::output_minimum(
+            session.route.as_ref().unwrap(),
+            session.route_request.as_ref().unwrap()
+        )
+        .unwrap()
+        .to_string(),
+        "2985000"
+    );
+    let fixture = serde_json::json!({
+        "provenance": "Enso Petal protected_swap_ceremony_fixture; mocked 3 USDC quote; no execution or settlement evidence",
+        "chain_id": 8453,
+        "sender": session.wallet_address,
+        "transaction": session.intents.last().unwrap(),
+    });
+    if let Some(directory) = std::env::var_os("BLOOM_UI_FIXTURE_DIR") {
+        std::fs::write(
+            std::path::Path::new(&directory).join("enso-petal-swap.json"),
+            serde_json::to_vec_pretty(&fixture).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
 // ===========================================================================
 // TEST: policy_overall aggregates correctly
 // ===========================================================================
@@ -990,9 +1051,78 @@ fn policy_overall_aggregation() {
     let id = crate::workflow::create(&mut host, "test-wallet", body).unwrap();
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
 
-    // Minnow-style policy accepts quote-only receiver/min-output facts with
-    // explicit warnings, so the aggregate is warn rather than a silent pass.
-    assert_eq!(sess.policy_overall(), "warn");
+    // Same-chain receiver/minimum now come from the locally prepared safe call.
+    assert_eq!(sess.policy_overall(), "pass");
+}
+
+#[test]
+fn same_chain_routes_work_with_required_calldata_verification() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let policy = host
+        .store
+        .get_mut("settings/test-wallet/venue.toml")
+        .unwrap();
+    *policy = String::from_utf8(policy.clone())
+        .unwrap()
+        .replace(
+            "require_calldata_verification = false",
+            "require_calldata_verification = true",
+        )
+        .into_bytes();
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 100.0 usdc to eth on ethereum",
+    )
+    .unwrap();
+    let session = load_session(&mut host, &id);
+    assert!(session.plan_md.contains("Calldata minimum output:"));
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    assert_eq!(host.staged.len(), 1);
+    assert!(
+        load_session(&mut host, &id)
+            .policy_checks
+            .to_string()
+            .contains("minimum-output floor is enforced")
+    );
+}
+
+#[test]
+fn tampered_stored_safe_output_is_refused_before_staging() {
+    use alloy::primitives::{Address, U256};
+    use alloy::sol_types::{SolCall, SolValue};
+    for change in ["receiver", "token", "minimum"] {
+        let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+        let id = crate::workflow::create(
+            &mut host,
+            "test-wallet",
+            b"swap 100.0 usdc to eth on ethereum",
+        )
+        .unwrap();
+        let mut session = load_session(&mut host, &id);
+        let route = session.route.as_mut().unwrap();
+        let mut call =
+            crate::api_types::IEnsoRouter::safeRouteSingleCall::abi_decode(&route.tx.data).unwrap();
+        match change {
+            "receiver" => call.receiver = Address::repeat_byte(0x77),
+            "token" => {
+                call.tokenOut.tokenType = 1;
+                call.tokenOut.data = (Address::repeat_byte(0x77), U256::MAX)
+                    .abi_encode_params()
+                    .into();
+            }
+            _ => call.tokenOut.data = (U256::ZERO,).abi_encode_params().into(),
+        }
+        route.tx.data = call.abi_encode().into();
+        session.intents.last_mut().unwrap().data_hex = format!("0x{}", hex::encode(&route.tx.data));
+        host.store
+            .insert(session.key(), serde_json::to_vec(&session).unwrap());
+        assert!(
+            crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").is_err(),
+            "{change}"
+        );
+        assert!(host.staged.is_empty());
+    }
 }
 
 // ===========================================================================
@@ -1155,6 +1285,245 @@ fn full_lifecycle_with_approve_two_intents() {
     assert_eq!(sess.intent_states[0].status, "confirmed");
     assert_eq!(sess.intent_states[1].status, "staged");
     assert!(sess.intent_states[1].depends_on.is_some());
+}
+
+/// A staged swap can be abandoned once its outbox entry is discarded, never
+/// while it could still execute.
+#[test]
+fn a_discarded_swap_can_be_abandoned() {
+    let (mut host, id) = quoted_session(10_000);
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    let route_id = load_session(&mut host, &id).intent_states[0]
+        .outbox_id
+        .clone()
+        .unwrap();
+    let error = crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap_err();
+    assert!(error.contains("`cancel` to its `confirm` file"), "{error}");
+    host.inspections.insert(
+        route_id.clone(),
+        OutboxInspection {
+            outbox_id: route_id,
+            state: "cancelled".into(),
+            tx_hash: None,
+            receipt_json: None,
+        },
+    );
+    crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(load_session(&mut host, &id).state, "abandoned");
+}
+
+#[test]
+fn abandon_and_confirm_serialize_after_approval_success() {
+    for abandon_first in [false, true] {
+        let mut host = MockHost::new()
+            .with_enso_response(build_enso_response_erc20())
+            .with_allowance("0");
+        let id = crate::workflow::create(
+            &mut host,
+            "test-wallet",
+            b"swap 100 usdc to eth on ethereum",
+        )
+        .unwrap();
+        crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+        let approval_id = load_session(&mut host, &id).intent_states[0]
+            .outbox_id
+            .clone()
+            .unwrap();
+        host.inspections.insert(
+            approval_id.clone(),
+            OutboxInspection {
+                outbox_id: approval_id,
+                state: "success".into(),
+                tx_hash: None,
+                receipt_json: None,
+            },
+        );
+        host.allowance = "100000000".into();
+        if abandon_first {
+            // Pause abandon after reading its snapshot; attempt a full confirm
+            // before returning it. Without the lock this hides a staged swap.
+            host.confirm_on_session_read = Some(id.clone());
+            crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+            assert_eq!(load_session(&mut host, &id).state, "abandoned");
+            assert_eq!(host.staged.len(), 1, "only the approval may exist");
+        } else {
+            // Attempt abandon after durable staging but before session save.
+            host.abandon_on_stage = Some(id.clone());
+            crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+            let session = load_session(&mut host, &id);
+            assert_eq!(session.state, "staged");
+            assert!(session.intent_states[1].outbox_id.is_some());
+            assert_eq!(host.staged.len(), 2);
+            let error = crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap_err();
+            assert!(error.contains("discard"), "{error}");
+            assert_eq!(
+                load_session(&mut host, &id).intent_states[1].outbox_id,
+                session.intent_states[1].outbox_id
+            );
+        }
+        let error = host.concurrent_result.take().unwrap().unwrap_err();
+        assert!(error.contains("already in progress"), "{error}");
+        assert!(
+            !host
+                .store
+                .contains_key(&format!("intents/test-wallet/{id}/confirm.lock"))
+        );
+    }
+}
+
+#[test]
+fn abandoned_approval_history_only_claims_successful_allowances() {
+    for outcome in ["success", "failed", "reverted", "cancelled"] {
+        let mut host = MockHost::new()
+            .with_enso_response(build_enso_response_erc20())
+            .with_allowance("0");
+        let id = crate::workflow::create(
+            &mut host,
+            "test-wallet",
+            b"swap 100 usdc to eth on ethereum",
+        )
+        .unwrap();
+        crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+        let approval_id = load_session(&mut host, &id).intent_states[0]
+            .outbox_id
+            .clone()
+            .unwrap();
+        host.inspections.insert(
+            approval_id.clone(),
+            OutboxInspection {
+                outbox_id: approval_id,
+                state: outcome.into(),
+                tx_hash: None,
+                receipt_json: None,
+            },
+        );
+        crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+        let session = load_session(&mut host, &id);
+        assert_eq!(session.state, "abandoned");
+        assert_eq!(
+            session
+                .history
+                .last()
+                .unwrap()
+                .reason
+                .contains("new intent reuses it"),
+            outcome == "success"
+        );
+    }
+}
+
+/// A stronger minimum already in Enso's route becomes the reviewed floor.
+#[test]
+fn a_stronger_calldata_minimum_becomes_the_reviewed_floor() {
+    let mut host =
+        MockHost::new().with_enso_response(build_enso_response_native_quoted_with_minimum(
+            1_000,
+            "3000000000",
+            DEFAULT_ROUTER,
+            serde_json::json!(["2990000000"]),
+        ));
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 1.0 eth to usdc on ethereum",
+    )
+    .unwrap();
+    assert_eq!(
+        load_session(&mut host, &id)
+            .route_request
+            .unwrap()
+            .min_amount_out,
+        Some(alloy::primitives::U256::from(2_990_000_000u64))
+    );
+}
+
+/// A staging failure after a passing simulation is what the session reports.
+#[test]
+fn a_staging_failure_replaces_the_previous_error() {
+    let (mut host, id) = quoted_session(10_000);
+    host.eth_call_success = false;
+    assert!(crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").is_err());
+    assert!(
+        load_session(&mut host, &id)
+            .last_error
+            .unwrap()
+            .contains("simulation failed")
+    );
+    host.eth_call_success = true;
+    host.stage_fail_after = Some(0);
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    let sess = load_session(&mut host, &id);
+    assert_eq!(sess.last_error.as_deref(), Some(error.as_str()));
+    assert!(error.contains("staging the swap failed"), "{error}");
+    assert!(sess.simulation.is_some());
+}
+
+/// A same-chain session from before output checks, with an unguarded route,
+/// is refused at confirm rather than staged.
+#[test]
+fn an_unguarded_same_chain_route_is_never_staged() {
+    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        b"swap 100.0 usdc to dai on ethereum",
+    )
+    .unwrap();
+    let mut session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    let original: crate::api_types::RouteResponse =
+        serde_json::from_slice(&build_enso_response_erc20()).unwrap();
+    session.route.as_mut().unwrap().tx.data = original.tx.data.clone();
+    session.intents.last_mut().unwrap().data_hex = format!("0x{}", hex::encode(&original.tx.data));
+    host.put(
+        &session.key(),
+        &serde_json::to_vec(&session).unwrap(),
+        false,
+    )
+    .unwrap();
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    assert!(error.contains("no on-chain output check"), "{error}");
+    assert_eq!(host.stage_count, 0);
+}
+
+/// A cross-chain swap whose quote changed while the owner approved the token
+/// allowance can be abandoned and started again, not left stuck.
+#[test]
+fn a_cross_chain_swap_refused_after_its_approval_can_be_abandoned() {
+    let mut response: serde_json::Value =
+        serde_json::from_slice(&build_enso_response_erc20()).unwrap();
+    response["route"][0]["destinationChainId"] = serde_json::json!(8453);
+    response["amountOut"] = serde_json::json!("1000");
+    let mut host = MockHost::new()
+        .with_enso_response(serde_json::to_vec(&response).unwrap())
+        .with_allowance("0");
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        br#"{"intent":"swap 100.0 usdc to eth","chain":"ethereum","destination_chain":"base"}"#,
+    )
+    .unwrap();
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    let approval_id = sess.intent_states[0].outbox_id.clone().unwrap();
+
+    // While the approval is still pending, abandoning says what to do first.
+    let pending = crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap_err();
+    assert!(pending.contains("still pending"), "{pending}");
+
+    host.mark_outbox_success(&approval_id);
+    host.allowance =
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935".into();
+    // The bridge quote changed during the approval, so the swap is refused.
+    host.now += 120_000;
+    response["amountOut"] = serde_json::json!("1001");
+    response["tx"]["data"] =
+        serde_json::json!(format!("{}00", response["tx"]["data"].as_str().unwrap()));
+    host.enso_response = Some(serde_json::to_vec(&response).unwrap());
+    assert!(crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").is_err());
+
+    crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+    let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    assert_eq!(sess.state, "abandoned");
 }
 
 // ===========================================================================
@@ -1342,39 +1711,50 @@ fn settlement_native_output_is_trackable() {
 }
 
 // ===========================================================================
-// TEST: settlement detects received funds after balance increase
+// TEST: settlement compares the balance increase with the route minimum
 // ===========================================================================
 
 #[test]
-fn settlement_received_after_balance_increase() {
-    let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+fn protected_settlement_is_not_downgraded_by_fees() {
+    for output in ["dai", "eth"] {
+        let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
 
-    let body = br#"swap 100.0 usdc to dai on ethereum"#;
-    let id = crate::workflow::create(&mut host, "test-wallet", body).unwrap();
+        let body = format!("swap 100.0 usdc to {output} on ethereum");
+        let id = crate::workflow::create(&mut host, "test-wallet", body.as_bytes()).unwrap();
+        crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
 
-    // Stage the intents so staged_ids is non-empty
-    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+        let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+        let route_id = sess.intent_states[0].outbox_id.clone().unwrap();
+        host.mark_outbox_success(&route_id);
+        let before: u128 = sess.observed_before.as_deref().unwrap().parse().unwrap();
+        let minimum = 49_750_000_000_000_000_u128;
 
-    let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
-    let route_id = sess.intent_states[0].outbox_id.clone().unwrap();
-    host.mark_outbox_success_with_transfer(
-        &route_id,
-        "0x6b175474e89094c44da98b954eedeac495271d0f",
-        "0x742d35cc6634c0532925a3b844bc9e7595f0beb1",
-        50_000_000_000_000_000,
-    );
+        host.balance_override = Some((before + minimum).to_string());
+        let status = crate::settlement::settlement_status(&mut host, &sess);
+        assert_eq!(status["status"], "destination_minimum_enforced");
+        assert_eq!(status["minimum_expected"], minimum.to_string());
+        assert_eq!(status["minimum_source"], "router_calldata");
+        assert!(status.get("retry_interval_ms").is_none());
 
-    // Now simulate balance increase on destination chain
-    host.balance_override = Some("2000000000000000000".to_string());
+        host.balance_override = Some((before + minimum - 1).to_string());
+        let status = crate::settlement::settlement_status(&mut host, &sess);
+        assert_eq!(status["status"], "destination_minimum_enforced");
+        assert_eq!(status["delta"], (minimum - 1).to_string());
+        assert!(status.get("retry_interval_ms").is_none());
 
-    let status = crate::settlement::settlement_status(&mut host, &sess);
+        host.balance_override = Some((before - 1).to_string());
+        let status = crate::settlement::settlement_status(&mut host, &sess);
+        assert_eq!(status["status"], "destination_minimum_enforced");
+        assert_eq!(status["observed_after"], (before - 1).to_string());
 
-    assert_eq!(
-        status.get("status").and_then(|v| v.as_str()),
-        Some("destination_received")
-    );
-    let delta = status.get("delta").and_then(|v| v.as_str()).unwrap();
-    assert_ne!(delta, "0", "delta should be non-zero");
+        let mut no_baseline = sess.clone();
+        no_baseline.observed_before = None;
+        host.balance_override = Some("invalid balance".into());
+        let status = crate::settlement::settlement_status(&mut host, &no_baseline);
+        assert_eq!(status["status"], "destination_minimum_enforced");
+        assert!(status["observation_error"].is_string());
+        assert!(status.get("delta").is_none());
+    }
 }
 
 // ===========================================================================
@@ -1398,6 +1778,28 @@ fn settlement_source_pending_before_receipt() {
         status.get("status").and_then(|v| v.as_str()),
         Some("source_pending")
     );
+    assert_eq!(status["retry_interval_ms"], 10000);
+
+    // A transient inspection failure is not terminal: keep polling.
+    host.inspect_error = Some(petal::SdkError::Message(
+        "backend: read EVM outbox receipt: busy".into(),
+    ));
+    let status = crate::settlement::settlement_status(&mut host, &sess);
+    assert_eq!(status["status"], "source_pending");
+    assert_eq!(status["retry_interval_ms"], 10000);
+    assert!(status["error"].as_str().unwrap().contains("busy"));
+
+    // A refused or missing entry never changes on retry: report a final error.
+    for refusal in [
+        petal::HostStatus::Denied,
+        petal::HostStatus::NotFound,
+        petal::HostStatus::Invalid,
+    ] {
+        host.inspect_error = Some(petal::SdkError::Host(refusal));
+        let status = crate::settlement::settlement_status(&mut host, &sess);
+        assert_eq!(status["status"], "error", "{status}");
+        assert!(status.get("retry_interval_ms").is_none(), "{status}");
+    }
 }
 
 // ===========================================================================
@@ -1513,6 +1915,19 @@ fn omitted_mev_section_keeps_the_default_slippage_ceiling() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("max_slippage"), "{error}");
+}
+
+#[test]
+fn plan_shows_slippage_as_a_percentage() {
+    for (bps, shown) in [(5, "5 bps (0.05%)"), (100, "100 bps (1.00%)")] {
+        let mut host = MockHost::new().with_enso_response(build_enso_response_erc20());
+        let body = format!(
+            r#"{{"intent":"swap 100.0 usdc to eth","chain":"ethereum","slippage_bps":{bps}}}"#
+        );
+        let id = crate::workflow::create(&mut host, "test-wallet", body.as_bytes()).unwrap();
+        let plan = load_session(&mut host, &id).plan_md;
+        assert!(plan.contains(shown), "{plan}");
+    }
 }
 
 // ===========================================================================
@@ -1770,10 +2185,12 @@ fn unrelated_balance_increase_is_not_claimed_as_settlement() {
     )
     .unwrap();
     crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
-    let session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    let mut session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     let route_id = session.intent_states[0].outbox_id.clone().unwrap();
     host.mark_outbox_success(&route_id);
     host.balance_override = Some("2000000000000000000".into());
+    // Legacy unprotected calldata cannot prove the minimum was enforced.
+    session.route.as_mut().unwrap().tx.data = vec![0].into();
 
     let status = crate::settlement::settlement_status(&mut host, &session);
     assert_eq!(
@@ -1971,6 +2388,34 @@ fn build_enso_response_native_quoted_with_minimum(
     ))
     .unwrap();
     body["minAmountOut"] = min_amount_out;
+    // Unlike quote metadata, this floor is enforced by Router V2 itself.
+    use alloy::sol_types::{SolCall, SolValue};
+    let route: crate::api_types::RouteResponse = serde_json::from_value(body.clone()).unwrap();
+    let original =
+        crate::api_types::IEnsoRouter::routeSingleCall::abi_decode(&route.tx.data).unwrap();
+    let value = match &body["minAmountOut"] {
+        serde_json::Value::Array(items) => &items[0],
+        value => value,
+    };
+    let minimum = alloy::primitives::U256::from_str_radix(value.as_str().unwrap(), 10).unwrap();
+    let guarded = crate::api_types::IEnsoRouter::safeRouteSingleCall {
+        tokenIn: original.tokenIn,
+        tokenOut: crate::api_types::IEnsoRouter::Token {
+            tokenType: 1,
+            data: (
+                "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                    .parse::<alloy::primitives::Address>()
+                    .unwrap(),
+                minimum,
+            )
+                .abi_encode_params()
+                .into(),
+        },
+        receiver: route.tx.from,
+        data: original.data,
+    }
+    .abi_encode();
+    body["tx"]["data"] = serde_json::json!(format!("0x{}", hex::encode(guarded)));
     serde_json::to_vec(&body).unwrap()
 }
 
@@ -2058,6 +2503,21 @@ fn aged_quote_is_refreshed_before_staging_within_reviewed_bounds() {
     assert_eq!(sess.last_error, None);
     assert_eq!(sess.route.as_ref().unwrap().amount_out, "2990000000");
     assert!(
+        sess.plan_md
+            .contains("Expected output (current Enso quote): 2990000000")
+    );
+    assert!(sess.plan_md.contains("Calldata minimum output: 2985000000"));
+    assert!(sess.plan_md.contains("This is the owner-reviewed floor"));
+    assert!(
+        sess.plan_md
+            .contains("50 bps (0.50%), applied to the first reviewed quote")
+    );
+    assert!(
+        !sess
+            .plan_md
+            .contains("Expected output (current Enso quote): 3000000000")
+    );
+    assert!(
         sess.history
             .iter()
             .any(|entry| entry.reason.contains("Enso quote refreshed before staging"))
@@ -2078,11 +2538,44 @@ fn aged_quote_is_refreshed_before_staging_within_reviewed_bounds() {
 }
 
 #[test]
+fn a_higher_refreshed_quote_does_not_raise_the_reviewed_floor() {
+    // Reviewed at 3,000,000,000 less 0.5%: floor 2,985,000,000. The market
+    // then rises, and Enso returns a safe route held to exactly that floor.
+    // The first refresh is saved but not staged (simulation fails); the next
+    // one compares against what the owner reviewed, not that replacement.
+    let (mut host, id) = quoted_session(120_000);
+    host.eth_call_success = false;
+    host.enso_response = Some(build_enso_response_native_quoted_with_minimum(
+        1_120,
+        "3030000000",
+        DEFAULT_ROUTER,
+        serde_json::json!(["2985000000"]),
+    ));
+    assert!(crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").is_err());
+    host.eth_call_success = true;
+    host.now += 120_000;
+    host.enso_response = Some(build_enso_response_native_quoted_with_minimum(
+        1_240,
+        "3000000000",
+        DEFAULT_ROUTER,
+        serde_json::json!(["2985000000"]),
+    ));
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    let sess = load_session(&mut host, &id);
+    assert_eq!(sess.state, "staged");
+    assert_eq!(
+        sess.route_request.as_ref().unwrap().min_amount_out,
+        Some(alloy::primitives::U256::from(2_985_000_000u64)),
+        "a replacement quote must not become the new floor"
+    );
+}
+
+#[test]
 fn refreshed_quote_outside_reviewed_bounds_is_refused_and_reported() {
     for (fresh, expected) in [
         (
             build_enso_response_native_quoted(1_120, "2984999999", DEFAULT_ROUTER),
-            "below the reviewed minimum output",
+            "is below the reviewed minimum output",
         ),
         // The quote clears the floor, but the transaction's own minimum does
         // not: it could fill below what the owner reviewed.
@@ -2094,12 +2587,6 @@ fn refreshed_quote_outside_reviewed_bounds_is_refused_and_reported() {
                 serde_json::json!("2984999999"),
             ),
             "route's minimum output (2984999999)",
-        ),
-        // Without a reported minimum, a slippage-based floor is assumed:
-        // 2,990,000,000 less 0.5% is 2,975,050,000, below 2,985,000,000.
-        (
-            build_enso_response_native_quoted(1_120, "2990000000", DEFAULT_ROUTER),
-            "route's minimum output (2975050000)",
         ),
         (
             build_enso_response_native_quoted(
@@ -2152,7 +2639,7 @@ fn temporary_refresh_failure_says_to_retry_not_abandon() {
 fn expired_staged_quote_error_names_the_outbox_entry_and_next_step() {
     let message = crate::quote::expired_staged_error("0002-63206");
     assert!(message.contains("0002-63206"));
-    assert!(message.contains("create a new intent"));
+    assert!(message.contains("pending/0002-63206/confirm") && message.contains("create a new one"));
 }
 
 // ===========================================================================
@@ -2235,4 +2722,120 @@ fn routes_declare_capabilities_their_workflows_need() {
             "status.json must declare {cap}"
         );
     }
+    let abandon = include_str!("../files/intents/[wallet]/[index]/[id]/abandon.rs");
+    for cap in ["bloom:store", "bloom:tx.outbox"] {
+        assert!(
+            abandon.contains(&format!("\"{cap}\"")),
+            "abandon must declare {cap}"
+        );
+    }
+}
+
+#[test]
+fn cross_chain_quote_refresh_requires_the_same_reviewed_shortcut() {
+    let mut response: serde_json::Value =
+        serde_json::from_slice(&build_enso_response_erc20()).unwrap();
+    response["route"][0]["destinationChainId"] = serde_json::json!(8453);
+    let mut host = MockHost::new().with_enso_response(serde_json::to_vec(&response).unwrap());
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        br#"{"intent":"swap 100.0 usdc to eth","chain":"ethereum","destination_chain":"base"}"#,
+    )
+    .unwrap();
+    let session = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
+    let reviewed = session.route.as_ref().unwrap();
+    let request = session.route_request.as_ref().unwrap();
+    assert!(crate::quote::verify_refreshed(reviewed, reviewed, request).is_ok());
+    let mut changed = reviewed.clone();
+    use alloy::sol_types::SolCall;
+    let mut call =
+        crate::api_types::IEnsoRouter::routeSingleCall::abi_decode(&changed.tx.data).unwrap();
+    call.data = vec![1].into();
+    changed.tx.data = call.abi_encode().into();
+    assert!(
+        crate::quote::verify_refreshed(reviewed, &changed, request)
+            .unwrap_err()
+            .contains("cross-chain shortcut changed")
+    );
+}
+
+#[test]
+fn cross_chain_floor_survives_repeated_refresh_and_reload_and_status_is_honest() {
+    let mut response: serde_json::Value =
+        serde_json::from_slice(&build_enso_response_erc20()).unwrap();
+    response["route"][0]["destinationChainId"] = serde_json::json!(8453);
+    response["amountOut"] = serde_json::json!("1000");
+    let mut host = MockHost::new().with_enso_response(serde_json::to_vec(&response).unwrap());
+    let id = crate::workflow::create(
+        &mut host,
+        "test-wallet",
+        br#"{"intent":"swap 100.0 usdc to eth","chain":"ethereum","destination_chain":"base"}"#,
+    )
+    .unwrap();
+    let original = load_session(&mut host, &id);
+    assert_eq!(
+        original
+            .route_request
+            .as_ref()
+            .unwrap()
+            .min_amount_out
+            .unwrap()
+            .to_string(),
+        "995"
+    );
+    // Failed simulation keeps the route unstaged so confirm can refresh again.
+    host.eth_call_success = false;
+    response["amountOut"] = serde_json::json!("995");
+    host.enso_response = Some(serde_json::to_vec(&response).unwrap());
+    for _ in 0..2 {
+        host.now += 120_000;
+        assert!(crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").is_err());
+        let reloaded = load_session(&mut host, &id);
+        assert_eq!(
+            reloaded
+                .route_request
+                .as_ref()
+                .unwrap()
+                .min_amount_out
+                .unwrap()
+                .to_string(),
+            "995"
+        );
+        assert_eq!(reloaded.route.as_ref().unwrap().amount_out, "995");
+        assert!(host.enso_urls.last().unwrap().contains("minAmountOut=995"));
+    }
+    response["amountOut"] = serde_json::json!("992");
+    host.enso_response = Some(serde_json::to_vec(&response).unwrap());
+    host.now += 120_000;
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    assert!(
+        error.contains("minimum") || error.contains("floor"),
+        "{error}"
+    );
+    host.eth_call_success = true;
+    response["amountOut"] = serde_json::json!("995");
+    host.enso_response = Some(serde_json::to_vec(&response).unwrap());
+    crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap();
+    let sess = load_session(&mut host, &id);
+    host.mark_outbox_success(sess.primary_outbox_id().unwrap());
+    let result = crate::settlement::settlement_status(&mut host, &sess);
+    assert_eq!(result["status"], "destination_unverified");
+    assert_eq!(result["minimum_expected"], "995");
+    assert_eq!(result["retry_supported"], false);
+    assert_eq!(host.bridge_calls, 0);
+    assert_eq!(host.destination_calls, 0);
+}
+
+#[test]
+fn legacy_session_refresh_requires_new_review() {
+    let (mut host, id) = quoted_session(120_000);
+    let mut sess = load_session(&mut host, &id);
+    sess.schema_version = 1;
+    sess.route_request.as_mut().unwrap().min_amount_out = None;
+    host.put(&sess.key(), &serde_json::to_vec(&sess).unwrap(), false)
+        .unwrap();
+    let error = crate::workflow::confirm(&mut host, "test-wallet", &id, b"confirm").unwrap_err();
+    assert!(error.contains("new review"), "{error}");
+    assert_eq!(host.stage_count, 0);
 }
