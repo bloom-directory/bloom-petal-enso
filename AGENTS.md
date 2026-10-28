@@ -1,8 +1,19 @@
 # Enso Petal
 
 Implement and review this package against the Bloom petal conventions
-documented in the `petal` repository's skill: `bloom-petal-development`.
+documented in the `bloom-petal-development` skill.
 Never run a live-money swap without explicit user authorization.
+
+## Development skill
+
+Petals are authored against the `bloom-petal-development` skill. It is
+vendored at `.agents/skills/bloom-petal-development/SKILL.md`, byte for byte
+from the contract crate of the pinned Petal CLI
+(`7dd2722db5de305dd63ca4ed03591f3ab82fa40b`), so it is available offline and
+matches that CLI. Its directory carries the skill's name, as the Agent Skills
+format requires. Load it into your agent before extending this Petal. It is
+part of the Petal package, so editing or refreshing it changes the package
+hash; Bloom does not serve it under `/petals/enso/`.
 
 ## Route/controller/module shape
 
