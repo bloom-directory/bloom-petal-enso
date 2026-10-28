@@ -1,10 +1,4 @@
-// Blocking settlement poll: reads balance on destination chain every 5s
-// for up to 300s (60 iterations), returning as soon as a positive delta
-// is observed.
-//
-// The petal runtime executes route files synchronously in the WASM host,
-// so a sleep-loop here blocks the read until settlement is confirmed or
-// the timeout expires.
+// One bounded settlement read. Only results with `retry_interval_ms` can still change.
 
 petal::route_file!(
     spec: petal::store_read_spec().caps(&["bloom:store", "bloom:chain", "bloom:tx.outbox"]),
@@ -32,33 +26,6 @@ petal::route_file!(
         }
 
         // Check settlement immediately.
-        let result = crate::settlement::settlement_status(&mut host, &sess);
-        let status = result
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-
-        if matches!(
-            status,
-            "destination_received" | "destination_observed_unattributed" | "unsupported_token"
-        ) {
-            return petal::read_json_value(&result);
-        }
-
-        // Poll loop: re-check every 5s for up to 300s (60 iterations).
-        // petal::sdk::sleep is not available — use a busy-wait via chain_read
-        // as a minimal throttle, or just return the current status with
-        // a "polling" indicator since true blocking in WASM is antipattern.
-        //
-        // The client (bloom daemon) is expected to re-read this file on its own
-        // poll cadence. We return the current status and a hint for retry.
-        petal::read_json_value(&serde_json::json!({
-            "status": status,
-            "observed_before": result.get("observed_before"),
-            "observed_after": result.get("observed_after"),
-            "delta": result.get("delta"),
-            "message": "settlement not yet observed — re-read this file to poll again",
-            "retry_interval_ms": 5000,
-        }))
+        petal::read_json_value(&crate::settlement::settlement_status(&mut host, &sess))
     }
 );
