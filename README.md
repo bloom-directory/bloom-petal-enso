@@ -64,10 +64,15 @@ confirming an expired route can revert or be refused. The owner's approval
 binds the exact transaction, so it cannot pick up a fresher quote; ask for
 approval within about two minutes of staging.
 
-Each transaction is staged behind a marker that is removed once the session
-records its outbox id. If an earlier confirm staged a transaction but could
-not record it, confirm refuses to stage it again; `last_error` names the
-wallet's pending outbox, where that entry can be reviewed or cancelled.
+Each transaction is staged behind a marker. The marker is removed once the
+session records the outbox id, or once Bloom refuses the transaction before
+writing it. A transaction can be in the outbox without its id recorded: the
+save after staging failed, or Bloom failed after it may have written the
+entry. Confirm then never stages it again, and `last_error` names the
+account's pending outbox, where it can be reviewed or cancelled. Then write
+`abandon`. If `last_error` has not said this yet, the first `abandon` refuses
+with it and the next one closes the intent. Create a new intent only if that
+transaction was not sent.
 
 ## Configuration
 

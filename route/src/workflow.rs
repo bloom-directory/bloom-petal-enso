@@ -4,6 +4,7 @@
 //! outbox staging → broadcast → settlement verification.
 
 use crate::api_types::{NATIVE_TOKEN, RouteRequest, RouteResponse};
+use crate::runtime::StageError;
 pub use crate::runtime::{BloomHost, Host};
 use crate::session::{self, IntentState, PreparedIntent, Session};
 use crate::{api, input, settings};
@@ -844,13 +845,62 @@ fn unrecorded_stage<H: Host>(host: &mut H, sess: &Session) -> Result<Option<usiz
     Ok(None)
 }
 
+/// What to do about an intent transaction that may be in the outbox without
+/// its outbox id recorded here. Every such refusal includes this text, and
+/// abandon looks for it in `last_error`, so the owner has been told where to
+/// look before the intent closes.
+fn unrecorded_stage_advice(account: &petal::WalletAccount, intent: &PreparedIntent) -> String {
+    format!(
+        "this intent's {} transaction may be in the wallet's outbox without being recorded \
+         here: review /{}/chains/{}/outbox/pending and cancel it there if it should not be \
+         sent. This intent will not stage it again; write `abandon` to close it, and create \
+         a new intent only if it was not sent",
+        intent.label,
+        account.dir(),
+        intent.chain,
+    )
+}
+
+/// The route was quoted for the address the account had at creation, and
+/// Bloom picks the sender from the live projection, so refuse once it changes.
+fn require_quoted_address<H: Host>(
+    host: &mut H,
+    account: &petal::WalletAccount,
+    sess: &Session,
+) -> Result<(), String> {
+    let quoted = &sess.wallet_address;
+    let current = wallet_address(host, account).map_err(|error| {
+        format!("cannot re-read the account's EVM address before staging: {error}")
+    })?;
+    if !current.eq_ignore_ascii_case(quoted) {
+        return Err(format!(
+            "account {account} now has EVM address {current}, but this intent was \
+             quoted for {quoted}; nothing was staged, create a new intent for this account"
+        ));
+    }
+    Ok(())
+}
+
 /// Stage one prepared intent behind its staging marker.
 fn stage_marked<H: Host>(
     host: &mut H,
+    account: &petal::WalletAccount,
     sess: &Session,
     index: usize,
-    tx: &EvmTransaction,
+    intent: &PreparedIntent,
 ) -> Result<StagedTransaction, String> {
+    // Bloom picks the sender as it stages, so check the address last.
+    require_quoted_address(host, account, sess)?;
+    let tx = EvmTransaction {
+        wallet: account.wallet().to_string(),
+        chain: intent.chain.clone(),
+        to: intent.to.clone(),
+        value_wei: intent.value_wei.clone(),
+        data_hex: intent.data_hex.clone(),
+        nonce: None,
+        max_fee_per_gas: None,
+        max_priority_fee_per_gas: None,
+    };
     let key = staging_marker_key(&sess.wallet, &sess.id, index);
     let marker = json(&serde_json::json!({
         "created_ms": host.now_ms(),
@@ -860,12 +910,33 @@ fn stage_marked<H: Host>(
     host.put_new(&key, &marker, false).map_err(|error| {
         format!("cannot record that staging began, so nothing was staged: {error}")
     })?;
-    let staged = host.tx_stage(tx);
-    if staged.is_err() {
-        // The outbox refused the transaction, so a retry cannot duplicate it.
-        let _ = host.delete_if(&key, &marker);
+    match host.tx_stage(&tx) {
+        Ok(staged) => Ok(staged),
+        Err(StageError::Refused(error)) => {
+            // Nothing was written, so a retry cannot duplicate it.
+            let _ = host.delete_if(&key, &marker);
+            Err(error)
+        }
+        // The marker stays, so no later confirm stages this intent again.
+        Err(StageError::Uncertain(error)) => Err(format!(
+            "{} (staging failed after it may have reached the outbox: {error})",
+            unrecorded_stage_advice(account, intent)
+        )),
     }
-    staged
+}
+
+/// The stage reached the outbox, but the session that records it was not
+/// saved.
+fn unrecorded_save_error(
+    account: &petal::WalletAccount,
+    intent: &PreparedIntent,
+    outbox_id: &str,
+    error: &str,
+) -> String {
+    format!(
+        "{} (it was staged as outbox entry {outbox_id}, but saving this intent failed: {error})",
+        unrecorded_stage_advice(account, intent)
+    )
 }
 
 /// Remove an intent's staging marker after its outbox id has been saved. One
@@ -977,17 +1048,8 @@ fn confirm_locked<H: Host>(
     if !tx_from_hex.eq_ignore_ascii_case(&wallet_addr) {
         return Err("route tx from does not match session wallet_address".into());
     }
-    // The route was quoted for the address the account had at creation.
-    // Re-read the projection so it is never staged once that has changed.
-    let current_addr = wallet_address(host, account).map_err(|error| {
-        format!("cannot re-read the account's EVM address before staging: {error}")
-    })?;
-    if !current_addr.eq_ignore_ascii_case(&wallet_addr) {
-        return Err(format!(
-            "account {account} now has EVM address {current_addr}, but this intent was \
-             quoted for {wallet_addr}; nothing was staged, create a new intent for this account"
-        ));
-    }
+    // Refuse before any quote refresh; `stage_marked` checks again.
+    require_quoted_address(host, account, &sess)?;
 
     // Re-verify route input integrity.
     if !route.input_matches_request(&req) {
@@ -1007,20 +1069,9 @@ fn confirm_locked<H: Host>(
     // An earlier confirm may have staged an intent and then failed to save
     // its outbox id. Staging it again could send the same transaction twice.
     if let Some(index) = unrecorded_stage(host, &sess)? {
-        let intent = &sess.intents[index];
-        let next = if sess.intent_states.iter().any(|s| s.outbox_id.is_some()) {
-            "this intent will not stage it again, so create a new intent if you still want the swap"
-        } else {
-            "then abandon this intent"
-        };
         let reason = format!(
-            "an earlier confirm began staging this intent's {} transaction but did not record \
-             it, so this confirm staged nothing; it may already be in the wallet's outbox at \
-             /{}/chains/{}/outbox/pending: review it there and cancel it if it should not be \
-             sent, {next}",
-            intent.label,
-            account.dir(),
-            intent.chain,
+            "{} (an earlier confirm began staging it, so this confirm staged nothing)",
+            unrecorded_stage_advice(account, &sess.intents[index])
         );
         sess.last_error = Some(reason.clone());
         save(host, &sess)?;
@@ -1072,17 +1123,8 @@ fn confirm_locked<H: Host>(
             .ok_or("approval intent state is missing")?;
 
         if approve_state.outbox_id.is_none() {
-            let evm_tx = EvmTransaction {
-                wallet: wallet.to_string(),
-                chain: approve.chain.clone(),
-                to: approve.to.clone(),
-                value_wei: approve.value_wei.clone(),
-                data_hex: approve.data_hex.clone(),
-                nonce: None,
-                max_fee_per_gas: None,
-                max_priority_fee_per_gas: None,
-            };
-            let staged = stage_marked(host, &sess, 0, &evm_tx)?;
+            let staged = stage_marked(host, account, &sess, 0, approve)?;
+            let outbox_id = staged.outbox_id.clone();
             if let Some(state) = sess.intent_states.first_mut() {
                 state.status = "staged".into();
                 state.outbox_id = Some(staged.outbox_id.clone());
@@ -1104,7 +1146,8 @@ fn confirm_locked<H: Host>(
                 "awaiting_approval",
                 "exact-amount approval staged; route remains unstaged",
             );
-            save(host, &sess)?;
+            save(host, &sess)
+                .map_err(|error| unrecorded_save_error(account, approve, &outbox_id, &error))?;
             clear_staging_marker(host, &sess, 0);
             return Ok(());
         }
@@ -1201,27 +1244,17 @@ fn confirm_locked<H: Host>(
     update_plan(&mut sess)?;
 
     let route_index = intents.len() - 1;
+    let intent = &intents[route_index];
+    let mut staged_route = None;
     if sess
         .intent_states
         .get(route_index)
         .and_then(|state| state.outbox_id.as_ref())
         .is_none()
     {
-        let intent = &intents[route_index];
-        let evm_tx = EvmTransaction {
-            wallet: wallet.to_string(),
-            chain: intent.chain.clone(),
-            to: intent.to.clone(),
-            value_wei: intent.value_wei.clone(),
-            data_hex: intent.data_hex.clone(),
-            nonce: None,
-            max_fee_per_gas: None,
-            max_priority_fee_per_gas: None,
-        };
-
         // Record this attempt's outcome, so the session never shows an
         // earlier error or a missing simulation after staging fails.
-        let staged = match stage_marked(host, &sess, route_index, &evm_tx) {
+        let staged = match stage_marked(host, account, &sess, route_index, intent) {
             Ok(staged) => staged,
             Err(error) => {
                 let reason = format!("staging the swap failed: {error}");
@@ -1242,12 +1275,16 @@ fn confirm_locked<H: Host>(
             });
             state.updated_ms = now;
         }
-        sess.staged_ids.push(staged.outbox_id);
+        sess.staged_ids.push(staged.outbox_id.clone());
+        staged_route = Some(staged.outbox_id);
     }
 
     sess.last_error = None;
     sess.transition(now, "staged", "route staged into outbox");
-    save(host, &sess)?;
+    save(host, &sess).map_err(|error| match &staged_route {
+        Some(outbox_id) => unrecorded_save_error(account, intent, outbox_id, &error),
+        None => error,
+    })?;
     clear_staging_marker(host, &sess, route_index);
     Ok(())
 }
@@ -1375,20 +1412,24 @@ fn refresh_route_quote<H: Host>(
 // abandon — cancel a session before any outbox transaction exists
 // ---------------------------------------------------------------------------
 
-pub fn abandon<H: Host>(host: &mut H, wallet: &str, id: &str) -> Result<(), String> {
-    abandon_with_body(host, wallet, id, b"abandon")
+pub fn abandon<H: Host>(
+    host: &mut H,
+    account: &petal::WalletAccount,
+    id: &str,
+) -> Result<(), String> {
+    abandon_with_body(host, account, id, b"abandon")
 }
 
 pub fn abandon_with_body<H: Host>(
     host: &mut H,
-    wallet: &str,
+    account: &petal::WalletAccount,
     id: &str,
     body: &[u8],
 ) -> Result<(), String> {
     // Serialize with confirmation before loading the session: an approval-only
     // snapshot must never overwrite a swap staged by a concurrent confirmation.
-    let (lock_key, lock_value) = acquire_confirm_lock(host, wallet, id)?;
-    let result = abandon_locked(host, wallet, id, body);
+    let (lock_key, lock_value) = acquire_confirm_lock(host, account.wallet(), id)?;
+    let result = abandon_locked(host, account, id, body);
     let unlock = host.delete_if(&lock_key, &lock_value);
     match (result, unlock) {
         (Err(error), _) => Err(error),
@@ -1401,10 +1442,11 @@ pub fn abandon_with_body<H: Host>(
 
 fn abandon_locked<H: Host>(
     host: &mut H,
-    wallet: &str,
+    account: &petal::WalletAccount,
     id: &str,
     body: &[u8],
 ) -> Result<(), String> {
+    let wallet = account.wallet();
     let command = std::str::from_utf8(body)
         .map_err(|_| "abandon body must be UTF-8")?
         .trim();
@@ -1455,15 +1497,41 @@ fn abandon_locked<H: Host>(
         approval_left |= inspection.state == "success";
     }
 
-    sess.transition(
-        now,
-        "abandoned",
-        if approval_left {
-            "user abandoned; the token approval already sent stays and a new intent reuses it"
-        } else {
-            "user abandoned; no successful token approval remains from this intent"
-        },
-    );
+    // A transaction left in the outbox unrecorded must not be forgotten: a new
+    // intent would stage the swap again. Refuse until `last_error` has said
+    // where to review it, then let the owner close the intent.
+    let unrecorded = match unrecorded_stage(host, &sess)? {
+        Some(index) => {
+            let intent = &sess.intents[index];
+            let advice = unrecorded_stage_advice(account, intent);
+            let label = intent.label.clone();
+            if !sess
+                .last_error
+                .as_deref()
+                .is_some_and(|shown| shown.contains(&advice))
+            {
+                let reason = format!("{advice} (write `abandon` again once you have reviewed it)");
+                sess.last_error = Some(reason.clone());
+                save(host, &sess)?;
+                return Err(reason);
+            }
+            Some(label)
+        }
+        None => None,
+    };
+
+    let mut reason = String::from("user abandoned");
+    if let Some(label) = &unrecorded {
+        reason.push_str(&format!(
+            "; its {label} transaction may be in the outbox unrecorded"
+        ));
+    }
+    if approval_left {
+        reason.push_str("; the token approval already sent stays and a new intent reuses it");
+    } else if unrecorded.is_none() {
+        reason.push_str("; no successful token approval remains from this intent");
+    }
+    sess.transition(now, "abandoned", &reason);
     save(host, &sess)
 }
 
@@ -1487,6 +1555,36 @@ fn lt_decimal(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Abandon finds this advice in `last_error`, which is cut at 512
+    /// characters, so every refusal carrying it must fit there whole.
+    #[test]
+    fn unrecorded_stage_advice_fits_in_last_error_for_the_longest_account() {
+        let account = petal::testing::wallet_account(&"a".repeat(64), u32::MAX);
+        let intent = PreparedIntent {
+            label: "approve".into(),
+            to: String::new(),
+            value_wei: "0".into(),
+            data_hex: "0x".into(),
+            chain: "robinhood".into(),
+            approve_token: None,
+            approve_spender: None,
+        };
+        let advice = unrecorded_stage_advice(&account, &intent);
+        for refusal in [
+            format!("staging the swap failed: {advice}"),
+            format!("{advice} (write `abandon` again once you have reviewed it)"),
+            format!(
+                "{advice} (an earlier confirm began staging it, so this confirm staged nothing)"
+            ),
+        ] {
+            assert!(
+                crate::redaction::sanitize_message(&refusal).contains(&advice),
+                "{} characters: {refusal}",
+                refusal.len()
+            );
+        }
+    }
 
     #[test]
     fn parses_whole_amount_no_decimals() {

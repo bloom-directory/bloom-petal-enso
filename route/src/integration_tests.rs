@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use petal::sdk::{EvmTransaction, HttpRequest, HttpResponse, OutboxInspection, StagedTransaction};
 
-use crate::runtime::{EthCallResult, Host};
+use crate::runtime::{EthCallResult, Host, StageError};
 
 /// In-memory mock implementing the full Host trait.
 struct MockHost {
@@ -55,6 +55,11 @@ struct MockHost {
     confirm_on_session_read: Option<String>,
     abandon_on_stage: Option<String>,
     concurrent_result: Option<Result<(), String>>,
+    /// The next stage writes its outbox entry and then fails, as Bloom does
+    /// when a write after the pending entry fails.
+    fail_next_stage_after_write: bool,
+    /// Replace account 0's address when Enso is next called.
+    address_after_enso_call: Option<Vec<u8>>,
 }
 
 impl MockHost {
@@ -130,6 +135,8 @@ require_calldata_verification = false
             confirm_on_session_read: None,
             abandon_on_stage: None,
             concurrent_result: None,
+            fail_next_stage_after_write: false,
+            address_after_enso_call: None,
         }
     }
 
@@ -193,6 +200,10 @@ impl Host for MockHost {
         if req.url.contains("api.enso.finance")
             && let Some(ref body) = self.enso_response
         {
+            if let Some(address) = self.address_after_enso_call.take() {
+                self.vfs
+                    .insert("wallets/test-wallet/0/address.evm".into(), address);
+            }
             self.enso_calls += 1;
             self.enso_urls.push(req.url.clone());
             return Ok(HttpResponse {
@@ -296,12 +307,14 @@ impl Host for MockHost {
         }
     }
 
-    fn tx_stage(&mut self, tx: &EvmTransaction) -> Result<StagedTransaction, String> {
+    fn tx_stage(&mut self, tx: &EvmTransaction) -> Result<StagedTransaction, StageError> {
         self.stage_count += 1;
         if let Some(limit) = self.stage_fail_after
             && self.stage_count > limit
         {
-            return Err("simulated staging failure".into());
+            return Err(StageError::from_host(
+                "denied: simulated staging failure".into(),
+            ));
         }
         self.tx_counter += 1;
         self.staged_data.push(tx.data_hex.clone());
@@ -312,9 +325,17 @@ impl Host for MockHost {
             approval: None,
         };
         self.staged.insert(id.clone(), staged.clone());
+        if std::mem::take(&mut self.fail_next_stage_after_write) {
+            return Err(StageError::from_host(
+                "backend: stage EVM outbox: write mev risk: No space left on device".into(),
+            ));
+        }
         if let Some(session_id) = self.abandon_on_stage.take() {
-            self.concurrent_result =
-                Some(crate::workflow::abandon(self, "test-wallet", &session_id));
+            self.concurrent_result = Some(crate::workflow::abandon(
+                self,
+                &petal::testing::wallet_account("test-wallet", 0),
+                &session_id,
+            ));
         }
         Ok(staged)
     }
@@ -927,7 +948,12 @@ fn abandon_before_staging_works() {
     )
     .expect("create should succeed");
 
-    crate::workflow::abandon(&mut host, "test-wallet", &id).expect("abandon should succeed");
+    crate::workflow::abandon(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+    )
+    .expect("abandon should succeed");
 
     let key = crate::session::key("test-wallet", &id);
     let raw = host.get(&key, 2 * 1024 * 1024).unwrap().unwrap();
@@ -961,8 +987,12 @@ fn abandon_after_staging_fails() {
     )
     .expect("confirm should succeed");
 
-    let err = crate::workflow::abandon(&mut host, "test-wallet", &id)
-        .expect_err("abandon should fail after staging");
+    let err = crate::workflow::abandon(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+    )
+    .expect_err("abandon should fail after staging");
     assert!(err.contains("is in the outbox"), "{err}");
 }
 
@@ -1536,7 +1566,12 @@ fn a_discarded_swap_can_be_abandoned() {
         .outbox_id
         .clone()
         .unwrap();
-    let error = crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap_err();
+    let error = crate::workflow::abandon(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+    )
+    .unwrap_err();
     assert!(error.contains("`cancel` to its `confirm` file"), "{error}");
     host.inspections.insert(
         route_id.clone(),
@@ -1547,7 +1582,12 @@ fn a_discarded_swap_can_be_abandoned() {
             receipt_json: None,
         },
     );
-    crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+    crate::workflow::abandon(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+    )
+    .unwrap();
     assert_eq!(load_session(&mut host, &id).state, "abandoned");
 }
 
@@ -1588,7 +1628,12 @@ fn abandon_and_confirm_serialize_after_approval_success() {
             // Pause abandon after reading its snapshot; attempt a full confirm
             // before returning it. Without the lock this hides a staged swap.
             host.confirm_on_session_read = Some(id.clone());
-            crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+            crate::workflow::abandon(
+                &mut host,
+                &petal::testing::wallet_account("test-wallet", 0),
+                &id,
+            )
+            .unwrap();
             assert_eq!(load_session(&mut host, &id).state, "abandoned");
             assert_eq!(host.staged.len(), 1, "only the approval may exist");
         } else {
@@ -1605,7 +1650,12 @@ fn abandon_and_confirm_serialize_after_approval_success() {
             assert_eq!(session.state, "staged");
             assert!(session.intent_states[1].outbox_id.is_some());
             assert_eq!(host.staged.len(), 2);
-            let error = crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap_err();
+            let error = crate::workflow::abandon(
+                &mut host,
+                &petal::testing::wallet_account("test-wallet", 0),
+                &id,
+            )
+            .unwrap_err();
             assert!(error.contains("discard"), "{error}");
             assert_eq!(
                 load_session(&mut host, &id).intent_states[1].outbox_id,
@@ -1654,7 +1704,12 @@ fn abandoned_approval_history_only_claims_successful_allowances() {
                 receipt_json: None,
             },
         );
-        crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+        crate::workflow::abandon(
+            &mut host,
+            &petal::testing::wallet_account("test-wallet", 0),
+            &id,
+        )
+        .unwrap();
         let session = load_session(&mut host, &id);
         assert_eq!(session.state, "abandoned");
         assert_eq!(
@@ -1790,7 +1845,12 @@ fn a_cross_chain_swap_refused_after_its_approval_can_be_abandoned() {
     let approval_id = sess.intent_states[0].outbox_id.clone().unwrap();
 
     // While the approval is still pending, abandoning says what to do first.
-    let pending = crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap_err();
+    let pending = crate::workflow::abandon(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+    )
+    .unwrap_err();
     assert!(pending.contains("still pending"), "{pending}");
 
     host.mark_outbox_success(&approval_id);
@@ -1812,7 +1872,12 @@ fn a_cross_chain_swap_refused_after_its_approval_can_be_abandoned() {
         .is_err()
     );
 
-    crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+    crate::workflow::abandon(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+    )
+    .unwrap();
     let sess = crate::workflow::load(&mut host, "test-wallet", &id).unwrap();
     assert_eq!(sess.state, "abandoned");
 }
@@ -1834,7 +1899,12 @@ fn confirm_on_abandoned_session_should_fail() {
     .expect("create should succeed");
 
     // Abandon the session first
-    crate::workflow::abandon(&mut host, "test-wallet", &id).expect("abandon should succeed");
+    crate::workflow::abandon(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+    )
+    .expect("abandon should succeed");
 
     // Now try to confirm — this should be rejected
     let result = crate::workflow::confirm(
@@ -2235,6 +2305,8 @@ fn staging_markers(host: &MockHost) -> Vec<&String> {
         .collect()
 }
 
+/// A swap that reached the outbox but was not recorded is never staged again,
+/// and once `last_error` says where it is, abandon closes the intent.
 #[test]
 fn an_unrecorded_route_stage_is_refused_and_can_be_abandoned() {
     let account = petal::testing::wallet_account("test-wallet", 0);
@@ -2250,6 +2322,7 @@ fn an_unrecorded_route_stage_is_refused_and_can_be_abandoned() {
     host.fail_session_save_after_stage = Some(1);
     let error = crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
     assert!(error.contains("simulated store write failure"), "{error}");
+    assert!(error.contains("staged as outbox entry outbox-1"), "{error}");
     assert_eq!(host.stage_count, 1);
 
     let error = crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
@@ -2262,13 +2335,19 @@ fn an_unrecorded_route_stage_is_refused_and_can_be_abandoned() {
         error.contains("/wallets/test-wallet/0/chains/ethereum/outbox/pending"),
         "{error}"
     );
-    assert!(error.contains("then abandon this intent"), "{error}");
+    assert!(error.contains("write `abandon` to close it"), "{error}");
+    assert!(error.contains("this confirm staged nothing"), "{error}");
     let sess = load_session(&mut host, &id);
     assert_eq!(sess.last_error.as_deref(), Some(error.as_str()));
 
-    // No outbox id was ever recorded, so the intent can still be abandoned.
-    crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
-    assert_eq!(load_session(&mut host, &id).state, "abandoned");
+    crate::workflow::abandon(&mut host, &account, &id).unwrap();
+    let sess = load_session(&mut host, &id);
+    assert_eq!(sess.state, "abandoned");
+    let reason = &sess.history.last().unwrap().reason;
+    assert!(
+        reason.contains("route transaction may be in the outbox unrecorded"),
+        "{reason}"
+    );
     assert_eq!(host.stage_count, 1);
 }
 
@@ -2290,14 +2369,16 @@ fn an_unrecorded_approval_stage_is_refused_and_can_be_abandoned() {
     let error = crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
     assert_eq!(host.stage_count, 1, "the approval must not be staged twice");
     assert!(error.contains("approve transaction"), "{error}");
-    assert!(error.contains("then abandon this intent"), "{error}");
+    assert!(error.contains("write `abandon` to close it"), "{error}");
 
-    crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+    crate::workflow::abandon(&mut host, &account, &id).unwrap();
     assert_eq!(load_session(&mut host, &id).state, "abandoned");
 }
 
+/// Main #16 lets an intent close after its approval succeeds, so the refusal
+/// says to abandon here too, and abandon records that the approval stays.
 #[test]
-fn an_unrecorded_route_stage_after_an_approval_says_to_create_a_new_intent() {
+fn an_unrecorded_route_stage_after_an_approval_can_be_abandoned() {
     let account = petal::testing::wallet_account("test-wallet", 0);
     let mut host = MockHost::new()
         .with_enso_response(build_enso_response_erc20())
@@ -2318,9 +2399,113 @@ fn an_unrecorded_route_stage_after_an_approval_says_to_create_a_new_intent() {
     let error = crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
     assert_eq!(host.stage_count, 2, "the route must not be staged twice");
     assert!(error.contains("route transaction"), "{error}");
-    assert!(error.contains("create a new intent"), "{error}");
-    // The recorded approval means abandon would refuse, so do not suggest it.
-    assert!(!error.contains("abandon"), "{error}");
+    assert!(error.contains("write `abandon` to close it"), "{error}");
+
+    crate::workflow::abandon(&mut host, &account, &id).unwrap();
+    let sess = load_session(&mut host, &id);
+    assert_eq!(sess.state, "abandoned");
+    let reason = &sess.history.last().unwrap().reason;
+    assert!(
+        reason.contains("route transaction may be in the outbox unrecorded"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("token approval already sent stays"),
+        "{reason}"
+    );
+}
+
+/// When `last_error` never said where an unrecorded swap is, abandon says so
+/// first, and closes the intent only on the next write.
+#[test]
+fn abandon_names_an_unrecorded_stage_before_closing_the_intent() {
+    let account = petal::testing::wallet_account("test-wallet", 0);
+    let mut host = MockHost::new().with_enso_response(build_enso_response_native());
+    let id = crate::workflow::create_for_account(
+        &mut host,
+        &account,
+        b"swap 1.0 eth to usdc on ethereum",
+    )
+    .unwrap();
+    host.fail_session_save_after_stage = Some(1);
+    crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
+    // As if recording the refusal had failed too.
+    let mut sess = load_session(&mut host, &id);
+    sess.last_error = Some("simulated store write failure".into());
+    host.store
+        .insert(sess.key(), serde_json::to_vec(&sess).unwrap());
+
+    let error = crate::workflow::abandon(&mut host, &account, &id).unwrap_err();
+    assert!(
+        error.contains("route transaction may be in the wallet's outbox"),
+        "{error}"
+    );
+    assert!(
+        error.contains("/wallets/test-wallet/0/chains/ethereum/outbox/pending"),
+        "{error}"
+    );
+    assert!(error.contains("write `abandon` again"), "{error}");
+    let sess = load_session(&mut host, &id);
+    assert_eq!(sess.state, "prepared");
+    assert_eq!(sess.last_error.as_deref(), Some(error.as_str()));
+
+    crate::workflow::abandon(&mut host, &account, &id).unwrap();
+    assert_eq!(load_session(&mut host, &id).state, "abandoned");
+    assert_eq!(host.stage_count, 1);
+}
+
+/// Bloom can write the outbox entry and still return an error. The marker must
+/// stay, or a retry with a refreshed quote would stage a second swap.
+#[test]
+fn a_stage_error_after_the_outbox_write_is_never_staged_again() {
+    let (mut host, id) = quoted_session(10_000);
+    let account = petal::testing::wallet_account("test-wallet", 0);
+    host.fail_next_stage_after_write = true;
+    let error = crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
+    assert!(error.contains("staging the swap failed"), "{error}");
+    assert!(error.contains("No space left on device"), "{error}");
+    assert!(error.contains("write `abandon` to close it"), "{error}");
+    assert_eq!(staging_markers(&host).len(), 1);
+    assert_eq!(
+        load_session(&mut host, &id).last_error.as_deref(),
+        Some(error.as_str())
+    );
+
+    host.now += 40_000;
+    host.enso_response = Some(build_enso_response_native_quoted_with_minimum(
+        1_050,
+        "2990000000",
+        DEFAULT_ROUTER,
+        serde_json::json!(["2985000000"]),
+    ));
+    let error = crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
+    assert!(error.contains("this confirm staged nothing"), "{error}");
+    assert_eq!(host.stage_count, 1);
+    assert_eq!(host.staged.len(), 1, "one swap in the outbox");
+
+    crate::workflow::abandon(&mut host, &account, &id).unwrap();
+    assert_eq!(load_session(&mut host, &id).state, "abandoned");
+}
+
+/// Bloom picks the sender as it stages, so an address change during the quote
+/// refresh must still stop the swap.
+#[test]
+fn the_address_is_checked_again_just_before_staging() {
+    let (mut host, id) = quoted_session(120_000);
+    let account = petal::testing::wallet_account("test-wallet", 0);
+    host.enso_response = Some(build_enso_response_native_quoted_with_minimum(
+        1_120,
+        "2990000000",
+        DEFAULT_ROUTER,
+        serde_json::json!(["2985000000"]),
+    ));
+    host.address_after_enso_call = Some(b"0x000000000000000000000000000000000000dEaD\n".to_vec());
+    let error = crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
+    assert_eq!(host.enso_calls, 2, "the quote was refreshed");
+    assert!(error.contains("now has EVM address"), "{error}");
+    assert!(error.contains("nothing was staged"), "{error}");
+    assert_eq!(host.stage_count, 0);
+    assert!(staging_markers(&host).is_empty());
 }
 
 #[test]
@@ -2553,8 +2738,13 @@ fn abandon_requires_exact_command() {
         b"swap 100.0 usdc to eth on ethereum",
     )
     .unwrap();
-    let error =
-        crate::workflow::abandon_with_body(&mut host, "test-wallet", &id, b"yes").unwrap_err();
+    let error = crate::workflow::abandon_with_body(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+        b"yes",
+    )
+    .unwrap_err();
     assert!(error.contains("exactly `abandon`"), "{error}");
     assert_eq!(
         crate::workflow::load(&mut host, "test-wallet", &id)
@@ -3364,7 +3554,12 @@ fn out_of_bounds_refresh_after_an_approval_can_still_be_abandoned() {
         Some(error.as_str())
     );
 
-    crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+    crate::workflow::abandon(
+        &mut host,
+        &petal::testing::wallet_account("test-wallet", 0),
+        &id,
+    )
+    .unwrap();
     let sess = load_session(&mut host, &id);
     assert_eq!(sess.state, "abandoned");
     assert!(

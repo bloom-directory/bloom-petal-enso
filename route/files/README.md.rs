@@ -63,8 +63,12 @@ A failed write to `confirm` shows only as an I/O error on the mount. Read
 `status.json`: `last_error` gives the reason. For an ERC-20 route, the first
 confirm stages only the exact-amount approval; broadcast it through the
 wallet outbox and wait for its receipt before confirming again.
-If a confirm staged a transaction but could not record it, the next confirm
-stages nothing and `last_error` names the pending outbox entry to review.
+If a confirm may have left a transaction in the outbox without recording it,
+confirm never stages it again and `last_error` names the account's pending
+outbox folder. Cancel the transaction there if it should not be sent, then
+write `abandon`. If `last_error` has not said this yet, the first `abandon`
+refuses with it and the next one closes the intent. Create a new intent only
+if the transaction was not sent.
 
 ### 4. Verify settlement
 ```json
