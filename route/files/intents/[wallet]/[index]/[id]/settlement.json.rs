@@ -17,7 +17,7 @@ petal::route_file!(
             Err(error) => return petal::error(-1, error),
         };
 
-        // Get balance-based settlement status.
+        // Read source status and available attributable settlement evidence.
         let settlement = crate::settlement::settlement_status(&mut host, &session);
 
         // Inspect outbox for each staged intent.

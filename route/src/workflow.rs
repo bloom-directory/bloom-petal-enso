@@ -267,15 +267,15 @@ fn render_plan_md(view: PlanView<'_>) -> String {
 
     let mut out = format!(
         "# Enso Shortcuts Swap\n\n\
-         The following is Bloom's authoritative transaction plan.\n\n\
+         Prepared transaction and Enso quote. Nested shortcut effects are not independently verified.\n\n\
          - Intent: `{intent_text}`\n\
          - Source chain: `{chain_name}` (chain ID {})\n\
          - Destination chain: `{dest}`\n\
          - Token in: `{token_in_hex}`\n\
          - Token out: `{token_out_hex}`\n\
          - Amount in: {}\n\
-         - Expected output: {}\n\
-         - Slippage tolerance: {} bps (0.{}%)\n\
+         - Expected output (current Enso quote): {}\n\
+         - Slippage tolerance: {} bps ({}.{:02}%), applied to the first reviewed quote\n\
          - Receiver: `{receiver_addr}`\n\
          - Route verified: {route_verified}\n\
          - Protocols: {protocol_str}\n\
@@ -286,13 +286,21 @@ fn render_plan_md(view: PlanView<'_>) -> String {
         req.amount_in,
         route.amount_out,
         req.slippage_bps,
-        req.slippage_bps,
+        req.slippage_bps / 100,
+        req.slippage_bps % 100,
         route.gas.as_deref().unwrap_or("not estimated"),
         route
             .price_impact
             .map(|v| format!("{v}"))
             .unwrap_or_else(|| "not reported".into()),
     );
+
+    match crate::calldata::output_minimum(route, req) {
+        Some(minimum) => out.push_str(&format!(
+            "- Calldata minimum output: {minimum} raw units of `{token_out_hex}` to `{receiver_addr}`. This is the owner-reviewed floor; a refreshed quote never changes it. The Router V2 call checks this balance increase atomically; it is not a receipt or a guarantee of future execution.\n\n"
+        )),
+        None => out.push_str("- Destination output is not constrained by a decoded same-chain router check.\n\n"),
+    }
 
     // Simulation summary.
     if let Some(sim) = simulation {
@@ -383,6 +391,30 @@ fn render_plan_md(view: PlanView<'_>) -> String {
     out
 }
 
+/// Keep the readable plan tied to the currently prepared transaction after
+/// refresh/simulation, rather than retaining the original quote's bytes.
+fn update_plan(sess: &mut Session) -> Result<(), String> {
+    let req = sess
+        .route_request
+        .as_ref()
+        .ok_or("session has no route request")?;
+    let route = sess.route.as_ref().ok_or("session has no route")?;
+    sess.plan_md = render_plan_md(PlanView {
+        intent_text: &sess.intent_text,
+        chain_name: &sess.chain,
+        destination_chain: sess.destination_chain.as_deref(),
+        req,
+        route,
+        intents: &sess.intents,
+        route_verified: route.input_matches_request(req),
+        receiver_class: sess.receiver_class.as_deref().unwrap_or("unknown"),
+        observed_before: sess.observed_before.as_deref(),
+        policy_checks: &sess.policy_checks,
+        simulation: sess.simulation.as_ref(),
+    });
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // create — route discovery + session creation
 // ---------------------------------------------------------------------------
@@ -464,8 +496,8 @@ pub fn create_for_account<H: Host>(
                  or end the intent with `on <chain>`"
                     .into(),
             )
-        })?
-        .to_ascii_lowercase();
+        })?;
+    let chain_name = input::canonical_chain(chain_name);
 
     // Resolve the configured RPC and prove that it is the requested chain.
     let chain_id = host
@@ -481,7 +513,7 @@ pub fn create_for_account<H: Host>(
     let destination_chain = parsed
         .destination_chain
         .as_ref()
-        .map(|chain| chain.to_ascii_lowercase());
+        .map(|chain| input::canonical_chain(chain));
     let dest_chain_name = destination_chain.as_deref().unwrap_or(&chain_name);
     let dest_chain_id = if let Some(ref dest) = destination_chain {
         Some(
@@ -547,7 +579,7 @@ pub fn create_for_account<H: Host>(
     }
 
     // Call Enso route API.
-    let route_resp = api::route(host, &api_key, &route_req)?;
+    let mut route_resp = api::route(host, &api_key, &route_req)?;
 
     // SECURITY: verify route input matches request — reject if not.
     let route_verified = route_resp.input_matches_request(&route_req);
@@ -566,6 +598,13 @@ pub fn create_for_account<H: Host>(
     if !valid_positive_decimal(route_resp.amount_out.trim()) {
         return Err("Enso route returned an invalid quoted output amount — refusing".into());
     }
+    crate::calldata::bind_output_checks(&mut route_resp, &route_req)?;
+    // Store one effective floor before showing the plan. Replacement quotes
+    // must never become a new baseline for slippage.
+    route_req.min_amount_out = Some(
+        crate::quote::reviewed_minimum_output(&route_resp, &route_req)?
+            .max(crate::calldata::output_minimum(&route_resp, &route_req).unwrap_or(U256::ZERO)),
+    );
 
     let router_addr = format!("0x{:x}", route_resp.tx.to);
 
@@ -617,6 +656,7 @@ pub fn create_for_account<H: Host>(
     // authoritative wallet policy independently when staging.
     let protocols = route_resp.protocols();
     let verified_policy = crate::policy::load_venue_config(host, wallet)?;
+    let output_verified = crate::calldata::verify_output_checks(&route_resp, &route_req)?;
     let policy_checks = crate::policy::evaluate(
         &verified_policy,
         &crate::policy::RoutePolicyContext {
@@ -632,9 +672,8 @@ pub fn create_for_account<H: Host>(
             native_value_wei: route_resp.tx.value,
             slippage_bps: route_req.slippage_bps,
             route_verified,
-            // Enso Router V2's opaque action bytes are not decoded here.
-            receiver_verified: false,
-            min_out_enforced: false,
+            receiver_verified: output_verified,
+            min_out_enforced: output_verified,
             needs_approve,
         },
     );
@@ -708,7 +747,7 @@ pub fn create_for_account<H: Host>(
         .collect();
 
     let mut sess = Session {
-        schema_version: 1,
+        schema_version: 2,
         id: id.clone(),
         wallet: wallet.to_string(),
         wallet_address: address,
@@ -847,6 +886,7 @@ pub fn confirm<H: Host>(
 ) -> Result<(), String> {
     let (lock_key, lock_value) = acquire_confirm_lock(host, account.wallet(), id)?;
     let result = confirm_locked(host, account, id, body);
+    record_confirm_result(host, account.wallet(), id, &result);
     let unlock = host.delete_if(&lock_key, &lock_value);
     match (result, unlock) {
         (Err(error), _) => Err(error),
@@ -855,6 +895,31 @@ pub fn confirm<H: Host>(
             "transaction was staged but confirmation lock cleanup failed: {error}"
         )),
     }
+}
+
+/// A refused confirmation reaches a mounted filesystem only as an I/O error,
+/// so keep its reason in the session's `status.json` (`last_error`) where the
+/// caller can read it. Best effort: the refusal itself is what matters, and a
+/// terminal session keeps the reason it ended with. Successful retries clear
+/// stale errors, including the idempotent already-staged path.
+fn record_confirm_result<H: Host>(
+    host: &mut H,
+    wallet: &str,
+    id: &str,
+    result: &Result<(), String>,
+) {
+    let Ok(mut sess) = load(host, wallet, id) else {
+        return;
+    };
+    let reason = result
+        .as_ref()
+        .err()
+        .map(|error| crate::redaction::sanitize_message(error));
+    if sess.wallet != wallet || sess.terminal() || sess.last_error == reason {
+        return;
+    }
+    sess.last_error = reason;
+    let _ = save(host, &sess);
 }
 
 fn confirm_locked<H: Host>(
@@ -1045,7 +1110,9 @@ fn confirm_locked<H: Host>(
         }
 
         let approval_id = approve_state.outbox_id.clone().unwrap();
-        let inspection = host.tx_inspect(wallet, &approve.chain, &approval_id)?;
+        let inspection = host
+            .tx_inspect(wallet, &approve.chain, &approval_id)
+            .map_err(|error| error.message())?;
         if inspection.state != "success" {
             if matches!(
                 inspection.state.as_str(),
@@ -1094,21 +1161,12 @@ fn confirm_locked<H: Host>(
                 fresh
             }
             Err(error) => {
-                // Abandon refuses once an outbox transaction exists, which
-                // after a successful approval it does.
-                let abandonable = sess.intent_states.iter().all(|s| s.outbox_id.is_none());
                 let reason = match error {
                     RefreshError::Unavailable(reason) => {
                         format!("{reason}; nothing was staged, write `confirm` again to retry")
                     }
-                    RefreshError::OutOfBounds(reason) if abandonable => format!(
-                        "{reason}; abandon this intent and create a new one for a fresh route"
-                    ),
                     RefreshError::OutOfBounds(reason) => format!(
-                        "{reason}; nothing was staged, and this intent's approval already \
-                         succeeded, so it cannot be abandoned: write `confirm` again later to \
-                         retry with a fresh quote, or create a new intent. The exact-amount \
-                         router allowance from this intent's approval remains granted"
+                        "{reason}; abandon this intent and create a new one for a fresh route"
                     ),
                 };
                 sess.last_error = Some(reason.clone());
@@ -1134,11 +1192,13 @@ fn confirm_locked<H: Host>(
             crate::simulation::failure_message(&simulation)
         );
         sess.simulation = Some(simulation);
+        update_plan(&mut sess)?;
         sess.last_error = Some(reason.clone());
         save(host, &sess)?;
         return Err(reason);
     }
     sess.simulation = Some(simulation);
+    update_plan(&mut sess)?;
 
     let route_index = intents.len() - 1;
     if sess
@@ -1159,7 +1219,17 @@ fn confirm_locked<H: Host>(
             max_priority_fee_per_gas: None,
         };
 
-        let staged = stage_marked(host, &sess, route_index, &evm_tx)?;
+        // Record this attempt's outcome, so the session never shows an
+        // earlier error or a missing simulation after staging fails.
+        let staged = match stage_marked(host, &sess, route_index, &evm_tx) {
+            Ok(staged) => staged,
+            Err(error) => {
+                let reason = format!("staging the swap failed: {error}");
+                sess.last_error = Some(reason.clone());
+                save(host, &sess)?;
+                return Err(reason);
+            }
+        };
 
         if let Some(state) = sess.intent_states.get_mut(route_index) {
             state.status = "staged".into();
@@ -1206,6 +1276,7 @@ fn route_policy_checks<H: Host>(
     let router = format!("0x{:x}", route.tx.to);
     let protocols = route.protocols();
     let verified_policy = crate::policy::load_venue_config(host, wallet)?;
+    let output_verified = crate::calldata::verify_output_checks(route, req)?;
     Ok(crate::policy::evaluate(
         &verified_policy,
         &crate::policy::RoutePolicyContext {
@@ -1221,8 +1292,8 @@ fn route_policy_checks<H: Host>(
             native_value_wei: route.tx.value,
             slippage_bps: req.slippage_bps,
             route_verified: true,
-            receiver_verified: false,
-            min_out_enforced: false,
+            receiver_verified: output_verified,
+            min_out_enforced: output_verified,
             needs_approve,
         },
     ))
@@ -1249,16 +1320,22 @@ fn refresh_route_quote<H: Host>(
     needs_approve: bool,
     now: u64,
 ) -> Result<(Session, RouteResponse), RefreshError> {
+    if sess.schema_version < 2 || req.min_amount_out.is_none() {
+        return Err(RefreshError::OutOfBounds(
+            "the original reviewed floor is unavailable; a new review is required".into(),
+        ));
+    }
     let api_key = resolve_api_key(host).map_err(RefreshError::Unavailable)?;
-    let mut refresh_request = req.clone();
-    refresh_request.min_amount_out = Some(
-        crate::quote::reviewed_minimum_output(reviewed, req).map_err(RefreshError::OutOfBounds)?,
-    );
-    let fresh = api::route(host, &api_key, &refresh_request).map_err(|error| {
+    // The floor stored at review is the only baseline; a replacement quote
+    // never raises or lowers it.
+    let refresh_request = req.clone();
+    let mut fresh = api::route(host, &api_key, &refresh_request).map_err(|error| {
         RefreshError::Unavailable(format!(
             "cannot refresh the Enso quote before staging: {error}"
         ))
     })?;
+    crate::calldata::bind_output_checks(&mut fresh, &refresh_request)
+        .map_err(RefreshError::OutOfBounds)?;
     crate::quote::verify_refreshed(reviewed, &fresh, req).map_err(RefreshError::OutOfBounds)?;
     let policy_checks = route_policy_checks(host, wallet, sess, req, &fresh, needs_approve)
         .map_err(RefreshError::Unavailable)?;
@@ -1277,7 +1354,10 @@ fn refresh_route_quote<H: Host>(
         })?;
     route_intent.data_hex = format!("0x{}", hex::encode(&fresh.tx.data));
     refreshed.route = Some(fresh.clone());
+    refreshed.route_request = Some(refresh_request);
     refreshed.policy_checks = policy_checks;
+    refreshed.simulation = None;
+    update_plan(&mut refreshed).map_err(RefreshError::OutOfBounds)?;
     verify_prepared_intents(&refreshed, req, &fresh).map_err(RefreshError::OutOfBounds)?;
     // The plan must describe the route that is about to be staged.
     refreshed.plan_md = render_plan_md(PlanView {
@@ -1319,6 +1399,26 @@ pub fn abandon_with_body<H: Host>(
     id: &str,
     body: &[u8],
 ) -> Result<(), String> {
+    // Serialize with confirmation before loading the session: an approval-only
+    // snapshot must never overwrite a swap staged by a concurrent confirmation.
+    let (lock_key, lock_value) = acquire_confirm_lock(host, wallet, id)?;
+    let result = abandon_locked(host, wallet, id, body);
+    let unlock = host.delete_if(&lock_key, &lock_value);
+    match (result, unlock) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(format!(
+            "session was abandoned but confirmation lock cleanup failed: {error}"
+        )),
+    }
+}
+
+fn abandon_locked<H: Host>(
+    host: &mut H,
+    wallet: &str,
+    id: &str,
+    body: &[u8],
+) -> Result<(), String> {
     let command = std::str::from_utf8(body)
         .map_err(|_| "abandon body must be UTF-8")?
         .trim();
@@ -1332,16 +1432,52 @@ pub fn abandon_with_body<H: Host>(
         return Err("wallet mismatch: session does not belong to this wallet".into());
     }
 
-    // Refuse if any intent has been staged to the outbox.
-    if sess.intent_states.iter().any(|s| s.outbox_id.is_some()) {
-        return Err("cannot abandon after an outbox transaction exists".into());
-    }
-
     if sess.terminal() {
         return Err("session is already terminal".into());
     }
 
-    sess.transition(now, "abandoned", "user abandoned before staging");
+    // The swap itself must not be in the outbox. A finished token approval
+    // may be: its exact allowance stays, and a new intent reuses it.
+    let mut approval_left = false;
+    for (intent, state) in sess.intents.iter().zip(&sess.intent_states) {
+        let Some(outbox_id) = state.outbox_id.as_deref() else {
+            continue;
+        };
+        let inspection = host
+            .tx_inspect(&sess.wallet, &sess.chain, outbox_id)
+            .map_err(|error| error.message())?;
+        if intent.label == "route" {
+            // Only a swap that will never execute can be abandoned.
+            if !matches!(
+                inspection.state.as_str(),
+                "failed" | "reverted" | "cancelled"
+            ) {
+                return Err(format!(
+                    "the swap {outbox_id} is in the outbox; discard it by writing `cancel` to its `confirm` file, then abandon"
+                ));
+            }
+            continue;
+        }
+        if !matches!(
+            inspection.state.as_str(),
+            "success" | "failed" | "reverted" | "cancelled"
+        ) {
+            return Err(format!(
+                "the token approval {outbox_id} is still pending in the outbox; confirm or discard it there, then abandon"
+            ));
+        }
+        approval_left |= inspection.state == "success";
+    }
+
+    sess.transition(
+        now,
+        "abandoned",
+        if approval_left {
+            "user abandoned; the token approval already sent stays and a new intent reuses it"
+        } else {
+            "user abandoned; no successful token approval remains from this intent"
+        },
+    );
     save(host, &sess)
 }
 

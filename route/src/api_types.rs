@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol;
-use alloy::sol_types::{SolCall, SolValue};
+use alloy::sol_types::SolValue;
 use serde::{Deserialize, Serialize};
 
 /// Sentinel address Enso uses for the chain's native token (ETH, MATIC, …).
@@ -17,6 +17,8 @@ sol! {
 
         function routeSingle(Token tokenIn, bytes data) external payable;
         function routeMulti(Token[] tokensIn, bytes data) external payable;
+        function safeRouteSingle(Token tokenIn, Token tokenOut, address receiver, bytes data) external payable;
+        function safeRouteMulti(Token[] tokensIn, Token[] tokensOut, address receiver, bytes data) external payable;
     }
 }
 
@@ -155,32 +157,29 @@ impl RouteResponse {
             return false;
         }
 
-        let Some(token) = (if let Ok(call) = IEnsoRouter::routeSingleCall::abi_decode(&self.tx.data)
-        {
-            Some(call.tokenIn)
-        } else if let Ok(call) = IEnsoRouter::routeMultiCall::abi_decode(&self.tx.data) {
-            (call.tokensIn.len() == 1).then(|| call.tokensIn.into_iter().next().unwrap())
-        } else {
-            None
-        }) else {
+        let Ok(envelope) = crate::calldata::decode(&self.tx.data) else {
+            return false;
+        };
+        let [token] = envelope.inputs.as_slice() else {
             return false;
         };
 
         match token.tokenType {
             0 => {
-                let Ok((amount,)) = <(U256,)>::abi_decode_params(&token.data) else {
-                    return false;
-                };
+                // The deployed routers on 11 chains revert with WrongMsgValue
+                // unless the native input data is exactly msg.value; the
+                // Tempo/Robinhood build ignores it. Enso always sends it.
                 req.token_in == NATIVE_TOKEN.parse::<Address>().unwrap()
-                    && amount == req.amount_in
-                    && self.tx.value == amount
+                    && token.data.as_ref() == (req.amount_in,).abi_encode_params()
+                    && self.tx.value == req.amount_in
             }
             1 => {
                 let Ok((token_in, amount)) = <(Address, U256)>::abi_decode_params(&token.data)
                 else {
                     return false;
                 };
-                req.token_in != NATIVE_TOKEN.parse::<Address>().unwrap()
+                token.data.as_ref() == (token_in, amount).abi_encode_params()
+                    && req.token_in != NATIVE_TOKEN.parse::<Address>().unwrap()
                     && token_in == req.token_in
                     && amount == req.amount_in
                     && self.tx.value == U256::ZERO

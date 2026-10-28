@@ -125,19 +125,32 @@ fn check(rule: &str, outcome: &str, message: impl Into<String>) -> serde_json::V
     })
 }
 
+/// Whether a chain is listed under any of its accepted names.
+fn chain_listed(list: &BTreeSet<String>, chain: &str) -> bool {
+    let chain = crate::input::canonical_chain(chain);
+    list.iter()
+        .any(|entry| crate::input::canonical_chain(entry) == chain)
+}
+
 fn set_contains_case_insensitive(set: &BTreeSet<String>, needle: &str) -> bool {
     set.iter().any(|value| value.eq_ignore_ascii_case(needle))
 }
 
 fn receiver_matches(set: &BTreeSet<String>, ctx: &RoutePolicyContext<'_>) -> bool {
-    let literal = format!(
-        "{}:{}:{}",
-        ctx.destination_chain.to_ascii_lowercase(),
-        ctx.token_out.to_ascii_lowercase(),
-        ctx.receiver.to_ascii_lowercase()
-    );
     let class = format!("class:{}", ctx.receiver_class.to_ascii_lowercase());
-    set_contains_case_insensitive(set, &literal) || set_contains_case_insensitive(set, &class)
+    set_contains_case_insensitive(set, &class)
+        || set.iter().any(|entry| {
+            let mut parts = entry.split(':');
+            let (Some(chain), Some(token), Some(receiver), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return false;
+            };
+            crate::input::canonical_chain(chain)
+                == crate::input::canonical_chain(ctx.destination_chain)
+                && token.eq_ignore_ascii_case(ctx.token_out)
+                && receiver.eq_ignore_ascii_case(ctx.receiver)
+        })
 }
 
 const MAX_VENUE_CONFIG_BYTES: usize = 256 * 1024;
@@ -220,10 +233,7 @@ pub fn evaluate(policy: &VerifiedPolicy, ctx: &RoutePolicyContext<'_>) -> serde_
         },
     ));
 
-    let source_allowed = set_contains_case_insensitive(
-        &defi.allowed_source_chains,
-        &ctx.source_chain.to_ascii_lowercase(),
-    );
+    let source_allowed = chain_listed(&defi.allowed_source_chains, ctx.source_chain);
     out.push(check(
         "source_chain",
         if source_allowed { "pass" } else { "deny" },
@@ -235,10 +245,8 @@ pub fn evaluate(policy: &VerifiedPolicy, ctx: &RoutePolicyContext<'_>) -> serde_
     ));
 
     if ctx.cross_chain {
-        let destination_allowed = set_contains_case_insensitive(
-            &defi.allowed_destination_chains,
-            &ctx.destination_chain.to_ascii_lowercase(),
-        );
+        let destination_allowed =
+            chain_listed(&defi.allowed_destination_chains, ctx.destination_chain);
         out.push(check(
             "destination_chain",
             if destination_allowed { "pass" } else { "deny" },
@@ -325,19 +333,27 @@ pub fn evaluate(policy: &VerifiedPolicy, ctx: &RoutePolicyContext<'_>) -> serde_
         ));
     }
 
-    let router_key = format!(
-        "{}:{}",
-        ctx.source_chain.to_ascii_lowercase(),
-        ctx.router.to_ascii_lowercase()
-    );
-    let router_allowed = set_contains_case_insensitive(&defi.allowed_routers, &router_key);
+    // `<chain>:<router>`, with the chain under any of its accepted names.
+    let router_key = |chain: &str, router: &str| {
+        format!(
+            "{}:{}",
+            crate::input::canonical_chain(chain),
+            router.to_ascii_lowercase()
+        )
+    };
+    let wanted = router_key(ctx.source_chain, ctx.router);
+    let router_allowed = defi.allowed_routers.iter().any(|entry| {
+        entry
+            .split_once(':')
+            .is_some_and(|(chain, router)| router_key(chain, router) == wanted)
+    });
     out.push(check(
         "router",
         if router_allowed { "pass" } else { "deny" },
         if router_allowed {
             format!("router {} allowlisted", ctx.router)
         } else {
-            format!("router {} is not allowlisted as {router_key}", ctx.router)
+            format!("router {} is not allowlisted as {wanted}", ctx.router)
         },
     ));
 
@@ -450,6 +466,44 @@ pub fn deny_reason(checks: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn chain_aliases_match_machine_names_in_both_directions() {
+        let list: BTreeSet<String> = ["bnb".to_owned()].into_iter().collect();
+        assert!(chain_listed(&list, "bsc") && chain_listed(&list, "BNB"));
+        let list: BTreeSet<String> = ["bsc".to_owned()].into_iter().collect();
+        assert!(chain_listed(&list, "bnb") && !chain_listed(&list, "base"));
+    }
+
+    #[test]
+    fn receiver_allow_and_deny_rules_match_chain_aliases() {
+        for rule_chain in ["bnb", "bsc", "BNB"] {
+            for destination in ["bnb", "bsc", "BSC"] {
+                let mut ctx = context(&[]);
+                ctx.destination_chain = destination;
+                let rule = format!("{rule_chain}:{}:{}", ctx.token_out, ctx.receiver);
+                let mut policy = policy();
+                policy.defi.allowed_receivers = [rule.clone()].into_iter().collect();
+                let receiver_outcome = |policy: &VerifiedPolicy, ctx: &RoutePolicyContext<'_>| {
+                    evaluate(policy, ctx)
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|check| check["rule"] == "defi.receiver")
+                        .unwrap()["outcome"]
+                        .clone()
+                };
+                assert_eq!(receiver_outcome(&policy, &ctx), "pass");
+                policy.defi.denied_receivers = [rule].into_iter().collect();
+                assert_eq!(receiver_outcome(&policy, &ctx), "deny");
+                ctx.destination_chain = "base";
+                assert!(!receiver_matches(&policy.defi.denied_receivers, &ctx));
+                ctx.destination_chain = destination;
+                ctx.receiver = "0x2222222222222222222222222222222222222222";
+                assert!(!receiver_matches(&policy.defi.denied_receivers, &ctx));
+            }
+        }
+    }
+
     fn policy() -> VerifiedPolicy {
         VerifiedPolicy {
             defi: DefiPolicy {
@@ -523,9 +577,15 @@ mod tests {
         let mut ctx = context(&[]);
         ctx.protocols_unknown = true;
         for source in &policy.defi.allowed_source_chains {
+            // Defaults must use Machine's own chain names.
+            assert_eq!(
+                &crate::input::canonical_chain(source),
+                source,
+                "advertised chain is not a Machine chain name: {source}"
+            );
             ctx.router = match source.as_str() {
                 "linea" => "0xa146d46823f3f594b785200102be5385cafce9b5",
-                "robinhood" | "arc" | "tempo" => "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7",
+                "robinhood" | "tempo" => "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7",
                 _ => "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
             };
             for destination in &policy.defi.allowed_destination_chains {

@@ -51,6 +51,13 @@ petal::route_file!(
                     .and_then(|view| view.get("expired"))
                     .and_then(|expired| expired.as_bool())
                     .unwrap_or(false);
+                // The session stops at `staged`; the outbox says what happened
+                // to the transaction after that.
+                let outbox = primary
+                    .and_then(|state| state.outbox_id.as_deref())
+                    .and_then(|outbox_id| {
+                        host.tx_inspect(&session.wallet, &session.chain, outbox_id).ok()
+                    });
                 let last_error = session.last_error.clone().or_else(|| {
                     let outbox_id = primary
                         .filter(|state| {
@@ -58,9 +65,7 @@ petal::route_file!(
                         })
                         .and_then(|state| state.outbox_id.clone())?;
                     // Only while the outbox has not moved it past pending.
-                    let unsent = host
-                        .tx_inspect(&session.wallet, &session.chain, &outbox_id)
-                        .map_or(true, |inspection| inspection.state == "pending");
+                    let unsent = outbox.as_ref().map_or(true, |inspection| inspection.state == "pending");
                     unsent.then(|| crate::quote::expired_staged_error(&outbox_id))
                 });
 
@@ -74,7 +79,10 @@ petal::route_file!(
                     "intent_states": session.intent_states,
                     "staged_ids": session.staged_ids,
                     "primary_outbox_id": primary.and_then(|s| s.outbox_id.clone()),
-                    "primary_tx_hash": primary.and_then(|s| s.tx_hash.clone()),
+                    "primary_tx_hash": primary
+                        .and_then(|s| s.tx_hash.clone())
+                        .or_else(|| outbox.as_ref().and_then(|i| i.tx_hash.clone())),
+                    "primary_outbox_state": outbox.as_ref().map(|i| i.state.clone()),
                     "policy_checks": session.policy_checks,
                     "quote": quote,
                     "last_error": last_error,
