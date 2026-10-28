@@ -3327,8 +3327,12 @@ fn refreshed_quote_outside_reviewed_bounds_is_refused_and_reported() {
     }
 }
 
+/// After its token approval succeeded, an intent whose refreshed route falls
+/// outside the reviewed bounds can still be abandoned: the swap was never
+/// staged, and the exact approval stays for a new intent to reuse. So the
+/// refusal's advice to abandon must be true.
 #[test]
-fn out_of_bounds_refresh_after_an_approval_does_not_suggest_abandoning() {
+fn out_of_bounds_refresh_after_an_approval_can_still_be_abandoned() {
     let account = petal::testing::wallet_account("test-wallet", 0);
     let mut host = MockHost::new()
         .with_enso_response(build_enso_response_erc20())
@@ -3353,21 +3357,24 @@ fn out_of_bounds_refresh_after_an_approval_does_not_suggest_abandoning() {
         error.contains("below the reviewed minimum output"),
         "{error}"
     );
-    assert!(error.contains("write `confirm` again later"), "{error}");
-    assert!(error.contains("create a new intent"), "{error}");
-    assert!(error.contains("router allowance"), "{error}");
-    assert!(!error.contains("abandon this intent"), "{error}");
+    assert!(error.contains("abandon this intent"), "{error}");
     assert_eq!(host.stage_count, 1, "only the approval was staged");
     assert_eq!(
         load_session(&mut host, &id).last_error.as_deref(),
         Some(error.as_str())
     );
 
-    // Abandon is unchanged: it still refuses once the approval exists.
-    let abandon = crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap_err();
+    crate::workflow::abandon(&mut host, "test-wallet", &id).unwrap();
+    let sess = load_session(&mut host, &id);
+    assert_eq!(sess.state, "abandoned");
     assert!(
-        abandon.contains("cannot abandon after an outbox transaction exists"),
-        "{abandon}"
+        sess.history
+            .last()
+            .unwrap()
+            .reason
+            .contains("token approval already sent stays"),
+        "{:?}",
+        sess.history.last()
     );
 }
 
@@ -3390,12 +3397,15 @@ fn refreshed_quote_rewrites_the_plan() {
     let sess = load_session(&mut host, &id);
     assert_eq!(sess.route.as_ref().unwrap().amount_out, "2990000000");
     assert!(
-        sess.plan_md.contains("Expected output: 2990000000"),
+        sess.plan_md
+            .contains("Expected output (current Enso quote): 2990000000"),
         "{}",
         sess.plan_md
     );
     assert!(
-        !sess.plan_md.contains("Expected output: 3000000000"),
+        !sess
+            .plan_md
+            .contains("Expected output (current Enso quote): 3000000000"),
         "{}",
         sess.plan_md
     );

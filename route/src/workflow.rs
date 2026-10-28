@@ -1359,20 +1359,6 @@ fn refresh_route_quote<H: Host>(
     refreshed.simulation = None;
     update_plan(&mut refreshed).map_err(RefreshError::OutOfBounds)?;
     verify_prepared_intents(&refreshed, req, &fresh).map_err(RefreshError::OutOfBounds)?;
-    // The plan must describe the route that is about to be staged.
-    refreshed.plan_md = render_plan_md(PlanView {
-        intent_text: &refreshed.intent_text,
-        chain_name: &refreshed.chain,
-        destination_chain: refreshed.destination_chain.as_deref(),
-        req,
-        route: &fresh,
-        intents: &refreshed.intents,
-        route_verified: true,
-        receiver_class: refreshed.receiver_class.as_deref().unwrap_or("unknown"),
-        observed_before: refreshed.observed_before.as_deref(),
-        policy_checks: &refreshed.policy_checks,
-        simulation: refreshed.simulation.as_ref(),
-    });
     let state = refreshed.state.clone();
     refreshed.transition(
         now,

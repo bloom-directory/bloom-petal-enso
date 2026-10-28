@@ -53,9 +53,7 @@ same-chain transaction carries an atomic receiver/output check at that floor.
 The fresh route must match the stored request, keep the reviewed router and
 native value, carry a decoded minimum output at least that floor, and pass the venue preferences again;
 otherwise nothing is staged and `status.json` `last_error` explains the
-refusal. A route outside those bounds means abandoning the intent, or, once
-its approval has succeeded and abandon is refused, writing `confirm` again
-later or creating a new intent (the approval's router allowance remains); a
+refusal. A route outside those bounds means abandoning the intent; a
 temporary Enso or network failure only needs another `confirm`. `status.json`
 reports `quote.fetched_at_ms`, `quote.expires_at_ms`, `quote.expires_from`
 (`enso_valid_until` or `fetch_time`) and `quote.expired`. When
