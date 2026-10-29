@@ -8,13 +8,8 @@ BLOOM_REPO="${BLOOM_REPO:-}"
 cargo test --manifest-path "$ROOT/route/Cargo.toml"
 "$ROOT/scripts/build.sh"
 
-if [[ -n "${PETAL_BIN:-}" ]]; then
-  "$PETAL_BIN" check --root "$ROOT"
-elif command -v petal >/dev/null 2>&1; then
-  petal check --root "$ROOT"
-else
-  "$ROOT/target/petal-tool/bin/petal" check --root "$ROOT"
-fi
+# Check with the same CLI build.sh used.
+"${PETAL_BIN:-$ROOT/target/petal-tool/bin/petal}" check --root "$ROOT"
 
 if [ -n "$BLOOM_REPO" ]; then
   cargo run --manifest-path "$BLOOM_REPO/Cargo.toml" -p bloom -- petals build "$ROOT"

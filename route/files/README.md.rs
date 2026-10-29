@@ -63,6 +63,12 @@ A failed write to `confirm` shows only as an I/O error on the mount. Read
 `status.json`: `last_error` gives the reason. For an ERC-20 route, the first
 confirm stages only the exact-amount approval; broadcast it through the
 wallet outbox and wait for its receipt before confirming again.
+If a confirm may have left a transaction in the outbox without recording it,
+confirm never stages it again and `last_error` names the account's pending
+outbox folder. Cancel the transaction there if it should not be sent, then
+write `abandon`. If `last_error` has not said this yet, the first `abandon`
+refuses with it and the next one closes the intent. Create a new intent only
+if the transaction was not sent.
 
 ### 4. Verify settlement
 ```json
@@ -76,6 +82,7 @@ wallet outbox and wait for its receipt before confirming again.
 - Enso-owned venue preferences are enforced at create and confirm
 - Bloom wallet policy and approval limits remain host-enforced
 - Simulation must pass before the route transaction is staged
+- Confirm stages nothing once the account's EVM address has changed
 - An aged quote is refreshed at staging only within the reviewed bounds
 - ERC-20 approval is exact-amount and must succeed before a second confirm
 - Successful protected same-chain swaps report destination_minimum_enforced;

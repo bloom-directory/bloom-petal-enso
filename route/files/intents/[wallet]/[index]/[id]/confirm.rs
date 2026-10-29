@@ -1,10 +1,12 @@
 petal::route_file!(
-    // `bloom:http` lets staging refresh an aged Enso quote (see quote.rs).
+    // `bloom:http` lets staging refresh an aged Enso quote (see quote.rs);
+    // `bloom:vfs.read` re-reads the account's address before staging.
     spec: petal::write_spec().caps(&[
         "bloom:http",
         "bloom:store",
         "bloom:tx.outbox",
         "bloom:chain",
+        "bloom:vfs.read",
     ]),
     read: |_ctx: &petal::Ctx| {
         petal::DispatchResponse::Read(
@@ -12,7 +14,7 @@ petal::route_file!(
         )
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
-        let wallet = match crate::wallet::param(ctx) {
+        let account = match crate::wallet::account(ctx) {
             Ok(value) => value,
             Err(response) => return response,
         };
@@ -21,7 +23,7 @@ petal::route_file!(
             Err(response) => return response,
         };
         let mut host = crate::workflow::BloomHost;
-        match crate::workflow::confirm(&mut host, wallet, id, body) {
+        match crate::workflow::confirm(&mut host, &account, id, body) {
             Ok(()) => petal::DispatchResponse::Write,
             Err(error) => petal::error(-4, crate::redaction::sanitize_message(&error)),
         }

@@ -29,21 +29,23 @@ jobs:
         run: cargo test --manifest-path route/Cargo.toml --locked
       - name: Clippy route crate
         run: cargo clippy --manifest-path route/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Check route architecture
         run: scripts/check-route-architecture.sh
       - name: Install wasm-tools
         run: cargo install wasm-tools --version 1.254.0 --locked
       - name: Install canonical Petal toolchain
-        run: cargo install --git https://github.com/bloom-directory/petal --rev 2beed2ff344ce2b0c112e07096027e1ae0404007 --locked bloom-petal-cli
+        run: cargo install --git https://github.com/bloom-directory/petal --rev 7dd2722db5de305dd63ca4ed03591f3ab82fa40b --locked bloom-petal-cli
       - name: Build and validate route components
         run: |
-          scripts/build.sh
+          PETAL_BIN="$(command -v petal)" scripts/build.sh
           petal check --root .
       - name: Checkout Bloom CLI
         uses: actions/checkout@v6
         with:
           repository: bloom-directory/bloom
-          ref: b751087b4d7bb65a0f2796a00cf49237e20d9cda
+          ref: 409a7a41d16e7ab2a6d1ac4828910513faa87c6b
           path: bloom
           persist-credentials: false
       - name: Build key-free debug Bloom CLI for install smoke tests

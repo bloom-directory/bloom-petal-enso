@@ -1,5 +1,33 @@
 use alloy::primitives::U256;
-use petal::sdk::{EvmTransaction, HttpRequest, HttpResponse, OutboxInspection, StagedTransaction};
+use petal::sdk::{
+    EvmTransaction, HttpRequest, HttpResponse, OutboxApproval, OutboxInspection, StagedTransaction,
+};
+
+/// A failed `tx_stage`, split by whether the transaction can be in the outbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageError {
+    /// Bloom refused it before writing it, so a retry cannot duplicate it.
+    Refused(String),
+    /// Staging failed in a way that may have left it in the outbox.
+    Uncertain(String),
+}
+
+impl StageError {
+    /// Classify Bloom's error text. Bloom reports the checks it makes before
+    /// the outbox write as `denied`, `invalid` or `not found`, and every
+    /// failure from the write onward as `backend`, so only those three
+    /// prefixes show that nothing was written. The SDK's status cannot be used
+    /// here: it matches words anywhere in the text, so a backend
+    /// `Permission denied` would read as a refusal.
+    pub fn from_host(message: String) -> Self {
+        const REFUSED: [&str; 3] = ["denied: ", "invalid: ", "not found: "];
+        if REFUSED.iter().any(|prefix| message.starts_with(prefix)) {
+            Self::Refused(message)
+        } else {
+            Self::Uncertain(message)
+        }
+    }
+}
 
 /// Result of a generic `eth_call`.
 ///
@@ -23,9 +51,10 @@ pub trait Host {
     fn put(&mut self, key: &str, value: &[u8], secret: bool) -> Result<(), String>;
     fn put_new(&mut self, key: &str, value: &[u8], secret: bool) -> Result<(), String>;
     fn delete_if(&mut self, key: &str, expected: &[u8]) -> Result<(), String>;
-    fn vfs_read(&mut self, path: &str, max: usize) -> Result<Vec<u8>, String>;
+    /// Keeps the SDK error so the host status of a failed read survives.
+    fn vfs_read(&mut self, path: &str, max: usize) -> Result<Vec<u8>, petal::SdkError>;
     fn chain_read(&mut self, chain: &str, method: &str, params: &str) -> Result<String, String>;
-    fn tx_stage(&mut self, tx: &EvmTransaction) -> Result<StagedTransaction, String>;
+    fn tx_stage(&mut self, tx: &EvmTransaction) -> Result<StagedTransaction, StageError>;
     fn tx_confirm(
         &mut self,
         wallet: &str,
@@ -126,8 +155,8 @@ impl Host for BloomHost {
         petal::sdk::store_del_if_value(key, expected).map_err(|error| error.message())
     }
 
-    fn vfs_read(&mut self, path: &str, max: usize) -> Result<Vec<u8>, String> {
-        petal::sdk::vfs_read(path, max).map_err(|error| error.message())
+    fn vfs_read(&mut self, path: &str, max: usize) -> Result<Vec<u8>, petal::SdkError> {
+        petal::sdk::vfs_read(path, max)
     }
 
     fn chain_read(&mut self, chain: &str, method: &str, params: &str) -> Result<String, String> {
@@ -142,8 +171,31 @@ impl Host for BloomHost {
         })
     }
 
-    fn tx_stage(&mut self, tx: &EvmTransaction) -> Result<StagedTransaction, String> {
-        petal::sdk::tx_stage(tx).map_err(|error| error.message())
+    /// Calls the outbox import directly, because `StageError::from_host`
+    /// needs Bloom's error text, which `petal::sdk::tx_stage` replaces with
+    /// a status.
+    fn tx_stage(&mut self, tx: &EvmTransaction) -> Result<StagedTransaction, StageError> {
+        use petal::bindings::bloom::tx::outbox;
+        petal::validate_wallet_id(&tx.wallet).map_err(StageError::Refused)?;
+        outbox::stage(&outbox::EvmTransaction {
+            wallet: tx.wallet.clone(),
+            chain: tx.chain.clone(),
+            to: tx.to.clone(),
+            value_wei: tx.value_wei.clone(),
+            data_hex: tx.data_hex.clone(),
+            nonce: tx.nonce,
+            max_fee_per_gas: tx.max_fee_per_gas.clone(),
+            max_priority_fee_per_gas: tx.max_priority_fee_per_gas.clone(),
+        })
+        .map(|staged| StagedTransaction {
+            outbox_id: staged.outbox_id,
+            plan_md: staged.plan_md,
+            approval: staged.approval.map(|approval| OutboxApproval {
+                action_id: approval.action_id,
+                expires_ms: approval.expires_ms,
+            }),
+        })
+        .map_err(StageError::from_host)
     }
 
     fn tx_confirm(
@@ -416,5 +468,31 @@ mod tests {
         assert!(rpc_quantity("").is_err());
         assert!(rpc_quantity("not-a-number").is_err());
         assert!(rpc_quantity("0xzz").is_err());
+    }
+
+    #[test]
+    fn only_bloom_checks_before_the_outbox_write_count_as_refusals() {
+        for refused in [
+            "denied: tx.outbox",
+            "invalid: data-hex must be canonical 0x-prefixed hex",
+            "not found: chain base",
+        ] {
+            assert_eq!(
+                StageError::from_host(refused.into()),
+                StageError::Refused(refused.into())
+            );
+        }
+        for uncertain in [
+            "backend: stage EVM outbox: write mev risk: Permission denied (os error 13)",
+            "backend: read staged EVM plan: invalid utf-8",
+            "UNSUPPORTED_VERSION: tx.outbox",
+            "Denied: tx.outbox",
+            "",
+        ] {
+            assert_eq!(
+                StageError::from_host(uncertain.into()),
+                StageError::Uncertain(uncertain.into())
+            );
+        }
     }
 }

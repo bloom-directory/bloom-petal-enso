@@ -64,6 +64,17 @@ confirming an expired route can revert or be refused. The owner's approval
 binds the exact transaction, so it cannot pick up a fresher quote; ask for
 approval within about two minutes of staging.
 
+Each transaction is staged behind a marker. The marker is removed once the
+session records the outbox id, or once Bloom refuses the transaction before
+writing it; if that removal fails, the marker records the refusal and the
+next confirm removes it. A transaction can be in the outbox without its id recorded: the
+save after staging failed, or Bloom failed after it may have written the
+entry. Confirm then never stages it again, and `last_error` names the
+account's pending outbox, where it can be reviewed or cancelled. Then write
+`abandon`. If `last_error` has not said this yet, the first `abandon` refuses
+with it and the next one closes the intent. Create a new intent only if that
+transaction was not sent.
+
 ## Configuration
 
 Set the package-wide Enso API key once for all accounts:
@@ -121,6 +132,8 @@ are never interpreted by this Petal.
   bundled defaults apply to unconfigured wallets, while authoritative wallet
   policy is independently enforced by Bloom when a transaction is staged
 - Simulation must pass before the route transaction is staged
+- Confirm re-reads the account's EVM address and stages nothing for a route
+  quoted for a different address
 - ERC-20 approval is exact-amount and must have a successful receipt first
 - Broadcast requires the standard outbox confirm (owner gate)
 - After source success, a verified same-chain safe route reports

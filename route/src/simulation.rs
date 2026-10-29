@@ -7,8 +7,9 @@ use crate::api_types::RouteResponse;
 use crate::runtime::Host;
 use crate::session::Session;
 
-/// Simulate a route response directly (used by `create()` before the session
-/// is persisted, and by `simulate_route()` for stored sessions).
+/// Simulate a route response directly (used by `create_for_account()` before
+/// the session is persisted, by `confirm()` before staging, and by
+/// `simulate_route()` for stored sessions).
 pub fn simulate_route_response<H: Host>(
     host: &mut H,
     chain: &str,
