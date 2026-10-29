@@ -60,6 +60,8 @@ struct MockHost {
     fail_next_stage_after_write: bool,
     /// Replace account 0's address when Enso is next called.
     address_after_enso_call: Option<Vec<u8>>,
+    /// Fail the next deletion of a staging marker.
+    fail_next_marker_delete: bool,
 }
 
 impl MockHost {
@@ -137,6 +139,7 @@ require_calldata_verification = false
             concurrent_result: None,
             fail_next_stage_after_write: false,
             address_after_enso_call: None,
+            fail_next_marker_delete: false,
         }
     }
 
@@ -267,6 +270,9 @@ impl Host for MockHost {
     }
 
     fn delete_if(&mut self, key: &str, expected: &[u8]) -> Result<(), String> {
+        if key.contains("/staging-") && std::mem::take(&mut self.fail_next_marker_delete) {
+            return Err("simulated store delete failure".into());
+        }
         if let Some(actual) = self.store.get(key)
             && actual == expected
         {
@@ -2505,6 +2511,66 @@ fn the_address_is_checked_again_just_before_staging() {
     assert!(error.contains("now has EVM address"), "{error}");
     assert!(error.contains("nothing was staged"), "{error}");
     assert_eq!(host.stage_count, 0);
+    assert!(staging_markers(&host).is_empty());
+}
+
+/// A retry after an unrecorded stage reports the outbox before any other check,
+/// so an address change cannot replace that advice with "create a new intent".
+#[test]
+fn an_unrecorded_stage_is_reported_before_an_address_change() {
+    let account = petal::testing::wallet_account("test-wallet", 0);
+    let mut host = MockHost::new().with_enso_response(build_enso_response_native());
+    let id = crate::workflow::create_for_account(
+        &mut host,
+        &account,
+        b"swap 1.0 eth to usdc on ethereum",
+    )
+    .unwrap();
+    host.fail_session_save_after_stage = Some(1);
+    crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
+    assert_eq!(host.stage_count, 1);
+
+    host.vfs.insert(
+        "wallets/test-wallet/0/address.evm".into(),
+        b"0x000000000000000000000000000000000000dEaD\n".to_vec(),
+    );
+    let error = crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
+    assert!(
+        error.contains("route transaction may be in the wallet's outbox"),
+        "{error}"
+    );
+    assert!(error.contains("this confirm staged nothing"), "{error}");
+    assert!(!error.contains("now has EVM address"), "{error}");
+    assert_eq!(host.stage_count, 1);
+    assert_eq!(
+        load_session(&mut host, &id).last_error.as_deref(),
+        Some(error.as_str())
+    );
+}
+
+/// Bloom refused the stage but its marker could not be removed. The marker
+/// then records the refusal, so the next confirm clears it and stages.
+#[test]
+fn a_refused_stage_whose_marker_cannot_be_removed_can_be_retried() {
+    let (mut host, id) = quoted_session(10_000);
+    let account = petal::testing::wallet_account("test-wallet", 0);
+    host.stage_fail_after = Some(0);
+    host.fail_next_marker_delete = true;
+    let error = crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap_err();
+    assert!(
+        error.contains("staging the swap failed: denied: simulated staging failure"),
+        "{error}"
+    );
+    assert!(!error.contains("may be in the wallet's outbox"), "{error}");
+    assert_eq!(staging_markers(&host).len(), 1, "the marker stayed");
+
+    host.stage_fail_after = None;
+    crate::workflow::confirm(&mut host, &account, &id, b"confirm").unwrap();
+    let sess = load_session(&mut host, &id);
+    assert_eq!(sess.state, "staged");
+    assert_eq!(sess.last_error, None);
+    assert_eq!(host.stage_count, 2);
+    assert_eq!(host.staged.len(), 1, "one swap in the outbox");
     assert!(staging_markers(&host).is_empty());
 }
 

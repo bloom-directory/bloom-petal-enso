@@ -66,7 +66,8 @@ approval within about two minutes of staging.
 
 Each transaction is staged behind a marker. The marker is removed once the
 session records the outbox id, or once Bloom refuses the transaction before
-writing it. A transaction can be in the outbox without its id recorded: the
+writing it; if that removal fails, the marker records the refusal and the
+next confirm removes it. A transaction can be in the outbox without its id recorded: the
 save after staging failed, or Bloom failed after it may have written the
 entry. Confirm then never stages it again, and `last_error` names the
 account's pending outbox, where it can be reviewed or cancelled. Then write

@@ -829,16 +829,29 @@ fn acquire_confirm_lock<H: Host>(
 /// Written with put-new just before an intent is staged, and removed once the
 /// session save that records its outbox id succeeds. A marker beside an
 /// intent with no outbox id means a stage may have reached the outbox without
-/// being recorded, so that intent must never be staged again.
+/// being recorded, so that intent must never be staged again, unless the
+/// marker records that Bloom refused the stage.
 fn staging_marker_key(wallet: &str, id: &str, index: usize) -> String {
     format!("intents/{wallet}/{id}/staging-{index}.json")
+}
+
+/// Whether a staging marker records a stage Bloom refused before writing it.
+/// A marker that cannot be read as one counts as a possible outbox entry.
+fn marker_refused(marker: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(marker)
+        .ok()
+        .and_then(|value| value.get("refused").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
 }
 
 /// The first unrecorded intent that an earlier confirm began staging.
 fn unrecorded_stage<H: Host>(host: &mut H, sess: &Session) -> Result<Option<usize>, String> {
     for state in &sess.intent_states {
         let key = staging_marker_key(&sess.wallet, &sess.id, state.index);
-        if state.outbox_id.is_none() && host.get(&key, 1024)?.is_some() {
+        if state.outbox_id.is_none()
+            && let Some(marker) = host.get(&key, 1024)?
+            && !marker_refused(&marker)
+        {
             return Ok(Some(state.index));
         }
     }
@@ -902,19 +915,39 @@ fn stage_marked<H: Host>(
         max_priority_fee_per_gas: None,
     };
     let key = staging_marker_key(&sess.wallet, &sess.id, index);
-    let marker = json(&serde_json::json!({
+    // A marker left by a refused stage proves nothing reached the outbox.
+    // Remove it before staging; until that works, this retry stages nothing.
+    if let Some(existing) = host.get(&key, 1024)?
+        && marker_refused(&existing)
+    {
+        host.delete_if(&key, &existing).map_err(|error| {
+            format!(
+                "cannot clear the record of a stage Bloom refused, so nothing was staged; \
+                 write `confirm` again: {error}"
+            )
+        })?;
+    }
+    let mut marker_value = serde_json::json!({
         "created_ms": host.now_ms(),
         "chain": tx.chain,
         "to": tx.to,
-    }))?;
+    });
+    let marker = json(&marker_value)?;
     host.put_new(&key, &marker, false).map_err(|error| {
         format!("cannot record that staging began, so nothing was staged: {error}")
     })?;
     match host.tx_stage(&tx) {
         Ok(staged) => Ok(staged),
         Err(StageError::Refused(error)) => {
-            // Nothing was written, so a retry cannot duplicate it.
-            let _ = host.delete_if(&key, &marker);
+            // Nothing was written, so a retry cannot duplicate it. If the
+            // marker cannot be removed, record the refusal in it instead, so
+            // the next stage removes it. A marker left unchanged fails closed.
+            if host.delete_if(&key, &marker).is_err() {
+                marker_value["refused"] = true.into();
+                if let Ok(refused) = json(&marker_value) {
+                    let _ = host.put(&key, &refused, false);
+                }
+            }
             Err(error)
         }
         // The marker stays, so no later confirm stages this intent again.
@@ -1028,6 +1061,24 @@ fn confirm_locked<H: Host>(
         ));
     }
 
+    // An earlier confirm may have staged an intent and then failed to save
+    // its outbox id. Staging it again could send the same transaction twice.
+    // Check this first, so no other refusal replaces this advice in
+    // `last_error`.
+    if let Some(index) = unrecorded_stage(host, &sess)? {
+        let intent = sess
+            .intents
+            .get(index)
+            .ok_or("session intent state has no matching intent — refusing")?;
+        let reason = format!(
+            "{} (an earlier confirm began staging it, so this confirm staged nothing)",
+            unrecorded_stage_advice(account, intent)
+        );
+        sess.last_error = Some(reason.clone());
+        save(host, &sess)?;
+        return Err(reason);
+    }
+
     // Re-verify route binding.
     let req = sess
         .route_request
@@ -1065,18 +1116,6 @@ fn confirm_locked<H: Host>(
         return Err("stored route has an invalid quoted output amount — refusing".into());
     }
     verify_prepared_intents(&sess, &req, &route)?;
-
-    // An earlier confirm may have staged an intent and then failed to save
-    // its outbox id. Staging it again could send the same transaction twice.
-    if let Some(index) = unrecorded_stage(host, &sess)? {
-        let reason = format!(
-            "{} (an earlier confirm began staging it, so this confirm staged nothing)",
-            unrecorded_stage_advice(account, &sess.intents[index])
-        );
-        sess.last_error = Some(reason.clone());
-        save(host, &sess)?;
-        return Err(reason);
-    }
 
     // Verify chain_id.
     let live_chain_id = host
@@ -1502,7 +1541,10 @@ fn abandon_locked<H: Host>(
     // where to review it, then let the owner close the intent.
     let unrecorded = match unrecorded_stage(host, &sess)? {
         Some(index) => {
-            let intent = &sess.intents[index];
+            let intent = sess
+                .intents
+                .get(index)
+                .ok_or("session intent state has no matching intent — refusing")?;
             let advice = unrecorded_stage_advice(account, intent);
             let label = intent.label.clone();
             if !sess
